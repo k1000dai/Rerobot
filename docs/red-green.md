@@ -348,6 +348,47 @@ The generators were fixed (compare each product against a running total, and
 subtract in both directions) until both branches were reached. The assertions
 that caught this are kept in the tests.
 
+## `NewLineTaskProcessorStep` development log
+
+The processor was added one observable rule at a time with:
+
+```text
+cargo test -p rerobot-core --test newline_task_processor
+```
+
+The implementation session recorded the first test reaching the new API while
+the implementation was deliberately absent:
+
+```text
+test complementary_data_without_a_task_key_is_returned_unchanged ... FAILED
+panicked at crates/rerobot-core/src/processor/newline_task.rs:18:9:
+not implemented
+test result: FAILED. 0 passed; 1 failed
+```
+
+The same session recorded subsequent RED cycles against three distinct
+incorrect partial implementations:
+
+```text
+left: String("pick up the cube")
+right: String("pick up the cube\n")
+
+left: String("pick up the cube\n\n")
+right: String("pick up the cube\n")
+
+left: Array [String("a\n"), Number(1)]
+right: Array [String("a"), Number(1)]
+```
+
+The last failure motivated the upstream all-or-nothing list rule rather than a
+per-element best effort. Separate cycles also recorded failures at the
+intentionally unimplemented `get_config` and `transform_features` methods.
+These excerpts are a development log, not independently reproducible proof of
+history; the retained tests are the auditable current evidence. The suite has
+24 cases covering strings, LF/CRLF, bare CR, Unicode, empty values, mixed and
+nested lists, config identity, stateless lifecycle, feature value identity,
+input independence, and insertion order.
+
 ## Final GREEN totals
 
 `cargo test --workspace --all-targets --all-features`
@@ -359,6 +400,7 @@ that caught this are kept in the tests.
 | `rerobot-core` `tests/byte_count.rs` | 15 |
 | `rerobot-core` `tests/ring_buffer.rs` | 37 |
 | `rerobot-core` `tests/rename_processor.rs` | 23 |
+| `rerobot-core` `tests/newline_task_processor.rs` | 24 |
 | `rerobot-core` `tests/types.rs` | 20 |
 | `rerobot-core` `tests/sysinfo.rs` | 13 |
 | `rerobot-compat` `tests/inventory.rs` | 17 |
@@ -366,7 +408,7 @@ that caught this are kept in the tests.
 | `rerobot-cli` `tests/cli.rs` | 21 |
 | `rerobot-cli` `tests/info.rs` | 18 |
 | `rerobot-cli` `tests/which.rs` | 21 |
-| **Total** | **246** |
+| **Total** | **270** |
 
 The 18 `lerobot-*` binary targets contribute no unit tests; their behaviour is
 covered by `tests/cli.rs`, which runs the built executables as subprocesses.
@@ -378,12 +420,12 @@ covered by `tests/cli.rs`, which runs the built executables as subprocesses.
 
 | Crate | Doctests |
 | --- | ---: |
-| `rerobot-core` (crate README + item docs) | 19 |
+| `rerobot-core` (crate README + item docs) | 24 |
 | `rerobot-compat` (crate README) | 2 |
 | `rerobot-cli` (crate README + `which`) | 3 |
-| **Total** | **24** |
+| **Total** | **29** |
 
-158 of the 246 are the compatibility slice itself (`rerobot-core`), which is
+182 of the 270 are the compatibility slice itself (`rerobot-core`), which is
 where the milestone's parity claim lives.
 
 ## Whole-workspace gate

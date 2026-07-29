@@ -304,8 +304,10 @@ pub static MODULE_FAMILIES: &[ModuleFamily] = &[
         name: "processor",
         status: Status::Partial,
         upstream_modules: 19,
-        note: "`rename_processor` (step + `rename_stats`) is ported and tested. The pipeline \
-               runtime, normalization, tokenizer, and device steps are not.",
+        note: "`rename_processor` (step + `rename_stats`) and the value transform/stateless \
+               lifecycle of `newline_task_processor.NewLineTaskProcessorStep` are ported and \
+               tested. Python aliasing, registry/config reconstruction, the pipeline runtime, \
+               normalization, tokenizer, and device steps are not.",
     },
     ModuleFamily {
         name: "rewards",

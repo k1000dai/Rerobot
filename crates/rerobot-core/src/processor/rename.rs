@@ -5,7 +5,7 @@
 //! last-write-wins collision behaviour are observable. Ordered maps are used
 //! throughout to preserve them.
 
-use crate::types::{PipelineFeatureType, PolicyFeature};
+use crate::types::PipelineFeatureType;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -16,11 +16,10 @@ pub type Observation = IndexMap<String, Value>;
 /// Insertion-ordered normalization-statistics dict (`dict[str, dict[str, Any]]`).
 pub type Stats = IndexMap<String, Option<IndexMap<String, Value>>>;
 
-/// Insertion-ordered feature dict for one pipeline stage.
-pub type FeatureMap = IndexMap<String, PolicyFeature>;
-
-/// Feature dicts keyed by pipeline stage.
-pub type PipelineFeatures = IndexMap<PipelineFeatureType, FeatureMap>;
+/// The pipeline-feature aliases live in [`crate::processor`]; they are shared
+/// with the other ported steps and re-exported here for the paths that named
+/// them under this module first.
+pub use super::{FeatureMap, PipelineFeatures};
 
 /// Registry name upstream registers this step under.
 pub const REGISTRY_NAME: &str = "rename_observations_processor";

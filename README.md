@@ -14,7 +14,7 @@ suite. Everything that does not work says so and exits non-zero.
 | Upstream target | `lerobot` 0.6.1 (`f37be3edbee60f3a09a5183788b91eb19f0c07d1`) |
 | Milestone | 1 of N — core utility slice + full CLI surface |
 | Runnable executables | 1 of 18 (`lerobot-info`); the other 17 exist and fail explicitly |
-| Tests | 246 integration/unit tests + 24 rustdoc tests, all passing |
+| Tests | 270 integration/unit tests + 29 rustdoc tests, all passing |
 | Minimum Rust | 1.85 — the floor of the locked dependency tree, built and tested on that exact toolchain by the `msrv` CI job |
 
 **Read [`docs/compatibility.md`](docs/compatibility.md) before using this.** It

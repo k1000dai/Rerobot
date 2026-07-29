@@ -92,7 +92,7 @@ pinned commit; it is a size indicator, not a progress metric.
 | `lerobot/motors` | hardware-gated | 16 | Feetech / Dynamixel / CAN motor buses. |
 | `lerobot/optim` | unimplemented | 4 | Optimizer and LR-scheduler configs bound to PyTorch. |
 | `lerobot/policies` | unimplemented | 128 | All policy architectures. Requires model inference; never faked. |
-| `lerobot/processor` | partial | 19 | `rename_processor` (step + `rename_stats`) is ported and tested. The pipeline runtime, normalization, tokenizer, and device steps are not. |
+| `lerobot/processor` | partial | 19 | `rename_processor` (step + `rename_stats`) and the value transform/stateless lifecycle of `newline_task_processor.NewLineTaskProcessorStep` are ported and tested. Python aliasing, registry/config reconstruction, the pipeline runtime, normalization, tokenizer, and device steps are not. |
 | `lerobot/rewards` | unimplemented | 24 | Reward classifiers and success detectors. |
 | `lerobot/rl` | unimplemented | 21 | HIL-SERL actor/learner infrastructure. |
 | `lerobot/robots` | hardware-gated | 53 | Per-robot drivers (SO-100/101, LeKiwi, Reachy2, Unitree, ...). |
@@ -116,6 +116,7 @@ from upstream's own test-suite and from direct execution of the upstream Python.
 | `rerobot_core::ring_buffer` | `lerobot/rollout/ring_buffer.py` | `crates/rerobot-core/tests/ring_buffer.rs` |
 | `rerobot_core::byte_count` | no upstream counterpart — it is the unbounded integer the byte accounting needs, standing in for a Python `int` | `crates/rerobot-core/tests/byte_count.rs` |
 | `rerobot_core::processor::rename` | `lerobot/processor/rename_processor.py` | `crates/rerobot-core/tests/rename_processor.rs` |
+| `rerobot_core::processor::newline_task` | `lerobot/processor/newline_task_processor.py` (`NewLineTaskProcessorStep` value transform, stateless lifecycle, and registry-name spelling only) | `crates/rerobot-core/tests/newline_task_processor.rs` |
 | `rerobot_core::sysinfo` | `lerobot/scripts/lerobot_info.py` (pure parts) | `crates/rerobot-core/tests/sysinfo.rs` |
 | `rerobot_cli::which` | `shutil.which`, as called by `get_ffmpeg_version` | `crates/rerobot-cli/tests/which.rs` |
 | `lerobot-info` | `lerobot/scripts/lerobot_info.py` | `crates/rerobot-cli/tests/{info,cli,which}.rs` |
@@ -142,6 +143,10 @@ a consequence of the target language, not a shortcut.
 | Building the interpolated sequence for a huge multiplier ends in `MemoryError` after CPython grinds through the `list` | `ActionInterpolator::add` returns `Err(InterpolatorError::BufferNotAllocatable)` up front | The sequence is `multiplier` elements of a Rust `Vec`, so a multiplier that does not fit a `usize`, or whose slots cannot be reserved, is refused rather than truncated to a step count that does fit. Below that boundary the buffer is genuinely built, and an allocator that fails part-way aborts the process where CPython would raise `MemoryError`. |
 | `fps * self.multiplier` raises `OverflowError: int too large to convert to float` for a multiplier outside the `f64` range | `get_control_interval` returns `Err(InterpolatorError::MultiplierNotFloatRepresentable)`, carrying that exact message | Rust has no exceptions, and the alternative is worse than an error: dividing by an infinity would silently report a control interval of `0.0`. Below the boundary the conversion is the nearest `f64`, taken through the decimal digits and Rust's correctly-rounded float parser. |
 | `_estimate_frame_bytes` dispatches on Python runtime types | Callers tag values with `FrameValue` | Static typing. The per-variant cost model is a byte-for-byte port. |
+| `NewLineTaskProcessorStep.complementary_data` returns the *same* `dict` object when `task` is absent or `None`, and otherwise makes a shallow copy whose untouched nested values remain shared | Always returns an independently owned `IndexMap` and deep-cloned `serde_json::Value`s | Deliberate ownership boundary. Values and key order match, but mutation-visible aliasing does not: mutating a nested Python value through either map can affect the other, while Rust's result is independent. The input is never modified by the Rust step. |
+| `NewLineTaskProcessorStep.transform_features` returns the identical `features` object it was handed | Returns an independent clone that compares equal and keeps its stage order | Value/ordering identity is ported; object identity and mutation sharing are not. This is more than a Python `is` difference: later nested mutation is observable. |
+| `complementary_data` takes any Python object as the `task` value and dispatches with `isinstance` | Takes a `serde_json::Value` | Static JSON-domain boundary. Strings, null, booleans, objects, representable finite numbers, and arrays built from them follow the matching Python branches. Oversized Python integers, NaN/infinities, tuples, bytes, arbitrary objects and ill-formed Unicode are outside the domain rather than approximated; see below. |
+| Upstream registers the step as `smolvla_new_line_processor` and reconstructs it through the processor registry | Exposes that exact spelling as `REGISTRY_NAME` only | Registry lookup, pipeline serialization and config reconstruction are not yet ported. The constant prevents spelling drift but is not a claim that old serialized pipelines can already be loaded. |
 | `lerobot-info` reports installed Python package versions | Reports `N/A (not ported)` for those keys, distinct from upstream's `N/A` | A Rust build has no `torch`/`datasets`/`numpy`. Inventing versions would make bug reports actively misleading; reusing `N/A` would claim a check that never happened. |
 | `lerobot-info`'s `LeRobot version` is the installed `lerobot` distribution version | `0.6.1 (upstream target; Rerobot 0.1.0, a partial Rust port)` | There is no `lerobot` Python distribution in a Rerobot install. The value names both versions rather than fabricating one or dropping the key. |
 | `lerobot-info`'s `Platform` is `platform.platform()`, e.g. `macOS-15.0-arm64-arm-64bit` | `<os>-<arch>` from `std::env::consts`, e.g. `macos-aarch64` | Rust's standard library exposes no OS release or libc version. The port reports only what it can know for certain rather than shelling out to `uname` or guessing a release string. |
@@ -171,6 +176,35 @@ Reproduced, not "fixed", because callers can observe them:
 * `ActionInterpolator.add`: `self._prev` is replaced by the *action*, not by the
   broadcast result, so a length-1 action after a length-3 previous leaves the
   interpolator able to accept any length next time.
+* `NewLineTaskProcessorStep`: the list branch is all-or-nothing. One non-string
+  element leaves the whole list untouched, so `["a", 1]` keeps `"a"` without its
+  newline; and because `all(...)` over an empty list is `True`, an empty list
+  takes the list branch and is rebuilt as an empty list.
+* `NewLineTaskProcessorStep`: `str.endswith("\n")` is exact. `"pick\r"`,
+  `"pick\u{2028}"` and `"pick\u{0085}"` all gain a newline; only a trailing
+  `"\n"` — including the `"\n"` of a `"\r\n"` — counts as already terminated.
+  `""` becomes `"\n"`, and a `bool` is not a `str`, so `[true, false]` is left
+  alone.
+
+### Python `task` values the newline step does not claim
+
+`complementary_data` is typed as `IndexMap<String, serde_json::Value>`, which is
+the JSON value domain. Upstream dispatches on Python runtime types, so there are
+`task` values that reach it in Python and have no `Value` counterpart. They are
+stated here rather than approximated. Each upstream behaviour below was observed
+by running the pinned module under CPython 3.12, not inferred:
+
+| Python `task` value | Upstream behaviour | Rerobot |
+| --- | --- | --- |
+| `("a", "b")` — a tuple of strings | unchanged, because `isinstance(task, list)` is `False` | Not representable. A caller who turns a tuple into a `Value::Array` gets the *list* answer (`["a\n", "b\n"]`), which is upstream's answer for a list and not for a tuple. |
+| `[b"a"]` — `bytes` elements | unchanged | Not representable; the nearest `Value` is a string or an array of numbers, neither of which is `bytes`. |
+| a `str` subclass, `numpy.str_`, a `torch.Tensor` | dispatches on the runtime type (`str` subclasses take the string branch) | Not representable; no attempt is made to model Python's type hierarchy. |
+| `"\ud800"` — a `str` holding an unpaired surrogate | becomes `"\ud800\n"` | Not representable: Rust `String` is well-formed UTF-8. Every value `Value::String` *can* hold is handled identically to upstream, including astral-plane and combining characters. |
+| an integer outside `serde_json::Number`'s enabled range | unchanged | Not representable by this build's `serde_json::Value`; the processor does not silently narrow it. |
+| `float("nan")`, `float("inf")`, `float("-inf")` | unchanged | Not representable as `serde_json::Number`; JSON has no non-finite number literals. |
+
+The keys are `String` for the same reason: a Python `dict` accepts any hashable
+key, and upstream only ever tests for `"task"`.
 
 ### Numeric domain
 

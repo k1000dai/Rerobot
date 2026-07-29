@@ -183,6 +183,64 @@ assert_eq!(renamed.keys().collect::<Vec<_>>(), vec!["observation.robot_state", "
 assert!(renamed["action"].as_ref().unwrap().is_empty());
 ```
 
+## `processor::newline_task` — `lerobot/processor/newline_task_processor.py`
+
+`NewLineTaskProcessorStep` makes the `task` prompt end with a newline, which is
+what a PaliGemma-style tokenizer expects. Only the `task` entry is rewritten;
+every other key keeps its value and its position.
+
+```rust
+use rerobot_core::processor::newline_task::{NewLineTaskProcessorStep, REGISTRY_NAME};
+use rerobot_core::processor::ComplementaryData;
+use serde_json::json;
+
+// This preserves upstream's spelling. Registry lookup/config reconstruction is
+// part of the not-yet-ported processor pipeline runtime.
+assert_eq!(REGISTRY_NAME, "smolvla_new_line_processor");
+
+let step = NewLineTaskProcessorStep;
+let mut data = ComplementaryData::new();
+data.insert("index".to_string(), json!(0));
+data.insert("task".to_string(), json!(["task1", "task2\n"]));
+
+let out = step.complementary_data(&data);
+assert_eq!(out["task"], json!(["task1\n", "task2\n"]));
+assert_eq!(out.keys().collect::<Vec<_>>(), vec!["index", "task"]);
+```
+
+The list branch is all-or-nothing, and `str.endswith("\n")` is exact — a value
+ending in `\r`, `\u{2028}` or `\u{0085}` does not count as already terminated:
+
+```rust
+use rerobot_core::processor::newline_task::NewLineTaskProcessorStep;
+use rerobot_core::processor::ComplementaryData;
+use serde_json::json;
+
+let step = NewLineTaskProcessorStep;
+let mut data = ComplementaryData::new();
+
+data.insert("task".to_string(), json!(["task1", 1])); // not all strings
+assert_eq!(step.complementary_data(&data)["task"], json!(["task1", 1]));
+
+data.insert("task".to_string(), json!([])); // `all(...)` of nothing is true
+assert_eq!(step.complementary_data(&data)["task"], json!([]));
+
+data.insert("task".to_string(), json!("")); // "" does not end with "\n"
+assert_eq!(step.complementary_data(&data)["task"], json!("\n"));
+
+data.insert("task".to_string(), json!("pick\r\n")); // already terminated
+assert_eq!(step.complementary_data(&data)["task"], json!("pick\r\n"));
+
+data.insert("task".to_string(), json!(null)); // null is left alone
+assert_eq!(step.complementary_data(&data)["task"], json!(null));
+```
+
+The step declares no configuration and no state, so `get_config` and
+`state_dict` are empty while `load_state_dict` and `reset` are no-ops.
+`transform_features` returns an equal owned clone; unlike upstream, it does not
+alias its input. The processor registry and pipeline-config reconstruction are
+not part of this slice.
+
 ## `types` — `lerobot/configs/types.py`, `lerobot/types.py`
 
 The `str`-backed enums, with upstream's exact wire values and case-sensitive

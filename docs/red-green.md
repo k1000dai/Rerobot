@@ -452,6 +452,32 @@ pins that upstream's `fps` post-init error precedes an unrelated typed `splits`
 boundary error. The three retained suites are the auditable current evidence;
 the historical RED excerpts are a development log.
 
+## ACT policy configuration
+
+`tests/act_config.rs` was compiled before `rerobot_core::policy` existed. The
+focused RED failed with `E0433: could not find policy in rerobot_core`, at the
+intended public import. Nine retained tests then drove defaults, exact validation
+precedence/messages, feature validation, presets, lazy delta indices, ordered
+checkpoint JSON, malformed/absent/unknown fields, and signed thousand-digit
+integers. A tenth retained test pins the explicit non-finite float output error.
+A second focused RED changed the compatibility inventory only after
+the new policy test existed: `policies_are_partial_once_act_config_is_available`
+observed `Unimplemented` where `Partial` was required.
+
+The oracle was CPython 3.12.13 running upstream commit
+`f37be3edbee60f3a09a5183788b91eb19f0c07d1`. It captured all four validation
+failures and their precedence, zero/negative range behavior, feature acceptance,
+the AdamW preset, and the full `config.json` shape. The retained tests are the
+auditable evidence. A post-GREEN differential malformed-input probe found that
+Draccus accepts numeric strings and booleans for integer fields; the focused
+test was changed first and observed RED before the decoder reproduced that
+coercion. A later bool-domain probe likewise found lowercase string coercion;
+that focused assertion failed against serde's nominal bool decoder before the
+Draccus-compatible decoder was added. The RED output above is a development log.
+The final annotation audit found ACT's `int = False` dilation field; a focused
+compile RED required the absent `PythonIntBool` type before the dual bool/BigInt
+wire representation was implemented.
+
 ## Final GREEN totals
 
 `cargo test --workspace --all-targets --all-features`
@@ -461,6 +487,7 @@ the historical RED excerpts are a development log.
 | `rerobot-cli` library unit tests | 1 |
 | `rerobot-core` `rollout::dagger` unit tests | 2 |
 | `rerobot-core` `tests/action_interpolator.rs` | 50 |
+| `rerobot-core` `tests/act_config.rs` | 10 |
 | `rerobot-core` `tests/byte_count.rs` | 15 |
 | `rerobot-core` `tests/ring_buffer.rs` | 37 |
 | `rerobot-core` `tests/rename_processor.rs` | 23 |
@@ -471,12 +498,12 @@ the historical RED excerpts are a development log.
 | `rerobot-core` `tests/dataset_json.rs` | 51 |
 | `rerobot-core` `tests/types.rs` | 20 |
 | `rerobot-core` `tests/sysinfo.rs` | 13 |
-| `rerobot-compat` `tests/inventory.rs` | 17 |
+| `rerobot-compat` `tests/inventory.rs` | 18 |
 | `rerobot-compat` `tests/docs_consistency.rs` | 10 |
 | `rerobot-cli` `tests/cli.rs` | 21 |
 | `rerobot-cli` `tests/info.rs` | 18 |
 | `rerobot-cli` `tests/which.rs` | 21 |
-| **Total** | **408** |
+| **Total** | **419** |
 
 The 18 `lerobot-*` binary targets contribute no unit tests; their behaviour is
 covered by `tests/cli.rs`, which runs the built executables as subprocesses.
@@ -488,12 +515,12 @@ covered by `tests/cli.rs`, which runs the built executables as subprocesses.
 
 | Crate | Doctests |
 | --- | ---: |
-| `rerobot-core` (crate README + item docs) | 37 |
+| `rerobot-core` (crate README + item docs) | 38 |
 | `rerobot-compat` (crate README) | 2 |
 | `rerobot-cli` (crate README + `which`) | 3 |
-| **Total** | **42** |
+| **Total** | **43** |
 
-320 of the 408 are the compatibility slice itself (`rerobot-core`), which is
+330 of the 419 are the compatibility slice itself (`rerobot-core`), which is
 where the milestone's parity claim lives.
 
 ## Whole-workspace gate

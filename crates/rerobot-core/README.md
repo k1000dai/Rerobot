@@ -1,8 +1,8 @@
 # rerobot-core
 
 Pure-Rust, behaviour-compatible ports of [Hugging Face LeRobot][upstream] core
-utilities and local `meta/info.json` metadata IO. No network IO, PyTorch,
-hardware, or Python sidecar.
+utilities, policy configuration, and local `meta/info.json` metadata IO. No
+network IO, tensor runtime, hardware, or Python sidecar.
 
 [upstream]: https://github.com/huggingface/lerobot
 
@@ -460,6 +460,51 @@ here; the typed fields reject values upstream's unchecked dataclass would
 accept, including the `bool` that Python treats as an `int`; and the file is
 always written as UTF-8 with LF, where CPython's `open(fpath, "w")` follows the
 locale encoding and translates newlines on Windows.
+
+## `policy::act` — `lerobot/policies/act/configuration_act.py`
+
+The concrete ACT policy configuration is checkpoint-wire compatible and keeps
+every Python integer field arbitrary precision. Validation preserves upstream's
+order, exception category, and exact message; it does not pretend that the ACT
+tensor model is available yet.
+
+```rust
+use rerobot_core::policy::act::{ActConfig, ActConfigErrorKind};
+use rerobot_core::BigInt;
+
+let mut config = ActConfig::default();
+assert_eq!(config.chunk_size, BigInt::from(100));
+assert_eq!(
+    config.action_delta_indices().take(3).collect::<Vec<_>>(),
+    vec![BigInt::from(0), BigInt::from(1), BigInt::from(2)]
+);
+
+config.vision_backbone = "vit".into();
+let error = config.validate().unwrap_err();
+assert_eq!(error.kind(), ActConfigErrorKind::Value);
+assert_eq!(
+    error.to_string(),
+    "`vision_backbone` must be one of the ResNet variants. Got vit."
+);
+```
+
+`action_delta_indices` is lazy rather than eagerly building Python's list. That
+is the explicit resource boundary which lets a syntactically valid, enormous
+`chunk_size` remain an exact `BigInt` without allocating until the machine is
+exhausted. Ordinary values yield the same ordered indices. JSON decoding
+requires the registry tag `"type":"act"`, distinguishes null from an absent
+defaulted field, rejects unknown fields, and round-trips negative and
+thousand-digit integers as bare JSON numbers. It also reproduces Draccus'
+checkpoint coercion: JSON strings accepted by Python `int()` and booleans become
+integers; float fields likewise accept numeric strings and booleans, and bool
+fields accept Draccus' exact lowercase `"true"` / `"false"` strings. Non-finite
+float output fails explicitly instead of silently becoming JSON null; see the
+compatibility ledger for that narrower wire boundary.
+
+The upstream dilation field is uniquely declared `int = False`: a fresh config
+stores and writes boolean `false`, while checkpoint decoding converts it to
+integer `0` and accepts arbitrary Python integers. `PythonIntBool` retains both
+forms instead of narrowing that field to a Rust `bool`.
 
 ## `types` — `lerobot/configs/types.py`, `lerobot/types.py`
 

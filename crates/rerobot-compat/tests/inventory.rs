@@ -226,6 +226,7 @@ fn partially_ported_families_are_exactly_the_ones_with_tests() {
         vec![
             "configs",
             "datasets",
+            "policies",
             "processor",
             "rollout",
             "scripts",
@@ -249,6 +250,13 @@ fn hardware_families_are_marked_hardware_gated() {
 fn module_family_lookup_rejects_unknown_names() {
     assert!(module_family("policies").is_some());
     assert!(module_family("nope").is_none());
+}
+
+#[test]
+fn policies_are_partial_once_act_config_is_available() {
+    let policies = module_family("policies").unwrap();
+    assert_eq!(policies.status, Status::Partial);
+    assert!(policies.note.contains("ACTConfig"));
 }
 
 #[test]

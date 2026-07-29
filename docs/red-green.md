@@ -389,6 +389,38 @@ history; the retained tests are the auditable current evidence. The suite has
 nested lists, config identity, stateless lifecycle, feature value identity,
 input independence, and insertion order.
 
+## DAgger event state machine development log
+
+The retained command for each focused cycle was:
+
+```text
+cargo test -p rerobot-core --test dagger
+```
+
+The implementation session first reached each deliberately absent API before
+adding its minimum behavior. Representative recorded REDs included:
+
+```text
+test phase_values_are_the_upstream_member_values ... FAILED
+panicked at crates/rerobot-core/src/rollout/dagger.rs:25:9:
+not implemented
+
+test reset_returns_the_machine_to_a_fresh_session ... FAILED
+panicked at crates/rerobot-core/src/rollout/dagger.rs:167:9:
+not implemented
+
+test a_later_valid_request_overwrites_the_pending_one ... FAILED
+test an_invalid_request_does_not_clear_a_valid_pending_one ... FAILED
+test a_pending_request_invalidated_by_a_phase_change_is_consumed_and_yields_nothing ... FAILED
+```
+
+Those later failures separated three easy-to-conflate one-slot semantics:
+valid requests overwrite, invalid requests do not clear, and consume takes the
+slot before revalidating against the current phase. Poison-recovery tests live
+inside the module because the lock is private. As with the newline excerpts,
+this is a development log rather than independently reproducible proof of
+history; the 28 retained DAgger tests are the auditable current evidence.
+
 ## Final GREEN totals
 
 `cargo test --workspace --all-targets --all-features`
@@ -396,11 +428,13 @@ input independence, and insertion order.
 | Target | Tests |
 | --- | ---: |
 | `rerobot-cli` library unit tests | 1 |
+| `rerobot-core` `rollout::dagger` unit tests | 2 |
 | `rerobot-core` `tests/action_interpolator.rs` | 50 |
 | `rerobot-core` `tests/byte_count.rs` | 15 |
 | `rerobot-core` `tests/ring_buffer.rs` | 37 |
 | `rerobot-core` `tests/rename_processor.rs` | 23 |
 | `rerobot-core` `tests/newline_task_processor.rs` | 24 |
+| `rerobot-core` `tests/dagger.rs` | 26 |
 | `rerobot-core` `tests/types.rs` | 20 |
 | `rerobot-core` `tests/sysinfo.rs` | 13 |
 | `rerobot-compat` `tests/inventory.rs` | 17 |
@@ -408,7 +442,7 @@ input independence, and insertion order.
 | `rerobot-cli` `tests/cli.rs` | 21 |
 | `rerobot-cli` `tests/info.rs` | 18 |
 | `rerobot-cli` `tests/which.rs` | 21 |
-| **Total** | **270** |
+| **Total** | **298** |
 
 The 18 `lerobot-*` binary targets contribute no unit tests; their behaviour is
 covered by `tests/cli.rs`, which runs the built executables as subprocesses.
@@ -420,12 +454,12 @@ covered by `tests/cli.rs`, which runs the built executables as subprocesses.
 
 | Crate | Doctests |
 | --- | ---: |
-| `rerobot-core` (crate README + item docs) | 24 |
+| `rerobot-core` (crate README + item docs) | 28 |
 | `rerobot-compat` (crate README) | 2 |
 | `rerobot-cli` (crate README + `which`) | 3 |
-| **Total** | **29** |
+| **Total** | **33** |
 
-182 of the 270 are the compatibility slice itself (`rerobot-core`), which is
+210 of the 298 are the compatibility slice itself (`rerobot-core`), which is
 where the milestone's parity claim lives.
 
 ## Whole-workspace gate

@@ -10,6 +10,7 @@ pub mod action_interpolator;
 pub mod byte_count;
 pub mod processor;
 pub mod ring_buffer;
+pub mod rollout;
 pub mod sysinfo;
 pub mod types;
 

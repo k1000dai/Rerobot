@@ -139,6 +139,69 @@ assert_eq!(estimate_frame_bytes(&frame), 8 + 5 + 16);
 assert_eq!(estimate_frame_bytes(&Frame::new()), 1); // max(total, 1)
 ```
 
+## `rollout::dagger` — `lerobot/rollout/strategies/dagger.py`
+
+The DAgger event state machine, and only that: the hand-off between the
+input-device threads that request phase changes and the main loop that applies
+them. `DAggerStrategy` itself, the keyboard and pedal listeners, the
+teleoperator handover, dataset recording and policy inference are **not**
+ported.
+
+Requests are validated against the phase when they are made and again when they
+are consumed, so a phase moved in between cannot be driven into an impossible
+state:
+
+```rust
+use rerobot_core::rollout::dagger::{
+    DAggerEvents, DAggerPhase, CORRECTION_EVENT, PAUSE_RESUME_EVENT,
+};
+
+let events = DAggerEvents::new();
+assert_eq!(events.phase(), DAggerPhase::Autonomous);
+
+events.request_transition(PAUSE_RESUME_EVENT);
+assert_eq!(
+    events.consume_transition(),
+    Some((DAggerPhase::Autonomous, DAggerPhase::Paused))
+);
+
+// `correction` is valid from PAUSED. A later misspelled (invalid) request does
+// not clear that valid pending request.
+events.request_transition(CORRECTION_EVENT);
+events.request_transition("pause_resume_but_misspelled"); // ignored
+assert_eq!(
+    events.consume_transition(),
+    Some((DAggerPhase::Paused, DAggerPhase::Correcting))
+);
+assert_eq!(events.consume_transition(), None); // consumed exactly once
+```
+
+`reset` restores a fresh session — except for `stop_recording`, which upstream
+deliberately leaves alone, so a session stopped with ESC stays stopped:
+
+```rust
+use rerobot_core::rollout::dagger::{DAggerEvents, DAggerPhase, PAUSE_RESUME_EVENT};
+
+let events = DAggerEvents::new();
+events.set_phase(DAggerPhase::Correcting);
+events.request_transition("correction");
+events.upload_requested.set();
+events.stop_recording.set();
+
+events.reset();
+
+assert_eq!(events.phase(), DAggerPhase::Autonomous);
+assert_eq!(events.consume_transition(), None); // the pending request is gone
+assert!(!events.upload_requested.is_set());
+assert!(events.stop_recording.is_set()); // upstream does not clear this one
+```
+
+Every method takes `&self` and is safe to call from several threads, because
+the phase and the pending request live behind one lock and are read and written
+together. `DAggerPhase` carries upstream's member values (`autonomous`,
+`paused`, `correcting`) and by-value lookup, but no `serde` support: upstream's
+enum is a plain `enum.Enum` with no JSON wire form to be compatible with.
+
 ## `processor::rename` — `lerobot/processor/rename_processor.py`
 
 ```rust

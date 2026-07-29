@@ -96,7 +96,7 @@ pinned commit; it is a size indicator, not a progress metric.
 | `lerobot/rewards` | unimplemented | 24 | Reward classifiers and success detectors. |
 | `lerobot/rl` | unimplemented | 21 | HIL-SERL actor/learner infrastructure. |
 | `lerobot/robots` | hardware-gated | 53 | Per-robot drivers (SO-100/101, LeKiwi, Reachy2, Unitree, ...). |
-| `lerobot/rollout` | partial | 18 | `ring_buffer.RolloutRingBuffer` is ported and tested, including its byte-accounting quirks. Rollout strategies and the policy loop are not. |
+| `lerobot/rollout` | partial | 18 | `ring_buffer.RolloutRingBuffer` is ported and tested, including its byte-accounting quirks, as is the DAgger event state machine (`strategies.dagger.DAggerPhase`, its four transitions and `DAggerEvents`). The DAgger strategy itself, the input devices it listens to, the other rollout strategies and the policy loop are not. |
 | `lerobot/scripts` | partial | 20 | `lerobot_info` is ported and runnable. The other 17 entry points exist only as executables that fail with a stable unsupported error. |
 | `lerobot/teleoperators` | hardware-gated | 59 | Leader arms, gamepads, keyboards, phone teleop. |
 | `lerobot/templates` | unimplemented | 0 | Non-Python scaffolding templates; nothing to port yet. |
@@ -114,6 +114,7 @@ from upstream's own test-suite and from direct execution of the upstream Python.
 | `rerobot_core::types` | `lerobot/configs/types.py`, `lerobot/types.py` (`TransitionKey`) | `crates/rerobot-core/tests/types.rs` |
 | `rerobot_core::action_interpolator` | `lerobot/utils/action_interpolator.py` | `crates/rerobot-core/tests/action_interpolator.rs` |
 | `rerobot_core::ring_buffer` | `lerobot/rollout/ring_buffer.py` | `crates/rerobot-core/tests/ring_buffer.rs` |
+| `rerobot_core::rollout::dagger` | `lerobot/rollout/strategies/dagger.py` lines 83-159 (`DAggerPhase`, `_DAGGER_TRANSITIONS`, `DAggerEvents`) only | `crates/rerobot-core/tests/dagger.rs`, plus the poison-recovery unit tests in `crates/rerobot-core/src/rollout/dagger.rs` |
 | `rerobot_core::byte_count` | no upstream counterpart — it is the unbounded integer the byte accounting needs, standing in for a Python `int` | `crates/rerobot-core/tests/byte_count.rs` |
 | `rerobot_core::processor::rename` | `lerobot/processor/rename_processor.py` | `crates/rerobot-core/tests/rename_processor.rs` |
 | `rerobot_core::processor::newline_task` | `lerobot/processor/newline_task_processor.py` (`NewLineTaskProcessorStep` value transform, stateless lifecycle, and registry-name spelling only) | `crates/rerobot-core/tests/newline_task_processor.rs` |
@@ -147,6 +148,10 @@ a consequence of the target language, not a shortcut.
 | `NewLineTaskProcessorStep.transform_features` returns the identical `features` object it was handed | Returns an independent clone that compares equal and keeps its stage order | Value/ordering identity is ported; object identity and mutation sharing are not. This is more than a Python `is` difference: later nested mutation is observable. |
 | `complementary_data` takes any Python object as the `task` value and dispatches with `isinstance` | Takes a `serde_json::Value` | Static JSON-domain boundary. Strings, null, booleans, objects, representable finite numbers, and arrays built from them follow the matching Python branches. Oversized Python integers, NaN/infinities, tuples, bytes, arbitrary objects and ill-formed Unicode are outside the domain rather than approximated; see below. |
 | Upstream registers the step as `smolvla_new_line_processor` and reconstructs it through the processor registry | Exposes that exact spelling as `REGISTRY_NAME` only | Registry lookup, pipeline serialization and config reconstruction are not yet ported. The constant prevents spelling drift but is not a claim that old serialized pipelines can already be loaded. |
+| `DAggerPhase` is a plain `enum.Enum`, so `str(DAggerPhase.PAUSED)` is `"DAggerPhase.PAUSED"` and `json.dumps` refuses the member outright | `as_str`/`FromStr` are the member `.value` and upstream's by-value lookup `DAggerPhase("paused")`; `Display` is that same value, and there is deliberately **no** `serde` impl | The values are ported; Python's `str()` spelling is not, because it is a repr rather than a wire format. No `serde` impl is provided precisely because upstream has no serialization to be compatible with — unlike the `str`-backed enums in `configs.types`, which do. |
+| `DAggerEvents.stop_recording` / `upload_requested` are `threading.Event`s | `EventFlag`, an `AtomicBool` exposing `set`/`clear`/`is_set` | Those three are the only operations the upstream DAgger path performs on them. `Event.wait()` and its timeout are not ported rather than approximated; nothing upstream blocks on these flags. |
+| `DAggerEvents` guards its state with a `threading.Lock`, which has no poison flag | `std::sync::Mutex` whose poisoning is recovered with `into_inner` | A panic in one thread must not convert every later call into a panic, which the `unwrap()` idiom would do. The recovered state is the one the panicking section left behind, not a silent reset. Verified by unit tests inside the module, because the lock is private and no public method runs caller code while holding it. |
+| `request_transition(event: str)` accepts any `str` | Takes `&str` | Same domain; unknown names are ignored rather than rejected, exactly as upstream's dict lookup does. |
 | `lerobot-info` reports installed Python package versions | Reports `N/A (not ported)` for those keys, distinct from upstream's `N/A` | A Rust build has no `torch`/`datasets`/`numpy`. Inventing versions would make bug reports actively misleading; reusing `N/A` would claim a check that never happened. |
 | `lerobot-info`'s `LeRobot version` is the installed `lerobot` distribution version | `0.6.1 (upstream target; Rerobot 0.1.0, a partial Rust port)` | There is no `lerobot` Python distribution in a Rerobot install. The value names both versions rather than fabricating one or dropping the key. |
 | `lerobot-info`'s `Platform` is `platform.platform()`, e.g. `macOS-15.0-arm64-arm-64bit` | `<os>-<arch>` from `std::env::consts`, e.g. `macos-aarch64` | Rust's standard library exposes no OS release or libc version. The port reports only what it can know for certain rather than shelling out to `uname` or guessing a release string. |
@@ -176,6 +181,16 @@ Reproduced, not "fixed", because callers can observe them:
 * `ActionInterpolator.add`: `self._prev` is replaced by the *action*, not by the
   broadcast result, so a length-1 action after a length-3 previous leaves the
   interpolator able to accept any length next time.
+* `DAggerEvents.reset`: clears `upload_requested` and **not** `stop_recording`,
+  so a session stopped with ESC stays stopped across a reset. The asymmetry is
+  reproduced, not corrected.
+* `DAggerEvents.request_transition`: an invalid or unknown event is ignored
+  *without* clearing a valid request that is already pending, and a later valid
+  request overwrites an earlier one — there is a single pending slot.
+* `DAggerEvents.consume_transition`: the pending request is cleared *before* the
+  transition table is consulted, so a request invalidated by an intervening
+  `phase` write returns `None` and is dropped rather than held until its phase
+  comes back.
 * `NewLineTaskProcessorStep`: the list branch is all-or-nothing. One non-string
   element leaves the whole list untouched, so `["a", 1]` keeps `"a"` without its
   newline; and because `all(...)` over an empty list is `True`, an empty list

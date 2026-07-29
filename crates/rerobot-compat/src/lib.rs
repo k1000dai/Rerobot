@@ -333,7 +333,9 @@ pub static MODULE_FAMILIES: &[ModuleFamily] = &[
         upstream_modules: 18,
         note:
             "`ring_buffer.RolloutRingBuffer` is ported and tested, including its byte-accounting \
-               quirks. Rollout strategies and the policy loop are not.",
+               quirks, as is the DAgger event state machine (`strategies.dagger.DAggerPhase`, its \
+               four transitions and `DAggerEvents`). The DAgger strategy itself, the input \
+               devices it listens to, the other rollout strategies and the policy loop are not.",
     },
     ModuleFamily {
         name: "scripts",

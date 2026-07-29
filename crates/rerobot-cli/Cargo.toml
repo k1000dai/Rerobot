@@ -1,0 +1,103 @@
+[package]
+name = "rerobot-cli"
+description = "The lerobot-* executables, ported to Rust. Implemented commands run natively; every not-yet-ported command fails with a stable unsupported error."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[dependencies]
+rerobot-core.workspace = true
+rerobot-compat.workspace = true
+
+# `shutil.which` accepts a candidate on `os.access(name, F_OK | X_OK)`, and the
+# search path falls back to `os.confstr("CS_PATH")` when PATH is unset. Both are
+# libc calls with no `std` equivalent, and `_CS_PATH` has a different value on
+# every Unix, so hand-declaring them would hardcode a portability bug.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[lints.rust]
+missing_docs = "warn"
+
+[lib]
+name = "rerobot_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lerobot-info"
+path = "src/bin/lerobot_info.rs"
+
+[[bin]]
+name = "lerobot-calibrate"
+path = "src/bin/lerobot_calibrate.rs"
+
+[[bin]]
+name = "lerobot-find-cameras"
+path = "src/bin/lerobot_find_cameras.rs"
+
+[[bin]]
+name = "lerobot-find-port"
+path = "src/bin/lerobot_find_port.rs"
+
+[[bin]]
+name = "lerobot-record"
+path = "src/bin/lerobot_record.rs"
+
+[[bin]]
+name = "lerobot-replay"
+path = "src/bin/lerobot_replay.rs"
+
+[[bin]]
+name = "lerobot-setup-motors"
+path = "src/bin/lerobot_setup_motors.rs"
+
+[[bin]]
+name = "lerobot-teleoperate"
+path = "src/bin/lerobot_teleoperate.rs"
+
+[[bin]]
+name = "lerobot-eval"
+path = "src/bin/lerobot_eval.rs"
+
+[[bin]]
+name = "lerobot-train"
+path = "src/bin/lerobot_train.rs"
+
+[[bin]]
+name = "lerobot-train-tokenizer"
+path = "src/bin/lerobot_train_tokenizer.rs"
+
+[[bin]]
+name = "lerobot-dataset-viz"
+path = "src/bin/lerobot_dataset_viz.rs"
+
+[[bin]]
+name = "lerobot-find-joint-limits"
+path = "src/bin/lerobot_find_joint_limits.rs"
+
+[[bin]]
+name = "lerobot-imgtransform-viz"
+path = "src/bin/lerobot_imgtransform_viz.rs"
+
+[[bin]]
+name = "lerobot-edit-dataset"
+path = "src/bin/lerobot_edit_dataset.rs"
+
+[[bin]]
+name = "lerobot-setup-can"
+path = "src/bin/lerobot_setup_can.rs"
+
+[[bin]]
+name = "lerobot-annotate"
+path = "src/bin/lerobot_annotate.rs"
+
+[[bin]]
+name = "lerobot-rollout"
+path = "src/bin/lerobot_rollout.rs"

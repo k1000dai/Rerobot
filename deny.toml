@@ -1,0 +1,43 @@
+# cargo-deny configuration. Run with `cargo deny check`.
+#
+# Rerobot is Apache-2.0 (matching upstream LeRobot) and keeps its dependency
+# tree deliberately small, so the policy here is strict on purpose: a new
+# dependency should be a conscious decision, not a transitive surprise.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# Permissive licenses only. Rerobot ships Apache-2.0 binaries; anything
+# copyleft or unclear needs an explicit discussion before it lands.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Nothing is banned outright yet. Candidates if they ever appear transitively:
+# heavyweight async runtimes and anything pulling in a Python interpreter, both
+# of which would undercut the "pure Rust, no sidecar" property.
+deny = []
+skip = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

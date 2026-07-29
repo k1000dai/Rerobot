@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = ["crates/rerobot-core", "crates/rerobot-compat", "crates/rerobot-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# Floor imposed by the locked dependency tree: indexmap 2.14.0 declares
+# rust-version 1.85 and hashbrown 0.17.1 declares 1.85.0, so nothing below that
+# can build this lockfile. The workspace's own code needs less, but the promise
+# has to cover what users actually install.
+#
+# Asserted by the `msrv` CI job, which reads this exact value and runs
+# `cargo build`/`cargo test --locked` on it. Do not raise it without a
+# dependency or language feature that requires the raise.
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/k1000dai/Rerobot"
+homepage = "https://github.com/k1000dai/Rerobot"
+authors = ["The Rerobot contributors"]
+keywords = ["robotics", "lerobot", "machine-learning"]
+categories = ["science::robotics"]
+
+[workspace.dependencies]
+rerobot-core = { version = "0.1.0", path = "crates/rerobot-core" }
+rerobot-compat = { version = "0.1.0", path = "crates/rerobot-compat" }
+indexmap = { version = "2.7", features = ["serde"] }
+# Upstream's `PolicyFeature.shape` and `ActionInterpolator.multiplier` are
+# Python `int`s, and the byte accounting is one too. `num-bigint` supplies the
+# unbounded integers those need; its own serde format is a limb tuple, so the
+# JSON wire shape is written by hand here instead of derived from it.
+num-bigint = "0.4.8"
+serde = { version = "1.0", features = ["derive"] }
+# `raw_value` is additive — it adds `RawValue` and nothing else changes — and it
+# is what lets a shape dimension be written and read back as an exact JSON
+# integer of any length. `arbitrary_precision` would do the same job but it
+# rewrites `serde_json::Number` for every crate in the dependency graph, which a
+# library has no business imposing on its users.
+serde_json = { version = "1.0", features = ["preserve_order", "raw_value"] }
+
+[profile.release]
+lto = "thin"

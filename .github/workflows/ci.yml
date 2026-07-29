@@ -1,0 +1,230 @@
+name: CI
+
+# Third-party action pinning policy
+# ---------------------------------
+# Every `uses:` below is pinned to a full 40-character commit SHA, because a tag
+# (even `v4`) is a mutable pointer the action's owner can move — pinning one
+# means trusting them not to, forever. The trailing comment records which
+# release each SHA was, so the pin stays readable and bumpable.
+#
+# Resolved and verified against the GitHub API at pin time:
+#   actions/checkout                 11d5960 = tag v4.4.0
+#   Swatinem/rust-cache              c193711 = tag v2.9.1
+#   EmbarkStudios/cargo-deny-action  3c63498 = tag v2.1.1
+#   dtolnay/rust-toolchain           4cda84d = head of the `stable` branch on
+#                                    2026-07-16. This action publishes no
+#                                    release tags for its toolchain branches;
+#                                    at this commit the `toolchain` input
+#                                    defaults to `stable`, which is what the
+#                                    jobs that do not pass it rely on.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: no job here writes to the repository, publishes a package, or
+# comments on a PR, so read access to the contents is the whole requirement.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    name: gates (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch, 2026-07-16
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --all-targets --all-features
+
+      # The `cfg(windows)` half of the `shutil.which` port cannot run on the
+      # machine it was written on, so `windows-latest` is where PATHEXT
+      # expansion, the current-directory rule, and `ntpath.split` are actually
+      # exercised. Re-running with NoDefaultCurrentDirectoryInExePath set takes
+      # the other branch of `NeedCurrentDirectoryForExePath`: the Win32 call is
+      # made rather than reimplemented, so this proves neither branch breaks
+      # resolution. docs/compatibility.md records that it does not pin *which*
+      # branch was taken.
+      - name: cargo test (Windows, no default current directory)
+        if: runner.os == 'Windows'
+        env:
+          NoDefaultCurrentDirectoryInExePath: '1'
+        run: cargo test --workspace --all-targets --all-features
+
+      - name: cargo test --doc
+        run: cargo test --workspace --doc
+
+      - name: cargo build --release
+        run: cargo build --workspace --release
+
+  msrv:
+    # The minimum supported Rust version is a published promise: `rust-version`
+    # in Cargo.toml is what `cargo install` enforces for users. Building on it is
+    # the only thing that makes the claim true.
+    name: MSRV (rust-version from Cargo.toml)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Read the version out of the manifest rather than repeating it here: a
+      # hardcoded toolchain would let the two drift and quietly stop testing the
+      # version users are promised.
+      - name: Read the declared MSRV
+        id: msrv
+        run: |
+          version="$(grep -m1 -E '^rust-version[[:space:]]*=' Cargo.toml \
+                     | sed -E 's/.*"([^"]+)".*/\1/')"
+          if [ -z "$version" ]; then
+            echo "no rust-version in the workspace Cargo.toml" >&2
+            exit 1
+          fi
+          echo "declared MSRV: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install the declared MSRV toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch, 2026-07-16
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Confirm the toolchain in use is the declared one
+        run: |
+          rustc --version
+          rustc --version | grep -q '${{ steps.msrv.outputs.version }}'
+
+      # --locked, because the MSRV is a property of the *locked* tree: a fresh
+      # resolve could pull a newer dependency with a higher floor and pass here
+      # while failing for anyone installing from the lockfile.
+      - name: cargo build (MSRV)
+        run: cargo build --workspace --all-features --locked
+
+      - name: cargo test (MSRV)
+        run: cargo test --workspace --all-targets --all-features --locked
+
+  package:
+    name: package publishable crates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch, 2026-07-16
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # --workspace is required rather than three -p runs: rerobot-cli depends
+      # on the other two, which are not on crates.io, so only the workspace
+      # form builds the temporary local registry that verification needs.
+      - name: cargo package
+        run: cargo package --workspace --allow-dirty
+
+  smoke:
+    name: lerobot-* smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch, 2026-07-16
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Build executables
+        run: cargo build --workspace --release
+
+      - name: lerobot-info runs for real
+        run: |
+          ./target/release/lerobot-info
+          out="$(./target/release/lerobot-info)"
+          printf '%s\n' "$out" | grep -q '^- LeRobot version:'
+          printf '%s\n' "$out" | grep -q '^- Platform:'
+          printf '%s\n' "$out" | grep -q '^- FFmpeg version:'
+          printf '%s\n' "$out" | grep -qx -- '- Using GPU in script?: <fill in>'
+          printf '%s\n' "$out" | grep -q "^- lerobot scripts: \['lerobot-calibrate', "
+          # Upstream's 15 get_sys_info keys, and nothing else.
+          test "$(printf '%s\n' "$out" | wc -l)" -eq 15
+
+      - name: lerobot-info still finds ffmpeg with PATH removed
+        run: |
+          # CPython 3.12 `shutil.which` falls back to `os.confstr("CS_PATH")`,
+          # or `os.defpath`, when PATH is absent from the environment. A port
+          # that returned None here would report an installed ffmpeg as missing
+          # for every process started with a scrubbed environment.
+          if ! command -v ffmpeg > /dev/null; then
+            # Nothing to detect, so the assertion below would prove nothing.
+            # The unit test `an_unset_search_path_falls_back_to_the_system_default`
+            # still covers the fallback on this runner.
+            echo "::warning::no ffmpeg on this runner; skipping the PATH-less probe"
+            exit 0
+          fi
+          out="$(env -u PATH ./target/release/lerobot-info)"
+          printf '%s\n' "$out" | grep -q '^- FFmpeg version:'
+          if printf '%s\n' "$out" | grep -qx -- '- FFmpeg version: N/A'; then
+            echo "PATH-less run reported ffmpeg absent; the CS_PATH fallback is not working"
+            printf '%s\n' "$out"
+            exit 1
+          fi
+
+      - name: lerobot-info reports no compatibility status
+        run: |
+          # Port status belongs in --help and docs/compatibility.md; this report
+          # exists to be comparable with upstream's.
+          scripts="$(./target/release/lerobot-info | grep '^- lerobot scripts:')"
+          for label in partial unimplemented hardware-gated implemented; do
+            if printf '%s\n' "$scripts" | grep -q "$label"; then
+              echo "the scripts list leaked port status: $scripts"; exit 1
+            fi
+          done
+
+      - name: unported commands fail with the documented contract
+        run: |
+          set +e
+          ./target/release/lerobot-train > out.txt 2> err.txt
+          code=$?
+          set -e
+          test "$code" -eq 2 || { echo "expected exit 2, got $code"; exit 1; }
+          test ! -s out.txt || { echo "expected empty stdout"; cat out.txt; exit 1; }
+          grep -q '^lerobot-train: unsupported in Rerobot' err.txt
+          test "$(wc -l < err.txt)" -eq 1
+          # The error has to point somewhere a user without a checkout can go.
+          grep -q 'https://github.com/k1000dai/Rerobot/blob/main/docs/compatibility.md' err.txt
+
+      - name: --help and --version work for every entry point
+        run: |
+          for bin in ./target/release/lerobot-*; do
+            case "$bin" in *.d) continue;; esac
+            "$bin" --help > /dev/null
+            "$bin" --version > /dev/null
+            "$bin" --help | grep -q 'https://github.com/k1000dai/Rerobot'
+          done
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check

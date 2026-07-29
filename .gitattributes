@@ -1,0 +1,4 @@
+# Keep source and configuration formatting deterministic on every runner.
+# In particular, rustfmt.toml requires Unix newlines; Git for Windows otherwise
+# checks text files out as CRLF before `cargo fmt --check` runs.
+* text=auto eol=lf

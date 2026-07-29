@@ -85,7 +85,7 @@ pinned commit; it is a size indicator, not a progress metric.
 | `lerobot/common` | unimplemented | 4 | Shared constants and mixins used by the unported families. |
 | `lerobot/configs` | partial | 11 | `configs.types` str-enums and `PolicyFeature` are ported and tested. Draccus-based config parsing, policy configs, and train/eval configs are not. |
 | `lerobot/data_processing` | unimplemented | 3 | Dataset-level batch processing helpers. |
-| `lerobot/datasets` | unimplemented | 22 | LeRobotDataset format, video decoding, and Hub sync. |
+| `lerobot/datasets` | partial | 22 | The `meta/info.json` slice is ported and tested: `utils`' path constants and `DatasetInfo` (defaults, shape coercion, validation, `to_dict`/`from_dict`), plus `io_utils.load_info`/`write_info` against a local directory. `LeRobotDatasetMetadata`, tasks, stats, episodes, parquet, video decoding and Hub sync are not. |
 | `lerobot/envs` | unimplemented | 10 | Gymnasium environment factories. |
 | `lerobot/jobs` | unimplemented | 4 | Hugging Face Jobs launchers. |
 | `lerobot/model` | unimplemented | 2 | Shared model plumbing. |
@@ -102,7 +102,7 @@ pinned commit; it is a size indicator, not a progress metric.
 | `lerobot/templates` | unimplemented | 0 | Non-Python scaffolding templates; nothing to port yet. |
 | `lerobot/transforms` | unimplemented | 2 | Image augmentation transforms built on torchvision. |
 | `lerobot/transport` | unimplemented | 4 | gRPC transport for async inference. |
-| `lerobot/utils` | partial | 25 | `action_interpolator` is ported and tested. Random/IO/hub/train utilities are not. |
+| `lerobot/utils` | partial | 25 | `action_interpolator` is ported and tested, as are `io_utils.load_json` and `io_utils.write_json` for local paths. Random/hub/train utilities, and the video and image writers in `io_utils`, are not. |
 
 ## What is actually ported
 
@@ -118,6 +118,10 @@ from upstream's own test-suite and from direct execution of the upstream Python.
 | `rerobot_core::byte_count` | no upstream counterpart — it is the unbounded integer the byte accounting needs, standing in for a Python `int` | `crates/rerobot-core/tests/byte_count.rs` |
 | `rerobot_core::processor::rename` | `lerobot/processor/rename_processor.py` | `crates/rerobot-core/tests/rename_processor.rs` |
 | `rerobot_core::processor::newline_task` | `lerobot/processor/newline_task_processor.py` (`NewLineTaskProcessorStep` value transform, stateless lifecycle, and registry-name spelling only) | `crates/rerobot-core/tests/newline_task_processor.rs` |
+| `rerobot_core::dataset` (constants) | `lerobot/datasets/utils.py` lines 78-97 | `crates/rerobot-core/tests/dataset_info.rs` |
+| `rerobot_core::dataset::info` | `lerobot/datasets/utils.py` lines 104-225 (`DatasetInfo`, minus the deprecated dict-style layer) | `crates/rerobot-core/tests/dataset_info.rs` |
+| `rerobot_core::dataset::json` | `lerobot/utils/io_utils.py`'s `JsonLike` alias, and CPython 3.12's `json` reader/writer for that domain | `crates/rerobot-core/tests/dataset_json.rs` |
+| `rerobot_core::dataset::io` | `lerobot/datasets/io_utils.py` lines 120-134 (`write_info`, `load_info`), `lerobot/utils/io_utils.py` lines 26-50 (`load_json`, `write_json`) | `crates/rerobot-core/tests/dataset_io.rs` |
 | `rerobot_core::sysinfo` | `lerobot/scripts/lerobot_info.py` (pure parts) | `crates/rerobot-core/tests/sysinfo.rs` |
 | `rerobot_cli::which` | `shutil.which`, as called by `get_ffmpeg_version` | `crates/rerobot-cli/tests/which.rs` |
 | `lerobot-info` | `lerobot/scripts/lerobot_info.py` | `crates/rerobot-cli/tests/{info,cli,which}.rs` |
@@ -152,6 +156,12 @@ a consequence of the target language, not a shortcut.
 | `DAggerEvents.stop_recording` / `upload_requested` are `threading.Event`s | `EventFlag`, an `AtomicBool` exposing `set`/`clear`/`is_set` | Those three are the only operations the upstream DAgger path performs on them. `Event.wait()` and its timeout are not ported rather than approximated; nothing upstream blocks on these flags. |
 | `DAggerEvents` guards its state with a `threading.Lock`, which has no poison flag | `std::sync::Mutex` whose poisoning is recovered with `into_inner` | A panic in one thread must not convert every later call into a panic, which the `unwrap()` idiom would do. The recovered state is the one the panicking section left behind, not a silent reset. Verified by unit tests inside the module, because the lock is private and no public method runs caller code while holding it. |
 | `request_transition(event: str)` accepts any `str` | Takes `&str` | Same domain; unknown names are ignored rather than rejected, exactly as upstream's dict lookup does. |
+| `DatasetInfo.__post_init__` rewrites `features[...]["shape"]` **in place**, so the caller's own dict — and, via `from_dict`, the dict `json.load` returned — comes back with a tuple in it | `DatasetInfo::new` / `from_dict` take or copy their input and mutate only the value they own | Deliberate ownership boundary, and the one upstream behaviour here a caller can *see* rather than infer. In Python, `features = {"a": {"shape": [1, 2]}}` passed to the constructor leaves `features["a"]["shape"] == (1, 2)` afterwards, and that happens even when construction then fails on `fps`. Rerobot cannot reproduce it without handing out aliased mutable state, so it does not. Values and ordering match; aliasing does not. |
+| `DatasetInfo` is an unchecked dataclass: `codebase_version=5`, `fps=30.5` and `splits=7` are all accepted, and a bad type surfaces later (`fps="30"` raises `TypeError` from the `<=` comparison, `features=[]` from `.values()`) or never | Typed fields; a value outside the domain is `DatasetInfoError::WrongType`, naming the field, the required Python type and the one found | Static typing. The message is deliberately *not* one of upstream's — there is no upstream message to match, because upstream mostly does not fail at all. `fps=30.5` is the clearest case: upstream stores the float and writes `30.5` into `info.json` where the field is declared `int`. |
+| `fps=True` is accepted, because Python's `bool` is an `int` subclass, and `json.dump` writes it back as `true` | A JSON `true` in any integer field is `DatasetInfoError::WrongType { expected: "int", found: "bool" }` | Reproducing it would mean every counter remembering whether it had been spelled as a bool, so that `to_dict` could write `true` again. The narrower domain is stated rather than silently coerced to `1`, which would change the file on the next write. |
+| `logger.warning(f"Unknown fields in DatasetInfo: {unknown}. …")` is emitted from `from_dict` | `DatasetInfo::from_dict` emits the same sentence at warning level through Rust's `log` facade before attempting construction; `unknown_fields` and `unknown_fields_warning` also expose the sorted list and exact text | Logger handlers and filters remain application configuration, just as Python logging configuration is process-wide. The list itself is exact: Python's `sorted()` on `str` orders by code point, which is Rust `String`'s `Ord` order for valid Unicode. |
+| `json.dump(..., indent=4)` goes through `open(fpath, "w")`, whose text mode translates `\n` to `\r\n` on Windows and encodes with the process's locale encoding | Always UTF-8, always LF | The JSON `json.dump` itself produces is identical; the translation and the encoding are artifacts of how the file was opened, not of the format. A locale-dependent `meta/info.json` is not a format Rerobot can be compatible with on both sides, and guessing an encoding is worse than naming one. On any platform whose locale is UTF-8 — which includes upstream's own CI — the bytes match exactly. |
+| `DatasetInfo` carries a deprecated dict-style layer (`__getitem__`, `__setitem__`, `__contains__`, `get`) that warns and forwards to attribute access | Not ported | It exists to keep un-migrated `info["key"]` call-sites working during upstream's own migration. A Rust port has no such call-sites, and public fields already are the attribute access it forwards to. |
 | `lerobot-info` reports installed Python package versions | Reports `N/A (not ported)` for those keys, distinct from upstream's `N/A` | A Rust build has no `torch`/`datasets`/`numpy`. Inventing versions would make bug reports actively misleading; reusing `N/A` would claim a check that never happened. |
 | `lerobot-info`'s `LeRobot version` is the installed `lerobot` distribution version | `0.6.1 (upstream target; Rerobot 0.1.0, a partial Rust port)` | There is no `lerobot` Python distribution in a Rerobot install. The value names both versions rather than fabricating one or dropping the key. |
 | `lerobot-info`'s `Platform` is `platform.platform()`, e.g. `macOS-15.0-arm64-arm-64bit` | `<os>-<arch>` from `std::env::consts`, e.g. `macos-aarch64` | Rust's standard library exposes no OS release or libc version. The port reports only what it can know for certain rather than shelling out to `uname` or guessing a release string. |
@@ -195,6 +205,32 @@ Reproduced, not "fixed", because callers can observe them:
   element leaves the whole list untouched, so `["a", 1]` keeps `"a"` without its
   newline; and because `all(...)` over an empty list is `True`, an empty list
   takes the list branch and is rebuilt as an empty list.
+* `DatasetInfo.to_dict`: `tools` is dropped only when it is `None`. An empty
+  list is a *declaration of no tools* and is written as `"tools": []`, so the
+  two are not interchangeable on disk.
+* `DatasetInfo.__post_init__`: only the feature dict's own `shape` key is
+  coerced. A `shape` nested deeper (`features.a.info.shape`) stays a list, a
+  `shape` that is not a list at all (`"xy"`) is left alone, and `[]` becomes an
+  empty tuple that `to_dict` turns back into `[]`.
+* `DatasetInfo.__post_init__`: the shape coercion runs *before* the four
+  positivity checks, so upstream rewrites the features even on the path that
+  then raises. The four checks run in declaration order, so an info with both
+  `fps=0` and `chunks_size=0` is reported against `fps`.
+* `DatasetInfo`: assigning to a field does not re-run `__post_init__`, so
+  `info.fps = 0` is reachable and `to_dict()` will happily write it. Rerobot's
+  fields are public for the same reason, and `post_init` is public so a caller
+  can opt back into the checks.
+* `json.loads`: `NaN`, `Infinity` and `-Infinity` are accepted by default and
+  `json.dump` emits them, so a non-finite float survives a round trip through
+  `meta/info.json` even though JSON has no literal for one. The lowercase
+  spellings (`nan`, `infinity`) are *not* accepted.
+* `json.loads`: a number with no fraction and no exponent is an `int`, and any
+  fraction or exponent makes it a `float` — so `1.0`, `1E5` and `1e+5` are
+  floats whose values are integral, and `-0` is the integer `0` while `-0.0` is
+  the float `-0.0`.
+* `float.__repr__`, which is what `json.dump` writes: the decimal point moves to
+  exponent notation only when it lands at or below `-4` or above `16`, so `1e15`
+  is written `1000000000000000.0` and `1e16` is written `1e+16`.
 * `NewLineTaskProcessorStep`: `str.endswith("\n")` is exact. `"pick\r"`,
   `"pick\u{2028}"` and `"pick\u{0085}"` all gain a newline; only a trailing
   `"\n"` — including the `"\n"` of a `"\r\n"` — counts as already terminated.
@@ -220,6 +256,71 @@ by running the pinned module under CPython 3.12, not inferred:
 
 The keys are `String` for the same reason: a Python `dict` accepts any hashable
 key, and upstream only ever tests for `"task"`.
+
+### The `meta/info.json` value domain
+
+`serde_json::Value` is not the value domain this file is written in, so
+`rerobot_core::dataset::json::JsonLike` is used instead. It is a port of the
+type alias upstream itself declares in `lerobot/utils/io_utils.py`:
+
+```python
+JsonLike = str | int | float | bool | None | list["JsonLike"]
+         | dict[str, "JsonLike"] | tuple["JsonLike", ...]
+```
+
+Three differences from `serde_json::Value` are load-bearing here, and each is
+exercised by a real `info.json`:
+
+| Property | Why `serde_json::Value` is not enough | What `JsonLike` does |
+| --- | --- | --- |
+| A Python `int` is unbounded | Without `arbitrary_precision`, an integer past `u64`/`i64` is silently rounded through `f64`. Enabling that feature is rejected at the workspace level, because it rewrites `serde_json::Number` for every crate in the dependency graph. | `JsonLike::Int` is a `num_bigint::BigInt`; values have no fixed-width narrowing. The parser accepts bare decimal tokens up to its documented 100,000-character fail-closed budget, while programmatically constructed values remain unbounded. CPython's configurable decimal-conversion guard is another runtime boundary described below. |
+| `json.load` accepts `NaN`, `Infinity` and `-Infinity`; `json.dump` emits them | JSON has no literal for a non-finite number and `serde_json` rejects all three, so a file CPython wrote could not be read back. | `JsonLike::Float` is an `f64` including the non-finite values, with CPython's spellings on both sides. |
+| A `tuple` is not a `list` | `Value` has one sequence variant, so `(1, 2) != [1, 2]` — which `DatasetInfo` relies on — cannot be represented. | `JsonLike::Tuple` is separate from `JsonLike::Array`, compares unequal to it, and is written as a JSON array exactly as `json.dump` writes a tuple. `loads` never produces one. |
+
+The reader and writer are consequently ports of CPython 3.12's `json` module
+for this domain, not wrappers around a JSON library: `loads` reproduces the
+acceptance rules and the `JSONDecodeError` message, line, column and character
+offset of the **C scanner** CPython uses by default (whose wording differs from
+the pure-Python fallback in `json/decoder.py` — `Invalid control character at`
+rather than `Invalid control character '\x01' at`), counting code points rather
+than bytes as CPython does. `dumps_pretty` reproduces `json.dump(..., indent=4,
+ensure_ascii=False)` byte for byte.
+
+`float.__repr__` is ported rather than delegated to Rust's `{}`, which never
+uses exponent notation. Rust's `{:e}` supplies only the *number* of significant
+digits; the digits themselves are recomputed from the double's exact value with
+`BigInt` arithmetic and rounded half to even, because on an exact tie CPython's
+`_Py_dg_dtoa` rounds to an even last digit and Rust's formatter rounds upward.
+That is not hypothetical: eight doubles in a 30,623-value sweep differ, and
+`tests/dataset_json.rs` pins all eight. The port is checked against CPython
+3.12.13 over 747,248 doubles, 40,586 of them subnormal, with no disagreement.
+
+**This is not full JSON parity, and is not claimed as such.** The scope is the
+`meta/info.json` metadata domain. One input CPython accepts is refused:
+
+| Input | CPython | Rerobot |
+| --- | --- | --- |
+| `"\ud800"` — a string escape naming an unpaired surrogate | succeeds, yielding a `str` holding the lone surrogate | `ParseError` whose message is deliberately none of CPython's (`Unpaired surrogate escape (not representable in Rust)`), because a Rust `String` is well-formed UTF-8 and borrowing CPython's wording would imply CPython's behaviour |
+| an integer token or value beyond CPython 3.12's active `sys.get_int_max_str_digits()` limit (4,300 by default) | `json.load` / `json.dump` raises `ValueError` unless the process raises or disables the limit | accepted and written exactly as `BigInt`; Rerobot has no process-global decimal-conversion guard |
+| more than 128 nested arrays/objects | accepted up to CPython's active recursion limit, then raises `RecursionError` | returns `ParseError` with `Rerobot JSON nesting limit exceeded`; the explicit lower bound prevents malformed metadata from aborting the process through native stack exhaustion |
+| a caller programmatically constructs a value far deeper than the reader's 128-container limit | CPython's encoder and ordinary object destruction are governed by its recursion/runtime behavior | `dumps` / `dumps_pretty` use an explicit work stack, but derived `JsonLike` destruction, cloning, equality, and debug formatting remain recursive and can exhaust the native stack. Callers must keep constructed values within the documented reader depth when using those operations. |
+| metadata exceeding a resource budget | limited only by available resources plus CPython's recursion/integer guards | local files and `loads` input are capped at 16 MiB; one parse is capped at 100,000 values, 1,000,000 decoded characters per string/key, and 100,000 source characters per number. Exceeding any bound returns `LoadError::ResourceLimit` or `ParseError`, rather than relying on allocator failure. These bounds are far above ordinary `info.json` metadata and are intentional fail-closed divergences. |
+| a file whose bytes are not UTF-8 | decodes with the process's locale encoding | an IO error naming the path |
+| a `dict` with a non-`str` key | accepted by `json.dump` for `int`/`float`/`bool`/`None` keys, which it coerces to strings | not representable; keys are `String`, and upstream's own `JsonLike` alias already declares `dict[str, ...]` |
+
+The budgets bound predictable work caused by the input; they are not a promise
+that every process-wide allocator failure is recoverable. Parser-owned byte,
+character, string, array, object-table, and numeric-token reservations are
+fallible and become typed errors. Allocation performed internally by `BigInt`
+conversion and by caller operations still follows Rust's global allocator
+behavior.
+
+Within those stated boundaries, the alias values exercised by metadata —
+including astral-plane and combining characters, surrogate *pairs*, duplicate
+keys, and numeric tokens within CPython's active conversion limit — are handled
+identically to CPython, and the round trip is pinned by tests. This does not
+claim identical resource exhaustion, recursion limits, or process-global
+configuration outside the `meta/info.json` metadata domain.
 
 ### Numeric domain
 
@@ -317,5 +418,6 @@ crossed by Rerobot at this milestone, and none are simulated.
 ## Non-goals for this milestone
 
 * No Python sidecar, FFI bridge, or subprocess shim for the implemented core.
-* No model inference, no weight loading, no dataset format reading.
+* No model inference, no weight loading, and no dataset frame/Parquet reading;
+  only local `meta/info.json` metadata is read and written.
 * No hardware access beyond invoking `ffmpeg -version` for `lerobot-info`.

@@ -14,7 +14,7 @@ suite. Everything that does not work says so and exits non-zero.
 | Upstream target | `lerobot` 0.6.1 (`f37be3edbee60f3a09a5183788b91eb19f0c07d1`) |
 | Milestone | 1 of N — core utility slice + full CLI surface |
 | Runnable executables | 1 of 18 (`lerobot-info`); the other 17 exist and fail explicitly |
-| Tests | 298 integration/unit tests + 33 rustdoc tests, all passing |
+| Tests | 408 integration/unit tests + 42 rustdoc tests, all passing |
 | Minimum Rust | 1.85 — the floor of the locked dependency tree, built and tested on that exact toolchain by the `msrv` CI job |
 
 **Read [`docs/compatibility.md`](docs/compatibility.md) before using this.** It
@@ -73,6 +73,7 @@ reachable.
 | `DAggerPhase`, `DAggerEvents` (the event state machine only) | `lerobot/rollout/strategies/dagger.py` |
 | `RenameObservationsProcessorStep`, `rename_stats` | `lerobot/processor/rename_processor.py` |
 | `FeatureType`, `NormalizationMode`, `PolicyFeature`, `TransitionKey`, … | `lerobot/configs/types.py`, `lerobot/types.py` |
+| `DatasetInfo`, the `meta/` path constants, and `load_info`/`write_info` for a local dataset | `lerobot/datasets/utils.py`, `lerobot/datasets/io_utils.py`, `lerobot/utils/io_utils.py` |
 | `lerobot-info` and its parsing helpers | `lerobot/scripts/lerobot_info.py` |
 
 Worked examples for every one of these live in

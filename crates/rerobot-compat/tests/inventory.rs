@@ -223,7 +223,14 @@ fn partially_ported_families_are_exactly_the_ones_with_tests() {
         .collect();
     assert_eq!(
         partial,
-        vec!["configs", "processor", "rollout", "scripts", "utils"]
+        vec![
+            "configs",
+            "datasets",
+            "processor",
+            "rollout",
+            "scripts",
+            "utils"
+        ]
     );
 }
 

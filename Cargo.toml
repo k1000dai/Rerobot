@@ -25,11 +25,15 @@ categories = ["science::robotics"]
 rerobot-core = { version = "0.1.0", path = "crates/rerobot-core" }
 rerobot-compat = { version = "0.1.0", path = "crates/rerobot-compat" }
 indexmap = { version = "2.7", features = ["serde"] }
+log = "0.4.27"
 # Upstream's `PolicyFeature.shape` and `ActionInterpolator.multiplier` are
 # Python `int`s, and the byte accounting is one too. `num-bigint` supplies the
 # unbounded integers those need; its own serde format is a limb tuple, so the
 # JSON wire shape is written by hand here instead of derived from it.
 num-bigint = "0.4.8"
+# CPython 3.12's `repr(str)` uses Unicode 15.0 printability categories.
+# Version 0.6.0 is deliberately pinned to that Unicode data version.
+unicode-general-category = "=0.6.0"
 serde = { version = "1.0", features = ["derive"] }
 # `raw_value` is additive — it adds `RawValue` and nothing else changes — and it
 # is what lets a shape dimension be written and read back as an exact JSON

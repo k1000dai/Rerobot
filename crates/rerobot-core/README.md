@@ -1,7 +1,8 @@
 # rerobot-core
 
 Pure-Rust, behaviour-compatible ports of [Hugging Face LeRobot][upstream] core
-utilities. No IO, no PyTorch, no hardware, no Python sidecar.
+utilities and local `meta/info.json` metadata IO. No network IO, PyTorch,
+hardware, or Python sidecar.
 
 [upstream]: https://github.com/huggingface/lerobot
 
@@ -303,6 +304,162 @@ The step declares no configuration and no state, so `get_config` and
 `transform_features` returns an equal owned clone; unlike upstream, it does not
 alias its input. The processor registry and pipeline-config reconstruction are
 not part of this slice.
+
+## `dataset` — `lerobot/datasets/utils.py`, `lerobot/datasets/io_utils.py`
+
+The `meta/info.json` slice, and only that: the path constants, the
+`DatasetInfo` dataclass, and reading and writing that one file from a local
+directory. `LeRobotDatasetMetadata`, tasks, stats, episodes, parquet, video and
+the Hub are **not** ported and are not stubbed.
+
+```rust
+use indexmap::IndexMap;
+use rerobot_core::dataset::info::{DatasetInfo, Feature};
+use rerobot_core::dataset::json::{dumps_pretty, JsonLike};
+use rerobot_core::dataset::{DEFAULT_DATA_PATH, INFO_PATH};
+use num_bigint::BigInt;
+
+assert_eq!(INFO_PATH, "meta/info.json");
+
+let mut state = Feature::new();
+state.insert("dtype".to_string(), JsonLike::Str("float32".to_string()));
+state.insert("shape".to_string(), JsonLike::Array(vec![JsonLike::Int(BigInt::from(6))]));
+
+let info = DatasetInfo::new("v3.0", 30, IndexMap::from([
+    ("observation.state".to_string(), state),
+])).unwrap();
+
+assert_eq!(info.chunks_size, BigInt::from(1000)); // the eleven defaults
+assert_eq!(info.data_path, DEFAULT_DATA_PATH);
+assert_eq!(info.tools, None);
+
+// `__post_init__` turned the shape into a tuple, so it no longer equals the
+// list it came from — exactly as it does not in Python.
+assert_eq!(
+    info.features["observation.state"]["shape"],
+    JsonLike::Tuple(vec![JsonLike::Int(BigInt::from(6))]),
+);
+
+// ... and `to_dict` turns it back into a list, and drops the unset `tools`.
+let dict = info.to_dict();
+assert!(!dict.contains_key("tools"));
+assert!(dumps_pretty(&JsonLike::Object(dict)).contains("\"shape\": [\n                6\n            ]"));
+```
+
+Upstream's four positivity checks keep their exact wording, and every integer
+field is a `BigInt`, because a Python `int` is unbounded and nothing upstream
+clamps one:
+
+```rust
+use rerobot_core::dataset::info::{DatasetInfo, DatasetInfoError};
+use indexmap::IndexMap;
+use num_bigint::BigInt;
+
+let err = DatasetInfo::new("v3.0", 0, IndexMap::new()).unwrap_err();
+assert_eq!(err.to_string(), "fps must be positive, got 0");
+assert_eq!(err, DatasetInfoError::NotPositive { field: "fps", value: BigInt::from(0) });
+
+// Assignment does not re-run `__post_init__` — nor does it upstream — so the
+// check is available on its own.
+let mut info = DatasetInfo::new("v3.0", 30, IndexMap::new()).unwrap();
+info.chunks_size = BigInt::from(2).pow(200); // held exactly, not narrowed
+info.post_init().unwrap();
+assert_eq!(info.chunks_size, BigInt::from(2).pow(200));
+```
+
+Unknown top-level keys are ignored for forward compatibility, as upstream
+ignores them. `DatasetInfo::from_dict` emits the upstream-equivalent warning
+through the `log` facade; callers can additionally inspect and render the same
+sorted fields explicitly:
+
+```rust
+use rerobot_core::dataset::info::{unknown_fields_warning, DatasetInfo};
+use rerobot_core::dataset::json::loads;
+
+let raw = loads(r#"{"codebase_version": "v2.1", "fps": 30, "features": {}, "total_videos": 7}"#)
+    .unwrap()
+    .as_object()
+    .unwrap()
+    .clone();
+
+let info = DatasetInfo::from_dict(&raw).unwrap(); // the extra key is ignored
+assert_eq!(info.codebase_version, "v2.1");
+
+let unknown = DatasetInfo::unknown_fields(&raw); // sorted, by code point
+assert_eq!(unknown, vec!["total_videos"]);
+assert_eq!(
+    unknown_fields_warning(&unknown).unwrap(),
+    "Unknown fields in DatasetInfo: ['total_videos']. These will be ignored.",
+);
+```
+
+`dataset::json` is a port of the `JsonLike` alias `lerobot/utils/io_utils.py`
+declares, and of CPython 3.12's reader and writer for it — not a wrapper around
+a JSON library. It has to be: a Python `int` is unbounded, `json.load` accepts
+`NaN`/`Infinity`/`-Infinity` by default and `json.dump` emits them, and a
+`tuple` is not a `list`.
+
+```rust
+use rerobot_core::dataset::json::{dumps, loads, python_float_repr, JsonLike};
+use num_bigint::BigInt;
+use std::str::FromStr;
+
+// Integers keep every digit without fixed-width narrowing; parser resource
+// budgets are documented in the compatibility ledger.
+let huge = "340282366920938463463374607431768211457";
+assert_eq!(loads(huge).unwrap(), JsonLike::Int(BigInt::from_str(huge).unwrap()));
+assert_eq!(dumps(&loads(huge).unwrap()), huge);
+
+// The three non-finite tokens survive a round trip; the lowercase spellings
+// are not values, exactly as in CPython.
+assert_eq!(loads("Infinity").unwrap(), JsonLike::Float(f64::INFINITY));
+assert_eq!(dumps(&JsonLike::Float(f64::NEG_INFINITY)), "-Infinity");
+assert_eq!(loads("infinity").unwrap_err().msg, "Expecting value");
+
+// Floats are written by `float.__repr__`, not by Rust's `{}`.
+assert_eq!(python_float_repr(30.0), "30.0");
+assert_eq!(python_float_repr(1e15), "1000000000000000.0");
+assert_eq!(python_float_repr(1e16), "1e+16"); // repr switches over here
+
+// A malformed document carries CPython's own message and coordinates, in code
+// points rather than bytes.
+let err = loads(r#"{"a":01}"#).unwrap_err();
+assert_eq!(err.to_string(), "Expecting ',' delimiter: line 1 column 7 (char 6)");
+```
+
+Writing goes through `json.dump(..., indent=4, ensure_ascii=False)`: four-space
+indentation, non-ASCII written literally, and no trailing newline.
+
+```rust
+use rerobot_core::dataset::io::{info_path, load_info, write_info};
+use rerobot_core::dataset::info::DatasetInfo;
+use indexmap::IndexMap;
+
+let root = std::env::temp_dir().join(format!("rerobot-readme-{}", std::process::id()));
+let _ = std::fs::remove_dir_all(&root);
+
+let mut info = DatasetInfo::new("v3.0", 30, IndexMap::new()).unwrap();
+info.robot_type = Some("bras-à-café".to_string());
+
+write_info(&info, &root).unwrap(); // creates `meta/` on the way
+assert_eq!(info_path(&root), root.join("meta").join("info.json"));
+
+let written = std::fs::read_to_string(info_path(&root)).unwrap();
+assert!(written.starts_with("{\n    \"codebase_version\": \"v3.0\","));
+assert!(written.contains("\"bras-à-café\"")); // not escaped
+assert!(!written.ends_with('\n'));            // `json.dump` writes none
+
+assert_eq!(load_info(&root).unwrap(), info);
+std::fs::remove_dir_all(&root).unwrap();
+```
+
+Three boundaries are worth knowing before you rely on this, and all three are
+spelled out in [the compatibility ledger](https://github.com/k1000dai/Rerobot/blob/master/docs/compatibility.md):
+`__post_init__` mutates the caller's own feature dicts in Python and cannot
+here; the typed fields reject values upstream's unchecked dataclass would
+accept, including the `bool` that Python treats as an `int`; and the file is
+always written as UTF-8 with LF, where CPython's `open(fpath, "w")` follows the
+locale encoding and translates newlines on Windows.
 
 ## `types` — `lerobot/configs/types.py`, `lerobot/types.py`
 

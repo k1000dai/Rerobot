@@ -260,9 +260,13 @@ pub static MODULE_FAMILIES: &[ModuleFamily] = &[
     },
     ModuleFamily {
         name: "datasets",
-        status: Status::Unimplemented,
+        status: Status::Partial,
         upstream_modules: 22,
-        note: "LeRobotDataset format, video decoding, and Hub sync.",
+        note: "The `meta/info.json` slice is ported and tested: `utils`' path constants and \
+               `DatasetInfo` (defaults, shape coercion, validation, `to_dict`/`from_dict`), plus \
+               `io_utils.load_info`/`write_info` against a local directory. \
+               `LeRobotDatasetMetadata`, tasks, stats, episodes, parquet, video decoding and Hub \
+               sync are not.",
     },
     ModuleFamily {
         name: "envs",
@@ -372,7 +376,9 @@ pub static MODULE_FAMILIES: &[ModuleFamily] = &[
         name: "utils",
         status: Status::Partial,
         upstream_modules: 25,
-        note: "`action_interpolator` is ported and tested. Random/IO/hub/train utilities are not.",
+        note: "`action_interpolator` is ported and tested, as are `io_utils.load_json` and \
+               `io_utils.write_json` for local paths. Random/hub/train utilities, and the video \
+               and image writers in `io_utils`, are not.",
     },
 ];
 

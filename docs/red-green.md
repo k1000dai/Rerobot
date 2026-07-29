@@ -421,6 +421,37 @@ inside the module because the lock is private. As with the newline excerpts,
 this is a development log rather than independently reproducible proof of
 history; the 28 retained DAgger tests are the auditable current evidence.
 
+## DatasetInfo and local `meta/info.json`
+
+The dataset metadata slice was developed in three focused cycles. The retained
+tests were written against absent behavior before each implementation:
+
+```text
+dataset_json: JsonLike/parser/writer skeleton
+    44 tests failed at `not implemented`
+
+dataset_info: constants plus DatasetInfo skeleton
+    30 behavior tests failed at `unimplemented!()`; 4 constant tests passed
+
+dataset_io: load_json/write_json/load_info/write_info skeleton
+    22 tests failed before the filesystem implementation
+```
+
+An independent differential sweep then exposed a real float-wire defect: 8 of
+30,623 finite doubles had a different final digit from CPython because two
+shortest decimals round-tripped and Rust chose upward where CPython chose the
+even last digit. Two focused tie tests were observed RED before the exact
+`BigInt` half-even implementation. The repaired formatter was then compared
+against CPython 3.12.13 over 747,248 doubles, including 40,586 subnormals, with
+zero disagreements. The fail-closed review then added four more observed REDs:
+CPython's leading-BOM diagnostic, Unicode 15.0 `str` printability in unknown
+field warnings, deeply nested parser input aborting a child process, and the
+recursive writer doing the same. The reader now returns an explicit depth error,
+and the writer uses an iterative work stack. A mixed-invalid input additionally
+pins that upstream's `fps` post-init error precedes an unrelated typed `splits`
+boundary error. The three retained suites are the auditable current evidence;
+the historical RED excerpts are a development log.
+
 ## Final GREEN totals
 
 `cargo test --workspace --all-targets --all-features`
@@ -435,6 +466,9 @@ history; the 28 retained DAgger tests are the auditable current evidence.
 | `rerobot-core` `tests/rename_processor.rs` | 23 |
 | `rerobot-core` `tests/newline_task_processor.rs` | 24 |
 | `rerobot-core` `tests/dagger.rs` | 26 |
+| `rerobot-core` `tests/dataset_info.rs` | 36 |
+| `rerobot-core` `tests/dataset_io.rs` | 23 |
+| `rerobot-core` `tests/dataset_json.rs` | 51 |
 | `rerobot-core` `tests/types.rs` | 20 |
 | `rerobot-core` `tests/sysinfo.rs` | 13 |
 | `rerobot-compat` `tests/inventory.rs` | 17 |
@@ -442,7 +476,7 @@ history; the 28 retained DAgger tests are the auditable current evidence.
 | `rerobot-cli` `tests/cli.rs` | 21 |
 | `rerobot-cli` `tests/info.rs` | 18 |
 | `rerobot-cli` `tests/which.rs` | 21 |
-| **Total** | **298** |
+| **Total** | **408** |
 
 The 18 `lerobot-*` binary targets contribute no unit tests; their behaviour is
 covered by `tests/cli.rs`, which runs the built executables as subprocesses.
@@ -454,12 +488,12 @@ covered by `tests/cli.rs`, which runs the built executables as subprocesses.
 
 | Crate | Doctests |
 | --- | ---: |
-| `rerobot-core` (crate README + item docs) | 28 |
+| `rerobot-core` (crate README + item docs) | 37 |
 | `rerobot-compat` (crate README) | 2 |
 | `rerobot-cli` (crate README + `which`) | 3 |
-| **Total** | **33** |
+| **Total** | **42** |
 
-210 of the 298 are the compatibility slice itself (`rerobot-core`), which is
+320 of the 408 are the compatibility slice itself (`rerobot-core`), which is
 where the milestone's parity claim lives.
 
 ## Whole-workspace gate

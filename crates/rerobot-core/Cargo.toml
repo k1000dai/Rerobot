@@ -1,6 +1,6 @@
 [package]
 name = "rerobot-core"
-description = "Pure-Rust behaviour-compatible port of LeRobot core utilities (types, action interpolation, rollout ring buffer, rename processor, system info)."
+description = "Pure-Rust LeRobot core compatibility: metadata IO, processors, rollout, types, and system info."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,9 +14,11 @@ readme = "README.md"
 
 [dependencies]
 indexmap.workspace = true
+log.workspace = true
 num-bigint.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+unicode-general-category.workspace = true
 
 [dev-dependencies]
 # The differential oracle for `byte_count`: `tests/byte_count.rs` checks the

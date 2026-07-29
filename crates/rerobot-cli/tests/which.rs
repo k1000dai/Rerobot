@@ -96,10 +96,19 @@ fn search(dirs: &OsString) -> Option<&OsStr> {
 
 // --- `shutil.which` ------------------------------------------------------
 
+// CPython 3.12 never tries a bare Windows name when its extension is absent
+// from PATHEXT. Generic lookup-order tests therefore create the platform's
+// actual candidate spelling rather than accidentally asserting POSIX rules on
+// Windows.
+#[cfg(windows)]
+const TEST_PROGRAM_FILE: &str = "ffmpeg.EXE";
+#[cfg(not(windows))]
+const TEST_PROGRAM_FILE: &str = "ffmpeg";
+
 #[test]
 fn an_executable_on_the_search_path_is_found() {
     let dir = TempDir::new("found");
-    let exe = dir.executable("ffmpeg", b"#!/bin/sh\nexit 0\n");
+    let exe = dir.executable(TEST_PROGRAM_FILE, b"#!/bin/sh\nexit 0\n");
     let path = path_list([dir.path.clone()]);
     assert_eq!(which_in("ffmpeg", search(&path)), Some(exe));
 }
@@ -219,8 +228,8 @@ fn a_directory_named_like_the_program_is_skipped() {
 fn the_first_directory_on_the_search_path_wins() {
     let first = TempDir::new("first");
     let second = TempDir::new("second");
-    let winner = first.executable("ffmpeg", b"#!/bin/sh\nexit 0\n");
-    second.executable("ffmpeg", b"#!/bin/sh\nexit 0\n");
+    let winner = first.executable(TEST_PROGRAM_FILE, b"#!/bin/sh\nexit 0\n");
+    second.executable(TEST_PROGRAM_FILE, b"#!/bin/sh\nexit 0\n");
     let path = path_list([first.path.clone(), second.path.clone()]);
     assert_eq!(which_in("ffmpeg", search(&path)), Some(winner));
 }
@@ -228,7 +237,7 @@ fn the_first_directory_on_the_search_path_wins() {
 #[test]
 fn a_directory_that_does_not_exist_is_skipped_not_fatal() {
     let dir = TempDir::new("skip");
-    let exe = dir.executable("ffmpeg", b"#!/bin/sh\nexit 0\n");
+    let exe = dir.executable(TEST_PROGRAM_FILE, b"#!/bin/sh\nexit 0\n");
     let path = path_list([dir.path.join("nope"), dir.path.clone()]);
     assert_eq!(which_in("ffmpeg", search(&path)), Some(exe));
 }
@@ -238,8 +247,8 @@ fn a_program_with_a_directory_component_ignores_the_search_path() {
     // `os.path.split(cmd)` with a non-empty dirname replaces the search path.
     let onpath = TempDir::new("onpath");
     let elsewhere = TempDir::new("elsewhere");
-    onpath.executable("ffmpeg", b"#!/bin/sh\nexit 0\n");
-    let direct = elsewhere.executable("ffmpeg", b"#!/bin/sh\nexit 0\n");
+    onpath.executable(TEST_PROGRAM_FILE, b"#!/bin/sh\nexit 0\n");
+    let direct = elsewhere.executable(TEST_PROGRAM_FILE, b"#!/bin/sh\nexit 0\n");
     let path = path_list([onpath.path.clone()]);
 
     let spelled = direct.to_str().expect("utf-8 temp path");

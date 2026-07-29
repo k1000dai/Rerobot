@@ -249,8 +249,10 @@ pub static MODULE_FAMILIES: &[ModuleFamily] = &[
         name: "configs",
         status: Status::Partial,
         upstream_modules: 11,
-        note: "`configs.types` str-enums and `PolicyFeature` are ported and tested. Draccus-based \
-               config parsing, policy configs, and train/eval configs are not.",
+        note:
+            "`configs.types` str-enums and `PolicyFeature` are ported and tested. The ACT policy's \
+               concrete config and checkpoint JSON shape are also ported; the generic Draccus CLI \
+               parser and train/eval configs are not.",
     },
     ModuleFamily {
         name: "data_processing",
@@ -300,9 +302,11 @@ pub static MODULE_FAMILIES: &[ModuleFamily] = &[
     },
     ModuleFamily {
         name: "policies",
-        status: Status::Unimplemented,
+        status: Status::Partial,
         upstream_modules: 128,
-        note: "All policy architectures. Requires model inference; never faked.",
+        note:
+            "ACTConfig validation, presets, delta indices and checkpoint JSON are ported. The ACT \
+               processor and tensor model, and every other policy architecture, are not.",
     },
     ModuleFamily {
         name: "processor",

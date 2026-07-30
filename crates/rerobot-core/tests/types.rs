@@ -227,18 +227,43 @@ fn policy_feature_rejects_malformed_json() {
 }
 
 #[test]
-fn policy_feature_rejects_shape_entries_that_are_not_integers() {
-    // A Python `int` is not a `float` and not a `str`. Each of these is a
-    // shape upstream could not have produced, so none may be silently
-    // truncated into one.
+fn policy_feature_rejects_unknown_fields_like_decode_dataclass() {
+    // `draccus.parsers.decoding.decode_dataclass` collects the leftover keys
+    // and raises `The fields `bogus` are not valid for PolicyFeature`. The
+    // only JSON decoder upstream ever applies to a `PolicyFeature` is that
+    // one, so an extra key is an error and not a silently dropped field.
+    assert!(
+        serde_json::from_str::<PolicyFeature>(r#"{"type":"STATE","shape":[7],"bogus":1}"#).is_err()
+    );
+    assert!(serde_json::from_str::<PolicyFeature>(r#"{"type":"STATE","shape":[7]}"#).is_ok());
+}
+
+#[test]
+fn policy_feature_shape_follows_draccus_decode_int() {
+    // `shape: tuple[int, ...]` decodes each item with `decode_int`, which
+    // explicitly rejects a `float` and otherwise calls `int(raw_value)`. A
+    // Python `bool` is an `int` subclass, and `int(str)` accepts surrounding
+    // whitespace, a sign, PEP 515 underscores and Unicode decimal digits.
+    for (good, expected) in [
+        (r#"{"type":"STATE","shape":["1"]}"#, vec![1i64]),
+        (r#"{"type":"STATE","shape":[true,false]}"#, vec![1, 0]),
+        (r#"{"type":"STATE","shape":[" -1_0 "]}"#, vec![-10]),
+        (r#"{"type":"STATE","shape":["١٢٣"]}"#, vec![123]),
+    ] {
+        let f: PolicyFeature = serde_json::from_str(good).unwrap();
+        let expected: Vec<BigInt> = expected.into_iter().map(BigInt::from).collect();
+        assert_eq!(f.shape, expected, "{good}");
+    }
+
+    // A Python `int` is not a `float`, and `int()` refuses the rest.
     for bad in [
         r#"{"type":"STATE","shape":[1.5]}"#,
         r#"{"type":"STATE","shape":[1.0]}"#,
         r#"{"type":"STATE","shape":[1e3]}"#,
-        r#"{"type":"STATE","shape":["1"]}"#,
-        r#"{"type":"STATE","shape":[true]}"#,
         r#"{"type":"STATE","shape":[null]}"#,
         r#"{"type":"STATE","shape":[[1]]}"#,
+        r#"{"type":"STATE","shape":["0x10"]}"#,
+        r#"{"type":"STATE","shape":[""]}"#,
     ] {
         assert!(
             serde_json::from_str::<PolicyFeature>(bad).is_err(),

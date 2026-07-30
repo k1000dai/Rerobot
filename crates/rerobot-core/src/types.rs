@@ -220,6 +220,7 @@ str_enum!(
 /// );
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyFeature {
     /// Feature category.
     pub r#type: FeatureType,
@@ -265,7 +266,6 @@ mod shape_wire {
     use serde::de::{self, Deserialize, Deserializer};
     use serde::ser::{Error as _, SerializeSeq, Serializer};
     use serde_json::value::RawValue;
-    use std::str::FromStr;
 
     pub(super) fn serialize<S>(shape: &[BigInt], serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -289,13 +289,19 @@ mod shape_wire {
         raw.iter()
             .map(|value| {
                 let text = value.get();
-                // `BigInt::from_str` accepts exactly a signed decimal integer,
-                // so a float, an exponent, a quoted string, a bool, `null` and
-                // a nested array all land here rather than being coerced.
-                BigInt::from_str(text).map_err(|_| {
+                // The only decoder upstream ever applies to a `PolicyFeature`
+                // is Draccus', and `tuple[int, ...]` decodes each item with
+                // `decode_int`: a `float` is refused outright, and everything
+                // else goes through Python's `int()`. So a bool and a string
+                // that `int()` parses are both accepted, while `1.0`, `null`
+                // and a nested array are not.
+                let parsed = crate::dataset::json::loads(text)
+                    .ok()
+                    .and_then(|value| crate::policy::draccus::decode_int(&value).ok());
+                parsed.ok_or_else(|| {
                     de::Error::custom(format!(
-                        "invalid shape dimension `{text}`: expected an integer, \
-                         mirroring the upstream `tuple[int, ...]`"
+                        "invalid shape dimension `{text}`: expected a value Python's \
+                         `int()` accepts, mirroring the upstream `tuple[int, ...]`"
                     ))
                 })
             })

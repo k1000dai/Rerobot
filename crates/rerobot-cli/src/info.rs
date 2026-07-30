@@ -87,7 +87,7 @@ fn detect_ffmpeg() -> FfmpegProbe {
     detect_ffmpeg_in(std::env::var_os("PATH").as_deref())
 }
 
-/// [`detect_ffmpeg`] against an explicit search path, so the resolve-then-run
+/// `detect_ffmpeg` against an explicit search path, so the resolve-then-run
 /// split is testable without mutating the environment.
 pub fn detect_ffmpeg_in(search_path: Option<&OsStr>) -> FfmpegProbe {
     match which::which_in("ffmpeg", search_path) {

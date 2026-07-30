@@ -11,6 +11,9 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 readme = "README.md"
+# This monorepo-only integration test checks the root compatibility ledger,
+# which is intentionally outside this crate's publishable archive.
+exclude = ["tests/docs_consistency.rs"]
 
 # No dependencies: this crate is inventory data and nothing else.
 [dependencies]

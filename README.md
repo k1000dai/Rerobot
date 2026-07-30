@@ -14,7 +14,7 @@ suite. Everything that does not work says so and exits non-zero.
 | Upstream target | `lerobot` 0.6.1 (`f37be3edbee60f3a09a5183788b91eb19f0c07d1`) |
 | Milestone | 1 of N — core utility slice + full CLI surface |
 | Runnable executables | 1 of 18 (`lerobot-info`); the other 17 exist and fail explicitly |
-| Tests | 419 integration/unit tests + 43 rustdoc tests, all passing |
+| Tests | 439 integration/unit tests + 50 rustdoc tests, all passing |
 | Minimum Rust | 1.85 — the floor of the locked dependency tree, built and tested on that exact toolchain by the `msrv` CI job |
 
 **Read [`docs/compatibility.md`](docs/compatibility.md) before using this.** It
@@ -27,7 +27,7 @@ compatible, and labelling it so would misrepresent the work.
 
 ```text
 crates/
-  rerobot-core     pure ports of upstream core utilities; no IO, no hardware
+  rerobot-core     pure logic plus bounded local metadata IO; no hardware
   rerobot-compat   machine-readable inventory of the upstream surface + status
   rerobot-cli      the 18 lerobot-* executables
 docs/
@@ -74,7 +74,8 @@ reachable.
 | `RenameObservationsProcessorStep`, `rename_stats` | `lerobot/processor/rename_processor.py` |
 | `FeatureType`, `NormalizationMode`, `PolicyFeature`, `TransitionKey`, … | `lerobot/configs/types.py`, `lerobot/types.py` |
 | `DatasetInfo`, the `meta/` path constants, and `load_info`/`write_info` for a local dataset | `lerobot/datasets/utils.py`, `lerobot/datasets/io_utils.py`, `lerobot/utils/io_utils.py` |
-| `ACTConfig`, its validation/presets/delta indices, and checkpoint JSON shape | `lerobot/policies/act/configuration_act.py` |
+| `ACTConfig`, its validation/presets/delta indices, and byte-exact `config.json` read/write | `lerobot/policies/act/configuration_act.py`, `lerobot/configs/policies.py` |
+| The Draccus value conversions a checkpoint is decoded through | `draccus/parsers/decoding.py` |
 | `lerobot-info` and its parsing helpers | `lerobot/scripts/lerobot_info.py` |
 
 Worked examples for every one of these live in

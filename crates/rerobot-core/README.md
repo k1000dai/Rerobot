@@ -491,20 +491,58 @@ assert_eq!(
 `action_delta_indices` is lazy rather than eagerly building Python's list. That
 is the explicit resource boundary which lets a syntactically valid, enormous
 `chunk_size` remain an exact `BigInt` without allocating until the machine is
-exhausted. Ordinary values yield the same ordered indices. JSON decoding
-requires the registry tag `"type":"act"`, distinguishes null from an absent
-defaulted field, rejects unknown fields, and round-trips negative and
-thousand-digit integers as bare JSON numbers. It also reproduces Draccus'
-checkpoint coercion: JSON strings accepted by Python `int()` and booleans become
-integers; float fields likewise accept numeric strings and booleans, and bool
-fields accept Draccus' exact lowercase `"true"` / `"false"` strings. Non-finite
-float output fails explicitly instead of silently becoming JSON null; see the
-compatibility ledger for that narrower wire boundary.
+exhausted. Ordinary values yield the same ordered indices.
+
+### Reading and writing `config.json`
+
+`from_checkpoint_json` and `to_checkpoint_json` are the checkpoint boundary:
+they reproduce `PreTrainedConfig.from_pretrained` and `_save_pretrained`, which
+are `json.load` plus `draccus.parse`, and `draccus.dump(..., indent=4)`. Output
+is byte-identical to upstream's, down to `float.__repr__` spelling and
+`ensure_ascii` escaping.
+
+```rust
+use rerobot_core::policy::act::ActConfig;
+
+let mut config = ActConfig::default();
+config.device = Some("cpu".into());
+let text = config.to_checkpoint_json();
+
+// `json.dump` writes `repr(1e-05)`; serde_json would write `0.00001`.
+assert!(text.contains("\"optimizer_lr\": 1e-05,"));
+// Duplicate keys follow Python `dict` assignment, which serde cannot express.
+let dup = ActConfig::from_checkpoint_json(
+    r#"{"type": "act", "chunk_size": 1, "chunk_size": 20, "n_action_steps": 20}"#,
+)
+.unwrap();
+assert_eq!(dup.chunk_size, rerobot_core::BigInt::from(20));
+```
+
+Use them for anything that touches a real checkpoint. Plain `serde` remains
+available for in-memory interop and agrees on every value both can express, but
+only these two go through CPython's JSON reader and writer, so only they handle
+duplicate object keys and the bare `NaN`/`Infinity` tokens.
+
+### Draccus does not type-check, it converts
+
+`policy::draccus` ports the conversions in `draccus/parsers/decoding.py`, and
+they are wider than the annotations suggest. A field declared `str` keeps
+`str()` of whatever JSON value it was given, so `"repo_id": 5` loads as `"5"`
+and `"tags": [null]` as `["None"]`. A field declared `int` accepts a bool and
+any string Python's `int()` parses — including PEP 515 underscores and Unicode
+decimal digits — while refusing a float outright. A field declared `bool`
+accepts only `true`, `false`, `"true"` and `"false"`. `normalization_mapping`
+is annotated `dict[str, NormalizationMode]`, so its key is an arbitrary string
+and a checkpoint carrying one outside `FeatureType` loads rather than failing.
+`pretrained_path` is a `pathlib.Path`, so it is normalised without touching the
+filesystem and refuses a non-string.
 
 The upstream dilation field is uniquely declared `int = False`: a fresh config
 stores and writes boolean `false`, while checkpoint decoding converts it to
 integer `0` and accepts arbitrary Python integers. `PythonIntBool` retains both
-forms instead of narrowing that field to a Rust `bool`.
+forms instead of narrowing that field to a Rust `bool`. Reading upstream's own
+`config.json` and writing it back therefore changes that one field from `false`
+to `0` — in upstream too, which is what the port matches.
 
 ## `types` — `lerobot/configs/types.py`, `lerobot/types.py`
 

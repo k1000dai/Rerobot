@@ -957,6 +957,12 @@ no final destination or temporary tree.
 into place only after every write succeeds. Existing destinations and aliases are
 refused before writing and checked again before publication.
 
+The first Windows CI run then supplied a retained platform RED: the real two-step
+CLI test failed replacing `checkpoints/last` with `Access is denied (os error 5)`.
+Windows requires a directory symlink to be unlinked with `remove_dir`, while the
+Unix implementation correctly uses `remove_file`. The platform-specific unlink
+now handles both directory and file symlinks without following either target.
+
 ## Final GREEN totals
 
 `cargo test --workspace --all-targets --all-features`

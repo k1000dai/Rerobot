@@ -255,8 +255,10 @@ fn remove_last_marker(link: &Path) -> Result<()> {
     };
     let kind = metadata.file_type();
     if kind.is_symlink() {
-        // Unlinks the link. `remove_file` never follows one.
-        return std::fs::remove_file(link).map_err(|error| TrainError::io(link, &error));
+        // Unlinks the link and never follows it. Windows distinguishes directory
+        // symlinks from file symlinks at deletion time; `remove_file` on the former
+        // returns AccessDenied even though it is only a link.
+        return unlink_symlink(link).map_err(|error| TrainError::io(link, &error));
     }
     if kind.is_dir() {
         return Err(TrainError::checkpoint(
@@ -276,6 +278,22 @@ fn remove_last_marker(link: &Path) -> Result<()> {
              replace it"
         ),
     ))
+}
+
+#[cfg(not(windows))]
+fn unlink_symlink(link: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(link)
+}
+
+#[cfg(windows)]
+fn unlink_symlink(link: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir(link) {
+        Ok(()) => Ok(()),
+        Err(directory_error) => match std::fs::remove_file(link) {
+            Ok(()) => Ok(()),
+            Err(_) => Err(directory_error),
+        },
+    }
 }
 
 #[cfg(unix)]

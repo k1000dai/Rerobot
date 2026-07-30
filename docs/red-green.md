@@ -478,6 +478,68 @@ The final annotation audit found ACT's `int = False` dilation field; a focused
 compile RED required the absent `PythonIntBool` type before the dual bool/BigInt
 wire representation was implemented.
 
+## ACT checkpoint boundary (Draccus)
+
+An independent differential audit of the ACT slice against CPython 3.12.13 and
+Draccus 0.10.0 found eight places where the port's accepted or emitted domain
+was not upstream's. `tests/act_checkpoint.rs` was written first, against an API
+that did not exist, and the focused RED was `E0432: unresolved import
+`rerobot_core::policy::draccus`` plus 37 `E0599: no associated function named
+`from_checkpoint_json`` — one per intended contract. `tests/types.rs` gained two
+tests that failed against the shipped decoder: `2 failed` on
+`policy_feature_rejects_unknown_fields_like_decode_dataclass` and
+`policy_feature_shape_follows_draccus_decode_int`.
+
+The oracle for every expectation was upstream itself, driven through
+`draccus.parse(ACTConfig, path)` and `draccus.dump(config, stream, indent=4)`
+under `draccus.config_type("json")` — the two calls `from_pretrained` and
+`_save_pretrained` make. What it showed, and what the GREEN now reproduces:
+
+1. `normalization_mapping` is `dict[str, NormalizationMode]`, so `{"BOGUS":
+   "MIN_MAX"}` loads and round-trips. The port had narrowed the key to
+   `FeatureType` and rejected it.
+2. Draccus decodes every `str`-annotated field with `str(raw_value)`, so
+   `"repo_id": 5` is `'5'`, `"license": true` is `'True'` and `"tags": [null]`
+   is `['None']`. The port raised a serde type error on all of them.
+3. `json.dump` writes `float.__repr__`, so the default `optimizer_lr` is
+   `1e-05`; serde_json writes `0.00001`. The crate already had
+   `dataset::json::python_float_repr` for the dataset slice and now uses it
+   here too.
+4. `int()` and `float()` run `_PyUnicode_TransformDecimalAndSpaceToASCII`
+   first, so `"1_000.5"` and `"１００"` parse. Rust's parsers reject both.
+5. `pretrained_path` is a `pathlib.Path`: `"a//b"` re-dumps as `"a/b"` and `""`
+   as `"."`. The port stored the raw string.
+6. `decode_dataclass` rejects an unknown key inside a nested `PolicyFeature`,
+   which the port silently dropped, and `decode_int` coerces a shape entry the
+   port refused.
+7. `json.load` gives a duplicate object key Python `dict` semantics; serde
+   raises `duplicate field`.
+8. `json.load`/`json.dump` accept and emit bare `NaN`/`Infinity`, which
+   `serde_json` cannot represent at all.
+
+(7) and (8) are properties of the JSON layer rather than of any field, so they
+are fixed by routing the checkpoint path through this crate's existing CPython
+`json` port instead of through `serde_json`: `ActConfig::from_checkpoint_json`
+and `to_checkpoint_json`. `dataset::json` gained `dumps_pretty_ascii` and
+`encode_basestring_ascii` for that, because `draccus.dump` leaves CPython's
+`ensure_ascii=True` default in place where `meta/info.json` does not.
+
+Three assertions in the first draft of `act_checkpoint.rs` were wrong and were
+corrected against the oracle rather than by loosening them: `ensure_ascii`
+escapes non-ASCII instead of preserving it, `__post_init__` runs during
+`draccus.parse` so a decode vector must leave `chunk_size >= n_action_steps`,
+and a read/write cycle over upstream's own `config.json` is *not* the identity
+upstream either — `replace_final_stride_with_dilation` widens from `false` to
+`0` on the first read. That last one is pinned by
+`checkpoint_round_trip_reproduces_upstreams_own_dilation_widening`.
+
+The final checkpoint review found two more CPython numeric-string boundaries.
+Focused RED runs rejected adjacent Mathematical Unicode digits (`𝟘𝟙`) and
+ASCII edge whitespace (`"\t7\r\n"`). GREEN maps all 680 Unicode 15.0 `Nd`
+characters to their decimal values and trims exactly the ASCII whitespace the
+numeric parsers skip; retained tests cover every digit plus integer and float
+edge-whitespace vectors.
+
 ## Final GREEN totals
 
 `cargo test --workspace --all-targets --all-features`
@@ -488,6 +550,7 @@ wire representation was implemented.
 | `rerobot-core` `rollout::dagger` unit tests | 2 |
 | `rerobot-core` `tests/action_interpolator.rs` | 50 |
 | `rerobot-core` `tests/act_config.rs` | 10 |
+| `rerobot-core` `tests/act_checkpoint.rs` | 19 |
 | `rerobot-core` `tests/byte_count.rs` | 15 |
 | `rerobot-core` `tests/ring_buffer.rs` | 37 |
 | `rerobot-core` `tests/rename_processor.rs` | 23 |
@@ -496,14 +559,14 @@ wire representation was implemented.
 | `rerobot-core` `tests/dataset_info.rs` | 36 |
 | `rerobot-core` `tests/dataset_io.rs` | 23 |
 | `rerobot-core` `tests/dataset_json.rs` | 51 |
-| `rerobot-core` `tests/types.rs` | 20 |
+| `rerobot-core` `tests/types.rs` | 21 |
 | `rerobot-core` `tests/sysinfo.rs` | 13 |
 | `rerobot-compat` `tests/inventory.rs` | 18 |
 | `rerobot-compat` `tests/docs_consistency.rs` | 10 |
 | `rerobot-cli` `tests/cli.rs` | 21 |
 | `rerobot-cli` `tests/info.rs` | 18 |
 | `rerobot-cli` `tests/which.rs` | 21 |
-| **Total** | **419** |
+| **Total** | **439** |
 
 The 18 `lerobot-*` binary targets contribute no unit tests; their behaviour is
 covered by `tests/cli.rs`, which runs the built executables as subprocesses.
@@ -515,12 +578,12 @@ covered by `tests/cli.rs`, which runs the built executables as subprocesses.
 
 | Crate | Doctests |
 | --- | ---: |
-| `rerobot-core` (crate README + item docs) | 38 |
+| `rerobot-core` (crate README + item docs) | 45 |
 | `rerobot-compat` (crate README) | 2 |
 | `rerobot-cli` (crate README + `which`) | 3 |
-| **Total** | **43** |
+| **Total** | **50** |
 
-330 of the 419 are the compatibility slice itself (`rerobot-core`), which is
+350 of the 439 are the compatibility slice itself (`rerobot-core`), which is
 where the milestone's parity claim lives.
 
 ## Whole-workspace gate

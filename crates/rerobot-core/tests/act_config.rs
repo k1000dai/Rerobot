@@ -19,12 +19,24 @@ fn defaults_match_upstream_act_config() {
     assert_eq!(config.n_obs_steps, bi(1));
     assert_eq!(config.chunk_size, bi(100));
     assert_eq!(config.n_action_steps, bi(100));
+    // Upstream annotates this `dict[str, NormalizationMode]`; the three literal
+    // keys it writes happen to be `FeatureType` values, but the key domain is
+    // every string. See `tests/act_checkpoint.rs`.
     assert_eq!(
         config.normalization_mapping,
         IndexMap::from([
-            (FeatureType::Visual, NormalizationMode::MeanStd),
-            (FeatureType::State, NormalizationMode::MeanStd),
-            (FeatureType::Action, NormalizationMode::MeanStd),
+            (
+                FeatureType::Visual.as_str().to_owned(),
+                NormalizationMode::MeanStd
+            ),
+            (
+                FeatureType::State.as_str().to_owned(),
+                NormalizationMode::MeanStd
+            ),
+            (
+                FeatureType::Action.as_str().to_owned(),
+                NormalizationMode::MeanStd
+            ),
         ])
     );
     assert_eq!(config.vision_backbone, "resnet18");

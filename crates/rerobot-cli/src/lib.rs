@@ -128,7 +128,8 @@ pub fn unsupported_message(name: &str) -> String {
 
 /// Handle `--help` / `--version` for any command, or report it unsupported.
 ///
-/// `args` excludes argv[0]. `--help` and `--version` win over every other
+/// `args` excludes the executable-name element at `argv` index zero. `--help`
+/// and `--version` win over every other
 /// argument so that help is always reachable.
 pub fn dispatch(name: &str, args: &[String]) -> Outcome {
     let Some(e) = entry_point(name) else {

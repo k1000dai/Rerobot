@@ -237,6 +237,30 @@ pub fn dumps(value: &JsonLike) -> String {
     out
 }
 
+/// Port of `json.dump(obj, f, indent=4)` — that is, with CPython's *default*
+/// `ensure_ascii=True`.
+///
+/// Identical to [`dumps_pretty`] except that every character outside printable
+/// ASCII is written as a `\uXXXX` escape, astral ones as a UTF-16 surrogate
+/// pair. This is the spelling Draccus' JSON parser produces, and therefore the
+/// one a policy `config.json` is written with; `meta/info.json` uses
+/// [`dumps_pretty`] because upstream passes `ensure_ascii=False` there.
+///
+/// ```
+/// use rerobot_core::dataset::json::{dumps_pretty_ascii, loads};
+///
+/// let value = loads(r#"{"clé": "😀"}"#).unwrap();
+/// assert_eq!(
+///     dumps_pretty_ascii(&value),
+///     "{\n    \"cl\\u00e9\": \"\\ud83d\\ude00\"\n}"
+/// );
+/// ```
+pub fn dumps_pretty_ascii(value: &JsonLike) -> String {
+    let mut out = String::new();
+    write_value_with(&mut out, value, Some(4), 0, encode_basestring_ascii);
+    out
+}
+
 /// Port of `float.__repr__`, which is what `json.dump` writes for a finite
 /// float.
 ///
@@ -439,11 +463,64 @@ pub fn encode_basestring(value: &str) -> String {
     out
 }
 
+/// Port of `json.encoder.py_encode_basestring_ascii`, the default
+/// `ensure_ascii=True` escaper.
+///
+/// `ESCAPE_ASCII = re.compile(r'([\\"]|[^\ -~])')`: everything outside
+/// `U+0020..U+007E` is escaped, so `DEL` is too, and a character above the BMP
+/// becomes the `\uXXXX\uXXXX` surrogate pair CPython computes by hand.
+///
+/// The result includes the surrounding double quotes, as CPython's does.
+///
+/// ```
+/// use rerobot_core::dataset::json::encode_basestring_ascii;
+///
+/// assert_eq!(encode_basestring_ascii("clé"), r#""cl\u00e9""#);
+/// assert_eq!(encode_basestring_ascii("😀"), r#""\ud83d\ude00""#);
+/// assert_eq!(encode_basestring_ascii("a\tb"), r#""a\tb""#);
+/// assert_eq!(encode_basestring_ascii("~\u{7f}"), r#""~\u007f""#);
+/// ```
+pub fn encode_basestring_ascii(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ' '..='~' => out.push(ch),
+            c if (c as u32) < 0x1_0000 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => {
+                let n = c as u32 - 0x1_0000;
+                let high = 0xd800 | ((n >> 10) & 0x3ff);
+                let low = 0xdc00 | (n & 0x3ff);
+                out.push_str(&format!("\\u{high:04x}\\u{low:04x}"));
+            }
+        }
+    }
+    out.push('"');
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Writer
 // ---------------------------------------------------------------------------
 
 fn write_value(out: &mut String, value: &JsonLike, indent: Option<usize>, level: usize) {
+    write_value_with(out, value, indent, level, encode_basestring);
+}
+
+fn write_value_with(
+    out: &mut String,
+    value: &JsonLike,
+    indent: Option<usize>,
+    level: usize,
+    encode_str: fn(&str) -> String,
+) {
     enum Task<'a> {
         Value(&'a JsonLike, usize),
         Prefix { position: usize, level: usize },
@@ -466,7 +543,7 @@ fn write_value(out: &mut String, value: &JsonLike, indent: Option<usize>, level:
                 JsonLike::Bool(false) => out.push_str("false"),
                 JsonLike::Int(n) => out.push_str(&n.to_string()),
                 JsonLike::Float(f) => out.push_str(&json_float(*f)),
-                JsonLike::Str(s) => out.push_str(&encode_basestring(s)),
+                JsonLike::Str(s) => out.push_str(&encode_str(s)),
                 JsonLike::Array(items) | JsonLike::Tuple(items) => {
                     out.push('[');
                     if items.is_empty() {
@@ -509,7 +586,7 @@ fn write_value(out: &mut String, value: &JsonLike, indent: Option<usize>, level:
                 }
             }
             Task::Key(key) => {
-                out.push_str(&encode_basestring(key));
+                out.push_str(&encode_str(key));
                 out.push_str(": ");
             }
             Task::Close { bracket, level } => {

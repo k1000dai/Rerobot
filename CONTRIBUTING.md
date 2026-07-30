@@ -103,8 +103,9 @@ see `deny.toml`.
 
 ## Conventions
 
-* Stable Rust. No nightly features, no `unsafe` (every crate has
-  `#![forbid(unsafe_code)]`).
+* Stable Rust. No nightly features. Core and compatibility crates forbid
+  `unsafe`; the CLI denies it globally and permits only the documented,
+  platform-gated executable-lookup FFI blocks in `which.rs`.
 * Dependencies are deliberately few. Adding one needs a justification in the PR
   description: what it replaces, and why hand-rolling is worse.
 * Crate boundaries follow concerns, not upstream file layout. Do not add a crate

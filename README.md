@@ -12,9 +12,9 @@ suite. Everything that does not work says so and exits non-zero.
 | | |
 | --- | --- |
 | Upstream target | `lerobot` 0.6.1 (`f37be3edbee60f3a09a5183788b91eb19f0c07d1`) |
-| Milestone | 1 of N — core utility slice + full CLI surface |
-| Runnable executables | 1 of 18 (`lerobot-info`); the other 17 exist and fail explicitly |
-| Tests | 439 integration/unit tests + 50 rustdoc tests, all passing |
+| Milestone | 2 of N — core utility slice, full CLI surface, and the first runnable training slice |
+| Runnable executables | 2 of 18 (`lerobot-info`, and `lerobot-train` for the ACT state-only slice); the other 16 exist and fail explicitly |
+| Tests | 779 integration/unit tests + 56 rustdoc tests, all passing. The ACT training slice is compared element by element against upstream running on PyTorch |
 | Minimum Rust | 1.85 — the floor of the locked dependency tree, built and tested on that exact toolchain by the `msrv` CI job |
 
 **Read [`docs/compatibility.md`](docs/compatibility.md) before using this.** It
@@ -29,15 +29,20 @@ compatible, and labelling it so would misrepresent the work.
 crates/
   rerobot-core     pure logic plus bounded local metadata IO; no hardware
   rerobot-compat   machine-readable inventory of the upstream surface + status
+  rerobot-train    the ACT training slice: dataset, tensor model, AdamW, checkpoints
   rerobot-cli      the 18 lerobot-* executables
 docs/
   compatibility.md the authoritative port boundary
   red-green.md     the RED -> GREEN record for every test cycle
+tools/
+  goldens/         the Python scripts that produced the committed fixtures
 ```
 
-Three crates, not one per Python module. `rerobot-core` is the behaviour port,
+Four crates, not one per Python module. `rerobot-core` is the behaviour port,
 `rerobot-compat` is compatibility *metadata* — a different axis, consumed by
-both the CLI and the documentation tests — and `rerobot-cli` is the deployment
+both the CLI and the documentation tests — `rerobot-train` is the one part of the
+port that needs a tensor runtime and a parquet reader, kept separate so that
+`rerobot-core` stays dependency-light, and `rerobot-cli` is the deployment
 surface.
 
 ## Install
@@ -55,8 +60,10 @@ This installs all 18 executables under their upstream names.
 ```shell
 lerobot-info                 # runs for real
 
-lerobot-train --help         # works, and states that it is unimplemented
-lerobot-train; echo $?       # -> 2, with a single-line error on stderr
+lerobot-train --help         # works, and lists exactly what it accepts
+
+lerobot-eval --help          # works, and states that it is unimplemented
+lerobot-eval; echo $?        # -> 2, with a single-line error on stderr
 ```
 
 Unsupported commands honour a fixed contract: empty stdout, exactly one line on
@@ -112,7 +119,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets --all-features
 cargo test --workspace --doc
 cargo build --workspace --release
-cargo package --workspace --allow-dirty
+python3 tools/verify_packages.py
 
 # The published MSRV, on the toolchain it names:
 cargo +1.85.0 build --workspace --all-features --locked

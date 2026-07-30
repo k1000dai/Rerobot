@@ -256,8 +256,28 @@ pub fn dumps(value: &JsonLike) -> String {
 /// );
 /// ```
 pub fn dumps_pretty_ascii(value: &JsonLike) -> String {
+    dumps_indent_ascii(value, 4)
+}
+
+/// Port of `json.dump(obj, f, indent=N)` with CPython's default
+/// `ensure_ascii=True`, for an arbitrary indent width.
+///
+/// [`dumps_pretty_ascii`] is this with `indent = 4`, which is what
+/// `PreTrainedConfig._save_pretrained` uses for a policy `config.json`. Upstream is
+/// not uniform, though: `ProcessorPipeline._save_pretrained` writes
+/// `json.dump(..., indent=2)`, so a processor artifact needs the narrower width to
+/// be byte-identical to the file upstream produces.
+///
+/// ```
+/// use rerobot_core::dataset::json::{dumps_indent_ascii, loads};
+///
+/// let value = loads(r#"{"a": [1]}"#).unwrap();
+/// assert_eq!(dumps_indent_ascii(&value, 2), "{\n  \"a\": [\n    1\n  ]\n}");
+/// assert_eq!(dumps_indent_ascii(&value, 4), "{\n    \"a\": [\n        1\n    ]\n}");
+/// ```
+pub fn dumps_indent_ascii(value: &JsonLike, indent: usize) -> String {
     let mut out = String::new();
-    write_value_with(&mut out, value, Some(4), 0, encode_basestring_ascii);
+    write_value_with(&mut out, value, Some(indent), 0, encode_basestring_ascii);
     out
 }
 

@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/rerobot-core", "crates/rerobot-compat", "crates/rerobot-cli"]
+members = [
+    "crates/rerobot-core",
+    "crates/rerobot-compat",
+    "crates/rerobot-train",
+    "crates/rerobot-cli",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -24,6 +29,7 @@ categories = ["science::robotics"]
 [workspace.dependencies]
 rerobot-core = { version = "0.1.0", path = "crates/rerobot-core" }
 rerobot-compat = { version = "0.1.0", path = "crates/rerobot-compat" }
+rerobot-train = { version = "0.1.0", path = "crates/rerobot-train" }
 indexmap = { version = "2.7", features = ["serde"] }
 log = "0.4.27"
 # Upstream's `PolicyFeature.shape` and `ActionInterpolator.multiplier` are

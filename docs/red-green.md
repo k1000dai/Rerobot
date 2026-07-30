@@ -540,6 +540,423 @@ characters to their decimal values and trims exactly the ASCII whitespace the
 numeric parsers skip; retained tests cover every digit plus integer and float
 edge-whitespace vectors.
 
+
+## Cycle 8 — the first runnable training slice
+
+Five pure modules in `rerobot-core`, a new `rerobot-train` crate, and
+`lerobot-train`'s argument surface. Written in that order, because each layer's
+tests had to be able to fail for its own reasons.
+
+### Part 1 — the pure additions to `rerobot-core`
+
+Signatures first with `unimplemented!()` bodies, so the tests compiled and failed
+pointing at the exact function.
+
+**RED** — `cargo test -p rerobot-core --test random --test dataset_delta --test
+dataset_sampler --test dataset_stats --test policy_normalize --no-fail-fast`
+
+```
+tests/dataset_delta.rs     19 tests   19 failed
+tests/dataset_sampler.rs   19 tests   19 failed
+tests/dataset_stats.rs     11 tests   11 failed
+tests/policy_normalize.rs  15 tests   15 failed
+tests/random.rs            11 tests   11 failed
+```
+
+| Test file | Expected failure reason | Unimplemented symbol |
+| --- | --- | --- |
+| `tests/random.rs` (all 11) | `not implemented` | `mix64`, `SplitMix64::*`, `shuffled_permutation` |
+| `tests/dataset_delta.rs` (all 19) | `not implemented` | `python_round_half_even`, `action_delta_timestamps`, `get_delta_indices`, `check_delta_timestamps`, `query_window` |
+| `tests/dataset_sampler.rs` (all 19) | `not implemented` | `EpisodeAwareSampler::{new,frame_index,next_epoch}`, `compute_sampler_state` |
+| `tests/dataset_stats.rs` (all 11) | `not implemented` | `load_stats`, `stats_from_value` |
+| `tests/policy_normalize.rs` (all 15) | `not implemented` | `Normalizer::{new,normalize,unnormalize}` |
+
+**GREEN** — 75 passed. Two of the tests were wrong rather than the code: the
+tolerance arithmetic in `the_tolerance_is_measured_in_seconds_after_dividing_by_fps`
+had assumed `0.101 * 10` deviates by exactly 1e-3 when binary64 makes it
+1.0000000000000009e-3, and `episodes_are_concatenated_by_their_dataset_index_ranges`
+had miscounted the frames of three contiguous episodes. Both were corrected in the
+test with a comment recording why.
+
+### Part 2 — `rerobot-train`
+
+**GREEN** — `cargo test -p rerobot-train --all-targets`
+
+```
+tests/dataset.rs     22 passed
+tests/model.rs       31 passed
+tests/optimizer.rs   16 passed
+tests/train.rs       32 passed
+tests/goldens.rs     12 passed
+```
+
+Four defects were found by these tests rather than by inspection, and all four
+would have produced a training loop that ran and reported plausible numbers:
+
+| Defect | How it presented | Fix |
+| --- | --- | --- |
+| `candle_nn::ops::softmax_last_dim`'s backward pass does not reach its input | Forward pass and every loss value correct; `model.encoder_1d_feature_pos_embed.weight` and `model.decoder_pos_embed.weight` received **no gradient at all**, and every attention projection trained only through its value path | `candle_nn::ops::softmax`, the composed differentiable version. Pinned by `tests/model.rs::attention_logits_receive_gradients` and by the oracle |
+| `state_dict()` returned handles that alias the live parameters | `Var::set` writes through, so a caller that snapshotted the weights, stepped, and compared saw no difference — and a test asserting "the step changed something" passed while asserting nothing | `state_dict()` returns detached deep copies, and says why |
+| `where_cond` on an `f32` condition | The VAE encoder's key-padding mask failed at runtime: `unsupported dtype F32 for op where-cond` | the mask stays `u8` |
+| `read_last_checkpoint` called `is_dir()` on `symlink_metadata` | `checkpoints/last` resolved as a file and the read failed with `Is a directory` | the symlink is read and re-anchored against the checkpoints directory |
+
+A fifth finding was **not** a defect, and the investigation is recorded because
+the conclusion matters: three tensors have an exactly-zero gradient on the first
+step of a freshly initialized ACT
+(`decoder.layers.0.{norm1.weight,self_attn.in_proj_weight,self_attn.out_proj.weight}`).
+That is upstream's behaviour too — the decoder's input is `torch.zeros`,
+`nn.MultiheadAttention` zero-initializes both biases, so the value stream is
+identically zero and the attention output is constant in those weights. They train
+from the second step. `tests/train.rs` pins the set in both directions and pins
+that they move on step 2, so the exemption cannot excuse a real regression.
+
+### Part 3 — the differential oracle
+
+`tools/goldens/make_act_goldens.py` ran once against upstream at the pinned commit
+and committed three files under
+`crates/rerobot-train/tests/fixtures/goldens/`: the loss scalars and provenance as
+JSON, `ACTPolicy.state_dict()` as safetensors, and the inputs, outputs, eleven
+gradients and post-step parameters as safetensors. `tests/goldens.rs` reads them.
+`cargo test` never runs Python.
+
+**GREEN** — `cargo test -p rerobot-train --test goldens` → 12 passed, on the
+first run for 9 of them. The three that failed did so for good reasons: two
+because the oracle's batch had no padded action and the tests said so
+(`the oracle batch has no padded action, so the mask is untested`), which moved the
+oracle from frames `[0, 1]` to `[0, 3]`; and one because a fixed absolute floor of
+1e-7 cannot judge a gradient tensor whose entries span six orders of magnitude,
+which moved the comparison to `atol + rtol * |expected|` with `atol` tied to each
+tensor's own scale.
+
+Verified not vacuous by injecting three defects and confirming failure:
+
+| Injected defect | Result |
+| --- | --- |
+| the packed `q` projection reads the `k` block | 5 of 12 fail; first predicted action -0.429 against the oracle's 0.055 |
+| `LayerNorm`'s epsilon dropped | 4 of 12 fail |
+| `softmax_last_dim` restored | 3 of 12 fail: both position embeddings receive no gradient |
+
+### Part 4 — `lerobot-train`
+
+**GREEN** — `cargo test -p rerobot-cli --test train_cli` → 25 passed. Two rounds
+of test-driven correction on the way: `--optimizer.lr` was reported as an unknown
+flag rather than as an unsupported one, which moved the refusal list to
+prefix matching and then moved the whole check after the accepted flags so that
+`--wandb.enable=false` stays honoured while `--wandb.project` is refused; and the
+reload test reconstructed the run without its batch size, which is now read out of
+the checkpoint's own `train_config.json`.
+
+Finally, run for real, and checked in the direction the Rust tests cannot:
+
+```
+$ ./target/debug/lerobot-train --dataset.repo_id=rerobot/state_only_slice \
+    --dataset.root=crates/rerobot-train/tests/fixtures/state_only \
+    --output_dir=/tmp/rr-real-run/out --policy.type=act --steps=1 --batch_size=2 ...
+step:1 loss:21.499 grdn:438.644 lr:1.0e-5
+Checkpoint: /tmp/rr-real-run/out/checkpoints/000001
+
+$ python tools/goldens/verify_checkpoint_upstream.py /tmp/rr-real-run/out/checkpoints/000001
+2. model.safetensors -> load_state_dict(strict=True): <All keys matched successfully>
+3. upstream forward pass on Rerobot's weights -> (2, 2, 2), all finite
+```
+
+## Cycle 9 — three independent reviews
+
+Three reviewers audited the training slice independently and all three failed it.
+Every material blocker below was fixed test-first: a focused regression test written
+and run RED, then the root cause fixed and the test run GREEN.
+
+### Upstream could not actually resume the checkpoint
+
+**RED** — `optimizer_param_groups.json` omitted `decoupled_weight_decay`, which
+`torch.optim.AdamW` records in every group. `Optimizer.load_state_dict` compares key
+*sets*, so upstream's own loader raised:
+
+```
+ValueError: Dictionary keys do not match.
+Expected: ... 'fused', 'decoupled_weight_decay', 'params'
+got:      ... 'fused', 'params'
+```
+
+The verifier had missed this because it overlaid the saved group onto a fresh one and
+never read `optimizer_state.safetensors` at all.
+
+**GREEN** — the key is written where torch writes it, between `fused` and `params`,
+and `tools/goldens/verify_checkpoint_upstream.py` now calls
+`lerobot.optim.optimizers.load_optimizer_state` on the real directory, asserts that
+61 parameters were restored with all three AdamW slots as tensors, and takes a step
+with the restored optimizer. Stripping the key back out reproduces the error above
+exactly, so the verifier is load-bearing rather than decorative.
+
+### The checkpoint was not a deployable artifact
+
+**RED** — `tests/train.rs::the_checkpoint_has_upstreams_directory_layout` failed with
+`the checkpoint has no pretrained_model/policy_preprocessor.json`. Upstream's
+`save_checkpoint` passes both processors, whose four artifacts carry the dataset
+statistics the weights were trained against. Nothing else in the checkpoint records
+them, so a policy loaded from one could not reproduce its own normalization.
+
+**GREEN** — `rerobot_train::processor` writes all four, and `tests/processor.rs`
+compares both JSON files **byte for byte** against output from upstream's own
+`save_pretrained`, and both safetensors tensor for tensor. Matching required a
+two-space JSON indent (`ProcessorPipeline` uses `indent=2` where a policy
+`config.json` uses 4), which is now `rerobot_core::dataset::json::dumps_indent_ascii`.
+
+### A truncating cast defeated the parser's fail-closed contract
+
+**RED** — `--num_workers=4294967296` completed a full training run and exited 0. The
+`u64 as u32` cast narrowed 2^32 to `0`, the one value `validate` accepts, so the run
+trained while appearing to honour a worker count it does not implement.
+
+**GREEN** — every integer flag goes through a checked `Value::as_integer::<T>`, which
+reports the field, the value and the accepted range. No `as` cast remains on a parsed
+value.
+
+### A NaN in a flag produced a successful run
+
+**RED** — `--policy.dropout=nan` exited 0 after `step:1 loss:NaN grdn:NaN lr:NaN`.
+Worse than a NaN model, in fact: `NaN > 0.0` is `false`, so the comparison gating
+dropout silently *disabled* it and the run trained a different configuration than the
+one requested.
+
+**GREEN** — two independent layers. `TrainConfig::validate_numeric_fields` refuses a
+non-finite or out-of-range float before the dataset is opened, and
+`TrainSession::step` refuses a non-finite loss, KL term, gradient norm or
+post-update parameter norm — checked *before* the optimizer runs, so a poisoned
+gradient cannot reach the weights.
+
+### Attacker-controlled sizes were unbounded
+
+**RED** — `tests/limits.rs` and `tests/parquet_budget.rs`, 31 tests. A `chunk_size` of
+10^29 reached a `Vec` collection; `FeatureSpec::width` multiplied untrusted shape
+dimensions with `product()` and mapped an out-of-range one to `0`; `batch_size` and
+`steps` were passed straight to `Vec::with_capacity`; and the parquet reader's row
+limit was applied *after* Arrow had decoded each batch, bounded nothing else, and was
+per file rather than per dataset.
+
+**GREEN** — `rerobot_train::limits` declares the whole budget in one auditable file
+with the reasoning for each number, `checked_product`/`checked_mul`/`checked_add`
+replace every untrusted multiplication (including `collate`'s
+`frames * window * width` reservation, which `collate` bounds itself rather than
+trusting its caller), and `ReadBudget` moves the parquet checks to the footer, before
+any decode. `DatasetBudget` adds the three totals a per-file budget cannot bound — file
+count, dataset rows and dataset-wide decoded values — because the episode table that
+names the files is attacker-controlled too. Both budgets are injectable so the checks
+are exercised without committing an enormous fixture, and one test each asserts the
+default is the production constant.
+
+The budget is bounded from both sides: static assertions require every limit to clear
+upstream's own defaults, so it cannot be tightened into an outage.
+
+Verified not vacuous by reverting three of the guards and confirming failure:
+
+| Reverted | Result |
+| --- | --- |
+| `collate`'s batch-size bound | `a_batch_larger_than_the_budget_is_refused_by_collate_itself` fails |
+| the dataset's file-count and row totals | 2 of 25 `limits.rs` tests fail |
+| the optimizer loader's parameter-index check | `an_optimizer_state_naming_a_parameter_that_does_not_exist_is_refused` fails |
+
+### Malformed episode metadata reached a panic
+
+**RED** — `query_window` computed `ep_end - 1`, and
+`tests/dataset_delta.rs::a_degenerate_episode_range_cannot_overflow_the_clamp` panicked
+with `attempt to subtract with overflow` on `i64::MIN`. In release it would have
+wrapped to `i64::MAX` and clamped the window onto unrelated frames.
+
+**GREEN** — the clamp saturates, and `DatasetMetadata::validate_episodes` refuses
+negative, inverted, overlapping, length-mismatched and past-the-end ranges. The tests
+build genuinely malformed parquet with the same arrow stack the reader reads with.
+
+### `checkpoints/last` could recursively delete a real directory
+
+**RED** — `tests/checkpoint_safety.rs::a_real_directory_at_the_reserved_last_path_is_refused_not_deleted`
+failed: a pre-existing tree at the reserved path was removed by `remove_dir_all`.
+
+**GREEN** — the marker is only ever unlinked. A symlink is unlinked without being
+followed, a regular file is removed, and a real directory is refused with an
+explanation. Four further tests cover that the marker is still replaceable and that
+a symlink's *target* survives replacement.
+
+### A corrupt checkpoint loaded silently
+
+**RED** — ten failures across `tests/checkpoint_safety.rs`. Model loading coerced any
+dtype to `f32`; the RNG reader accepted extra tensors and took element zero of any
+shape; the optimizer loader skipped keys it did not recognize and never checked a
+parameter index, a moment's shape or dtype, or that a step count was finite.
+
+**GREEN** — every one is now exact and fail-closed, and the load is atomic: the
+optimizer validates every entry before installing any of it, so a rejected file leaves
+the optimizer untouched.
+
+### Documentation and CI
+
+* The core subtotal in this file said 426 where its rows summed to 425. The tally is
+  recomputed above and its rows are checked to sum to the stated total.
+* `.github/workflows/ci.yml`'s pinning header named checkout `11d5960` / v4.4.0 while
+  every job used `fbc6f39` / v5.
+* The PATH-less `ffmpeg` smoke used `command -v ffmpeg` as its precondition, which a
+  Homebrew or Nix install satisfies while `CS_PATH` knows nothing about it — so the
+  step asserted a fallback that could not succeed. It now probes the fallback path
+  itself and skips only when ffmpeg is genuinely not there.
+* Strict rustdoc was not a gate. Doctests run the code in the docs and say nothing
+  about whether the docs resolve, so `cargo doc` with `-D warnings` is now its own step.
+
+**GREEN, whole workspace**
+
+```
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-targets --all-features      # 774 tests
+cargo test --workspace --doc                             # 56 doctests
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+cargo deny check                                         # advisories, bans, licenses, sources
+```
+
+## Cycle 10 — two final reviews
+
+Two more reviewers audited the tree after Cycle 9 and both failed it. What they found
+was not the guards being absent but the guards being *incomplete*: each one checked the
+property it was written for and left a neighbouring property of the same value
+unchecked. Same method as before — the regression test first, run RED, then the fix.
+
+### A checkpoint could still hold values no model can use
+
+**RED** — `checkpoint_safety.rs`, three tests. Model loading validated every key, shape
+and dtype and then accepted a `NaN` weight; a probe loaded such a checkpoint and
+reported `model_nonfinite_accepted=true`. The optimizer loader accepted a state whose
+step was `0.5`, whose step tensor was `[1]` rather than a scalar, whose moments held
+`NaN`, and which covered only some of the parameters it was restoring.
+
+**GREEN** — `ParameterStore::load` scans every element and names the offending index.
+`AdamW::load_state_tensors` requires a rank-0 step (`[]`, which is what torch writes),
+a finite non-negative *whole* number of steps, finite moments, and a state that is
+either empty — a fresh run has none — or complete for every parameter, listing the
+missing ones by index and name. Validation still completes before any of it is
+installed.
+
+### Every limit was individually respected and jointly absurd
+
+**RED** — `limits.rs`. `dim_model` 2048, `dim_feedforward` 32768 and 128 layers is
+inside every single bound, and each feed-forward weight is 268 MB — under the
+per-tensor budget. The model is not: the allowed layer counts multiply that tensor
+256 times over. `Initializer` also still used a bare `shape.iter().product()`, and
+`TrainSession::new` never checked the `batch_size` a library caller handed it.
+
+**GREEN** — `MAX_MODEL_BYTES` bounds the sum, accounted as each parameter and buffer is
+created, so the refusal happens before the allocation rather than after. Shapes go
+through `checked_product`, and `TrainSession::new` validates `batch_size` the way the
+CLI already did. Two tests bound the budget from the other side: upstream's stock ACT
+and the reduced configuration both fit.
+
+### The parquet and metadata budgets did not bound the work
+
+**RED** — `parquet_budget.rs` and `limits.rs`. Rows, columns and compressed bytes were
+each bounded and their *product* was not: a thousand rows of a thousand wide columns is
+inside all three and still a gibibyte of cells. And `meta/episodes/` is discovered by
+walking a directory, so its size was bounded by what was on disk — every file read and
+materialized before any invariant could be checked.
+
+**GREEN** — `ReadBudget` gained `max_cells` and `max_decoded_bytes`, both read from the
+footer before Arrow builds a reader, and the aggregate checks run before the per-column
+ones. `MetadataBudget` bounds the tree's files, rows and decoded cells cumulatively,
+with the file count enforced *during* the walk so a hostile tree is not enumerated in
+full first.
+
+### Two sources of truth about episodes were never compared
+
+**RED** — `limits.rs`, nine tests. `validate_episodes` checked signs, spans and overlap
+but accepted a duplicate `episode_index` — `episode_of` scans for the first match, so
+one record becomes unreachable and the other's frames are clamped against the wrong
+range, silently — accepted a non-contiguous numbering, and accepted ranges leaving a
+frame owned by nobody. The frame rows carry their own `episode_index`, and nothing
+compared it with the range it falls in.
+
+**GREEN** — indices must be the exact contiguous range `0..len`, the ranges must tile
+`0..total_frames` exactly, and `check_consistency` resolves every frame's absolute index
+to an episode and refuses a disagreement, quoting both.
+
+### The portable `last` marker had a window a symlink fits through
+
+**RED** — the marker was unlinked and then written at the reserved path. A symlink
+planted between those two operations is followed, and its target truncated.
+
+**GREEN** — the contents go to a same-directory temporary file and are `rename`d into
+place, so the reserved path is never opened for writing. Pinned by a 3000-iteration
+test that races a symlink-planting thread against the writer and asserts the victim
+file is never truncated; it fails on the unfixed code.
+
+### Packaging and documentation
+
+* `crates/rerobot-cli/README.md` said exactly one executable runs and that
+  `lerobot-train` exits 2 as unimplemented. Two run, and a bare invocation is exit 64.
+  That README ships inside `rerobot-cli-0.1.0.crate`, so the false claim would have
+  been the crates.io page.
+* All four `.crate` archives omitted `LICENSE` and `NOTICE` while the packaged READMEs
+  told recipients to consult them, and the root `LICENSE` points at `NOTICE` for the
+  LeRobot attribution. Every crate now ships byte-identical copies — real files rather
+  than symlinks, which a Windows checkout without symlink support would turn into a
+  text file holding a path — and `tools/verify_packages.py` asserts both are present
+  and non-empty in each archive.
+* CI ran the identical strict `cargo doc` gate twice; and both the verifier's docstring
+  and `CONTRIBUTING.md` said `rerobot-core 0.1.0` was already on crates.io, where the
+  live API returns 404. None of the four is published, which is precisely why the
+  verifier patches the sibling dependencies inside the archive.
+
+Verified not vacuous by reverting each new guard in turn:
+
+| Reverted | Result |
+| --- | --- |
+| the model's finite-value scan | 3 of 32 `checkpoint_safety.rs` tests fail |
+| the exact scalar step shape | `a_step_count_that_is_not_a_scalar_is_refused_even_at_one_element` fails |
+| the integral step check | `a_fractional_step_count_is_refused` fails |
+| the moment finiteness scan | `an_optimizer_moment_holding_a_non_finite_value_is_refused` fails |
+| optimizer state completeness | `an_optimizer_state_covering_only_some_parameters_is_refused` fails |
+| `MAX_MODEL_BYTES` | the test process is killed by the OOM killer — which is the outcome the budget exists to prevent |
+| `TrainSession`'s `batch_size` check | `train_session_validates_the_batch_size_it_was_given` fails |
+| the aggregate cell budget | 2 of 21 `parquet_budget.rs` tests fail |
+| the aggregate decoded-byte budget | `an_aggregate_decoded_byte_estimate_above_the_budget_is_refused_from_the_footer` fails |
+| the cumulative metadata row and value totals | 2 of 8 metadata-budget tests fail |
+| the walk-time metadata file bound | `more_metadata_files_than_the_budget_are_refused_before_any_is_read` fails |
+| the duplicate-index check | `two_episodes_sharing_an_index_are_refused` fails |
+| the index contiguity check | `episode_indices_that_are_not_the_contiguous_range_are_refused` fails |
+| the frame-domain coverage sweep | 3 of 3 `episode_ranges_that_*` tests fail |
+| the frame/episode cross-check | `a_frame_whose_episode_index_disagrees_with_its_range_is_refused` fails |
+
+Three of those reverts initially left their test *passing*, because a neighbouring check
+produced a message the assertion also matched. Each assertion was tightened to name the
+property under test — the numbering, the uncovered frames, the walk itself — and the
+revert then failed as it should. An assertion loose enough to be satisfied by a
+different guard is not evidence about this one.
+
+## Cycle 11 — upstream checkpoint-frequency fix
+
+Upstream moved from the pinned commit to
+`1fe58f2d3afe0e7c46e86fee03de2e4122fbe9a1` during review. Most intervening
+changes are outside this state-only ACT slice; one changed the shared training
+contract: `save_freq <= 0` now disables periodic checkpoints while preserving
+the final checkpoint.
+
+**RED** — two executable tests ran before the implementation changed. The zero
+case exited 2 with `save_freq must be positive`; the negative case exited 64
+because the CLI narrowed the source `int` to `u64`.
+
+**GREEN** — both complete two real optimization steps and write only
+`checkpoints/000002`. `TrainConfig.save_freq` is now an arbitrary-precision
+signed integer, so the modulo decision does not narrow the accepted source
+domain.
+
+## Cycle 12 — atomic checkpoint publication
+
+**RED** — three writer tests compiled before `write_staged_directory` existed;
+the focused run failed with `E0432: unresolved import`. They require an existing
+destination to stay byte-for-byte unchanged, a symlink destination to leave its
+target untouched, and an injected failure after the first staged write to leave
+no final destination or temporary tree.
+
+**GREEN** — checkpoint files are built in a unique temporary sibling and renamed
+into place only after every write succeeds. Existing destinations and aliases are
+refused before writing and checked again before publication.
+
 ## Final GREEN totals
 
 `cargo test --workspace --all-targets --all-features`
@@ -561,12 +978,33 @@ edge-whitespace vectors.
 | `rerobot-core` `tests/dataset_json.rs` | 51 |
 | `rerobot-core` `tests/types.rs` | 21 |
 | `rerobot-core` `tests/sysinfo.rs` | 13 |
+| `rerobot-core` `tests/random.rs` | 11 |
+| `rerobot-core` `tests/dataset_delta.rs` | 20 |
+| `rerobot-core` `tests/dataset_sampler.rs` | 19 |
+| `rerobot-core` `tests/dataset_stats.rs` | 11 |
+| `rerobot-core` `tests/policy_normalize.rs` | 15 |
 | `rerobot-compat` `tests/inventory.rs` | 18 |
-| `rerobot-compat` `tests/docs_consistency.rs` | 10 |
+| `rerobot-compat` `tests/docs_consistency.rs` | 13 |
+| `rerobot-train` `run` unit tests | 3 |
+| `rerobot-train` `tests/dataset.rs` | 22 |
+| `rerobot-train` `tests/model.rs` | 31 |
+| `rerobot-train` `tests/optimizer.rs` | 16 |
+| `rerobot-train` `tests/train.rs` | 36 |
+| `rerobot-train` `tests/goldens.rs` | 12 |
+| `rerobot-train` `tests/processor.rs` | 8 |
+| `rerobot-train` `tests/limits.rs` | 48 |
+| `rerobot-train` `tests/parquet_budget.rs` | 21 |
+| `rerobot-train` `tests/checkpoint_safety.rs` | 32 |
 | `rerobot-cli` `tests/cli.rs` | 21 |
 | `rerobot-cli` `tests/info.rs` | 18 |
 | `rerobot-cli` `tests/which.rs` | 21 |
-| **Total** | **439** |
+| `rerobot-cli` `tests/train_cli.rs` | 32 |
+| **Total** | **779** |
+
+Summing the `test result:` lines cargo prints gives 781, not 779.
+`tests/dataset_json.rs` re-executes its own harness twice to drive a case that
+needs a fresh thread stack, and each re-execution prints a `1 passed; 50 filtered
+out` line of its own. The table above counts distinct tests.
 
 The 18 `lerobot-*` binary targets contribute no unit tests; their behaviour is
 covered by `tests/cli.rs`, which runs the built executables as subprocesses.
@@ -578,13 +1016,23 @@ covered by `tests/cli.rs`, which runs the built executables as subprocesses.
 
 | Crate | Doctests |
 | --- | ---: |
-| `rerobot-core` (crate README + item docs) | 45 |
+| `rerobot-core` (crate README + item docs) | 49 |
 | `rerobot-compat` (crate README) | 2 |
 | `rerobot-cli` (crate README + `which`) | 3 |
-| **Total** | **50** |
+| `rerobot-train` (crate README + `limits`) | 2 |
+| **Total** | **56** |
 
-350 of the 439 are the compatibility slice itself (`rerobot-core`), which is
-where the milestone's parity claim lives.
+The subtotals, which sum to the 779 above: 426 in `rerobot-core` (including its two
+`rollout::dagger` unit tests), 229 in `rerobot-train`, 93 in `rerobot-cli` (including
+its one library unit test) and 31 in `rerobot-compat`. `rerobot-core` is where the
+pure-behaviour parity claim lives; of `rerobot-train`'s 229, `tests/goldens.rs` is the
+only file whose expected values came from PyTorch rather than from upstream's source,
+and `tests/processor.rs` is the only one comparing bytes against files upstream's own
+writer produced.
+
+The training slice's fixtures are committed and read offline. `cargo test` never
+invokes Python: `tools/goldens/` holds the scripts that produced them, run once
+against upstream at the pinned commit.
 
 ## Whole-workspace gate
 
@@ -594,7 +1042,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets --all-features
 cargo test --workspace --doc
 cargo build --workspace --release
-cargo package --workspace --allow-dirty
+python3 tools/verify_packages.py                              # exact archive-only verification
 cargo +1.85.0 build --workspace --all-features --locked      # declared MSRV
 cargo +1.85.0 test --workspace --all-targets --all-features --locked
 ```

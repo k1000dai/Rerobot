@@ -190,3 +190,132 @@ fn the_doc_says_exactly_which_parts_are_checked() {
 fn collapse(note: &str) -> String {
     note.split_whitespace().collect::<Vec<_>>().join(" ")
 }
+
+// ---------------------------------------------------------------------------
+// Every crate ships the licence documents its README points at
+// ---------------------------------------------------------------------------
+
+/// The root `LICENSE` and `NOTICE`, and each crate's packaged copy of them.
+///
+/// Real copies rather than symlinks: cargo does follow a symlink when packaging, but a
+/// Windows checkout without symlink support leaves git a *text file containing the
+/// path*, which would package silently-wrong content. Copies are robust everywhere and
+/// this test is what stops them drifting.
+#[test]
+fn every_crate_ships_a_verbatim_copy_of_the_licence_and_notice() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates/")
+        .parent()
+        .expect("the repository root");
+
+    for document in ["LICENSE", "NOTICE"] {
+        let canonical = std::fs::read(root.join(document))
+            .unwrap_or_else(|error| panic!("the root {document} is unreadable: {error}"));
+        assert!(!canonical.is_empty(), "the root {document} is empty");
+        for crate_name in [
+            "rerobot-core",
+            "rerobot-compat",
+            "rerobot-train",
+            "rerobot-cli",
+        ] {
+            let path = root.join("crates").join(crate_name).join(document);
+            let shipped = std::fs::read(&path).unwrap_or_else(|error| {
+                panic!(
+                    "{crate_name} does not ship {document} ({}): {error}. Apache-2.0 section \
+                     4(d) requires the NOTICE to travel with a redistribution, and the \
+                     packaged README tells recipients to consult these files.",
+                    path.display()
+                )
+            });
+            assert_eq!(
+                shipped, canonical,
+                "{crate_name}/{document} is not a verbatim copy of the repository root's"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_notice_carries_the_upstream_attribution_the_licence_points_at() {
+    // The reason `NOTICE` has to travel: it is where upstream LeRobot is credited.
+    // A copy that had lost that would satisfy the byte-comparison above only because
+    // the root had lost it too.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates/")
+        .parent()
+        .expect("the repository root");
+    let notice = std::fs::read_to_string(root.join("NOTICE")).unwrap();
+    assert!(
+        notice.contains("LeRobot"),
+        "NOTICE does not credit upstream LeRobot"
+    );
+    assert!(
+        notice.contains("Apache"),
+        "NOTICE does not name the licence"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The packaged CLI README cannot outlive its own claim
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_cli_readme_agrees_with_the_inventory_about_how_many_commands_run() {
+    // `crates/rerobot-cli/README.md` is included in `rerobot-cli-0.1.0.crate`, so
+    // whatever it says appears on crates.io. It said "exactly one of them runs" and
+    // that `lerobot-train` is unimplemented and exits 2, after `lerobot-train` had
+    // become runnable -- a false claim about the release, in the one document a
+    // prospective user reads first.
+    //
+    // Checked against the inventory rather than against a hardcoded number, so
+    // promoting a third command forces the README to be updated in the same change.
+    let readme = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates/")
+            .join("rerobot-cli/README.md"),
+    )
+    .expect("the CLI README is readable");
+
+    let runnable: Vec<&str> = ENTRY_POINTS
+        .iter()
+        .filter(|entry| !entry.status.is_unsupported())
+        .map(|entry| entry.name)
+        .collect();
+    let unsupported = ENTRY_POINTS.len() - runnable.len();
+
+    // The count, spelled the way the prose spells it.
+    let spelled = match runnable.len() {
+        1 => "one",
+        2 => "Two",
+        3 => "Three",
+        other => panic!("the README's prose has no spelling for {other} runnable commands"),
+    };
+    assert!(
+        readme.contains(spelled),
+        "the CLI README does not state that {} of the entry points run",
+        runnable.len()
+    );
+    assert!(
+        readme.contains(&unsupported.to_string()) || readme.contains("sixteen"),
+        "the CLI README does not state how many are unported ({unsupported})"
+    );
+
+    // And it must not still be describing a runnable command as unported.
+    for name in &runnable {
+        let stale = format!("{name} --help         # works, and states that it is unimplemented");
+        assert!(
+            !readme.contains(&stale),
+            "the CLI README still calls the runnable {name} unimplemented"
+        );
+    }
+    // Every runnable command has to be mentioned at all.
+    for name in &runnable {
+        assert!(
+            readme.contains(name),
+            "the CLI README never mentions the runnable {name}"
+        );
+    }
+}

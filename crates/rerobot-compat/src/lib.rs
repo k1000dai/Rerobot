@@ -148,9 +148,12 @@ pub static ENTRY_POINTS: &[EntryPoint] = &[
     EntryPoint {
         name: "lerobot-train",
         target: "lerobot.scripts.lerobot_train:main",
-        status: Status::Unimplemented,
+        status: Status::Partial,
         summary: "Train a policy.",
-        note: "Needs the PyTorch training stack; out of scope for a pure-Rust milestone.",
+        note: "Runnable for one vertical slice: the ACT policy on a state-only LeRobot v3.0 \
+            dataset on local disk, on CPU, writing upstream's checkpoint layout. Image and video \
+            features, the Hub, accelerate, mixed precision, LR schedulers, PEFT, environment \
+            evaluation and resume are refused with a reason rather than ignored.",
     },
     EntryPoint {
         name: "lerobot-train-tokenizer",
@@ -253,7 +256,9 @@ pub static MODULE_FAMILIES: &[ModuleFamily] = &[
             "`configs.types` str-enums and `PolicyFeature` are ported and tested. The ACT policy's \
                concrete config is too, including the `from_pretrained`/`_save_pretrained` \
                checkpoint JSON path and the Draccus value conversions it decodes through. The \
-               Draccus CLI parser and train/eval configs are not.",
+               Draccus CLI parser is not, and neither is `configs.train`: `lerobot-train` \
+               consumes an explicit allow-list of flags instead, refusing everything else by \
+               name.",
     },
     ModuleFamily {
         name: "data_processing",
@@ -265,11 +270,15 @@ pub static MODULE_FAMILIES: &[ModuleFamily] = &[
         name: "datasets",
         status: Status::Partial,
         upstream_modules: 22,
-        note: "The `meta/info.json` slice is ported and tested: `utils`' path constants and \
-               `DatasetInfo` (defaults, shape coercion, validation, `to_dict`/`from_dict`), plus \
-               `io_utils.load_info`/`write_info` against a local directory. \
-               `LeRobotDatasetMetadata`, tasks, stats, episodes, parquet, video decoding and Hub \
-               sync are not.",
+        note: "A state-only LeRobot v3.0 dataset on local disk is ported and tested end to end: \
+               `utils`' path constants, `DatasetInfo`, `io_utils`' four loaders including \
+               `load_stats`, the tasks and episodes parquet tables, the frame data files, \
+               `feature_utils`' delta indices and tolerance check, `dataset_reader`'s \
+               episode-clamped windows and `<key>_is_pad` flags, and `sampler`'s \
+               `EpisodeAwareSampler` structure. Image and video features, video decoding, the \
+               streaming dataset, episode-filtered index remapping, dataset editing and Hub sync \
+               are not, and the sampler's per-epoch order is Rerobot's own rather than \
+               `torch.randperm`'s.",
     },
     ModuleFamily {
         name: "envs",
@@ -297,17 +306,23 @@ pub static MODULE_FAMILIES: &[ModuleFamily] = &[
     },
     ModuleFamily {
         name: "optim",
-        status: Status::Unimplemented,
+        status: Status::Partial,
         upstream_modules: 4,
-        note: "Optimizer and LR-scheduler configs bound to PyTorch.",
+        note: "`torch.optim.AdamW` and `torch.nn.utils.clip_grad_norm_` are reimplemented with \
+               upstream's update order and save format, and checked against PyTorch. The Draccus \
+               optimizer and LR-scheduler registries, every other optimizer, and all schedulers \
+               are not ported.",
     },
     ModuleFamily {
         name: "policies",
         status: Status::Partial,
         upstream_modules: 128,
         note: "ACTConfig validation, presets, delta indices and byte-exact checkpoint JSON \
-               read/write are ported. The ACT processor and tensor model, and every other policy \
-               architecture, are not.",
+               read/write are ported, as is the ACT tensor model itself for the state-only case: \
+               the VAE encoder, transformer, action head and the L1-plus-KL objective, compared \
+               element by element against upstream running on PyTorch. The ResNet backbone, the \
+               2-D camera position embedding, the temporal ensembler, the ACT processor pipeline \
+               and every other policy architecture are not.",
     },
     ModuleFamily {
         name: "processor",
@@ -315,8 +330,12 @@ pub static MODULE_FAMILIES: &[ModuleFamily] = &[
         upstream_modules: 19,
         note: "`rename_processor` (step + `rename_stats`) and the value transform/stateless \
                lifecycle of `newline_task_processor.NewLineTaskProcessorStep` are ported and \
-               tested. Python aliasing, registry/config reconstruction, the pipeline runtime, \
-               normalization, tokenizer, and device steps are not.",
+               tested, as is `normalize_processor`'s numeric transform for all four of its \
+               modes. The pre/postprocessor *artifacts* a checkpoint carries are written \
+               byte-identically to upstream's, including both normalizer state files. The \
+               pipeline runtime that would execute those steps, Python aliasing, \
+               registry/config reconstruction, and the tokenizer and device steps are not \
+               ported.",
     },
     ModuleFamily {
         name: "rewards",
@@ -350,8 +369,9 @@ pub static MODULE_FAMILIES: &[ModuleFamily] = &[
         name: "scripts",
         status: Status::Partial,
         upstream_modules: 20,
-        note: "`lerobot_info` is ported and runnable. The other 17 entry points exist only as \
-               executables that fail with a stable unsupported error.",
+        note: "`lerobot_info` and `lerobot_train` are ported and runnable, the latter for one \
+               vertical slice. The other 16 entry points exist only as executables that fail with \
+               a stable unsupported error.",
     },
     ModuleFamily {
         name: "teleoperators",
@@ -382,8 +402,11 @@ pub static MODULE_FAMILIES: &[ModuleFamily] = &[
         status: Status::Partial,
         upstream_modules: 25,
         note: "`action_interpolator` is ported and tested, as are `io_utils.load_json` and \
-               `io_utils.write_json` for local paths. Random/hub/train utilities, and the video \
-               and image writers in `io_utils`, are not.",
+               `io_utils.write_json` for local paths. `common.train_utils`' checkpoint layout is \
+               ported by `rerobot-train`. `random_utils` is deliberately *not* ported: Rerobot \
+               seeds its own SplitMix64 rather than Python's, NumPy's and PyTorch's three \
+               generators, so its random values differ. Hub utilities and the video and image \
+               writers in `io_utils` are not ported.",
     },
 ];
 

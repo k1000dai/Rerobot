@@ -80,7 +80,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets --all-features
 cargo test --workspace --doc
 cargo build --workspace --release
-cargo package --workspace --allow-dirty
+python3 tools/verify_packages.py
 
 # The declared MSRV, on the toolchain `Cargo.toml` names. CI reads the version
 # out of the manifest so the two cannot drift; do it by hand here.
@@ -93,10 +93,19 @@ enforces for users. Raise it only when a dependency or a language feature forces
 the raise, and say which in the commit message — the current `1.85` comes from
 `indexmap` 2.14.0 and `hashbrown` 0.17.1 in the lockfile, not from this source.
 
-`cargo package` must be run with `--workspace`, not as three `-p` runs:
-`rerobot-cli` depends on the other two crates, which are not on crates.io, and
-only the workspace form builds the temporary local registry that the
-verification build resolves them from.
+The package verifier runs `cargo package --workspace --locked --no-verify`,
+extracts the exact `.crate` archives, patches their registry dependencies only
+inside a temporary directory to the extracted sibling archives, and runs every
+packaged test and doctest. It also asserts that every archive carries `LICENSE`
+and `NOTICE`.
+
+Cargo's built-in verifier alone cannot validate this workspace, and the reason is
+worth stating precisely: **none of the four crates has been published**. A
+normalized manifest resolves each path dependency from crates.io, so verifying
+`rerobot-train` or `rerobot-cli` fails because there is no `rerobot-core 0.1.0`
+on the registry to resolve to. That is a chicken-and-egg problem inherent to
+releasing a set of interdependent crates for the first time, not a fault in the
+archives — which is exactly what the verifier exists to demonstrate.
 
 `cargo deny check` is also run in CI if you have `cargo-deny` installed locally;
 see `deny.toml`.

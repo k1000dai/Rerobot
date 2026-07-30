@@ -10,7 +10,11 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+# Candle 0.9.1 is the newest release that builds on the declared Rust 1.85
+# floor. Its `gemm` dependency uses `paste`; RUSTSEC-2024-0436 records that the
+# macro crate is archived, not a vulnerability, and offers no safe upgrade.
+# Remove this exception when Candle can move without raising the MSRV.
+ignore = ["RUSTSEC-2024-0436"]
 
 [licenses]
 version = 2
@@ -22,6 +26,11 @@ allow = [
     "MIT",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    # A public-domain dedication, so permissive in the sense this list cares about.
+    # `tiny-keccak` carries it, reached only as a compile-time proc-macro input
+    # through `ahash`'s `const-random`, which Arrow's hashing depends on. Nothing
+    # under this licence is linked into a shipped binary.
+    "CC0-1.0",
     "ISC",
     "Unicode-3.0",
     "Zlib",

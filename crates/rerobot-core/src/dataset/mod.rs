@@ -5,9 +5,12 @@
 //! `LeRobotDatasetMetadata`, tasks, stats, episodes, parquet, video, and the
 //! Hub are **not** part of it and are not stubbed.
 
+pub mod delta;
 pub mod info;
 pub mod io;
 pub mod json;
+pub mod sampler;
+pub mod stats;
 
 /// Max number of files per chunk (`DEFAULT_CHUNK_SIZE`).
 ///

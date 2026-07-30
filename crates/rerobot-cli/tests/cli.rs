@@ -142,12 +142,20 @@ fn unported_commands_stay_unsupported_even_with_arguments() {
 }
 
 #[test]
-fn seventeen_of_eighteen_commands_are_unsupported() {
+fn sixteen_of_eighteen_commands_are_unsupported() {
     let unsupported = ENTRY_POINTS
         .iter()
         .filter(|e| e.status.is_unsupported())
         .count();
-    assert_eq!(unsupported, 17);
+    assert_eq!(unsupported, 16);
+    // The two that are not: `lerobot-info` in full, and `lerobot-train` for the
+    // ACT state-only slice.
+    let runnable: Vec<&str> = ENTRY_POINTS
+        .iter()
+        .filter(|e| !e.status.is_unsupported())
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(runnable, vec!["lerobot-train", "lerobot-info"]);
 }
 
 #[test]

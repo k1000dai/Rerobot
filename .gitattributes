@@ -2,3 +2,9 @@
 # In particular, rustfmt.toml requires Unix newlines; Git for Windows otherwise
 # checks text files out as CRLF before `cargo fmt --check` runs.
 * text=auto eol=lf
+
+# Test fixtures are binary: parquet written by pyarrow, safetensors written by
+# PyTorch. `text=auto` above would otherwise be free to inspect and (mis)convert
+# them, and a corrupted fixture is a confusing failure rather than an obvious one.
+*.parquet binary
+*.safetensors binary

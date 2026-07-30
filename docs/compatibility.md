@@ -52,7 +52,7 @@ All 18 upstream console scripts exist as executables with byte-identical names.
 | `lerobot-setup-motors` | hardware-gated | `lerobot.scripts.lerobot_setup_motors:main` | Set motor ids and baudrate on a motor bus. | Drives physical hardware through a vendor SDK; nothing is faked, so it stays hardware-gated until a real driver layer exists. |
 | `lerobot-teleoperate` | hardware-gated | `lerobot.scripts.lerobot_teleoperate:main` | Drive a robot from a teleoperator. | Drives physical hardware through a vendor SDK; nothing is faked, so it stays hardware-gated until a real driver layer exists. |
 | `lerobot-eval` | unimplemented | `lerobot.scripts.lerobot_eval:main` | Evaluate a policy by running environment rollouts. | Needs policy inference and a Gymnasium environment; neither is ported, and fabricating metrics would be worse than failing. |
-| `lerobot-train` | unimplemented | `lerobot.scripts.lerobot_train:main` | Train a policy. | Needs the PyTorch training stack; out of scope for a pure-Rust milestone. |
+| `lerobot-train` | partial | `lerobot.scripts.lerobot_train:main` | Train a policy. | Runnable for one vertical slice: the ACT policy on a state-only LeRobot v3.0 dataset on local disk, on CPU, writing upstream's checkpoint layout. Image and video features, the Hub, accelerate, mixed precision, LR schedulers, PEFT, environment evaluation and resume are refused with a reason rather than ignored. |
 | `lerobot-train-tokenizer` | unimplemented | `lerobot.scripts.lerobot_train_tokenizer:main` | Train the FAST action tokenizer. | Needs LeRobotDataset loading and the tokenizer training stack. |
 | `lerobot-dataset-viz` | unimplemented | `lerobot.scripts.lerobot_dataset_viz:main` | Visualize every frame of a dataset episode. | Needs the dataset reader plus a Rerun/Foxglove viewer bridge. |
 | `lerobot-info` | partial | `lerobot.scripts.lerobot_info:main` | Print a markdown summary of the system configuration. | Ported and runnable. Keys that report Python package versions cannot apply to a Rust build and are reported as not ported rather than invented. |
@@ -83,26 +83,26 @@ pinned commit; it is a size indicator, not a progress metric.
 | `lerobot/async_inference` | unimplemented | 6 | gRPC policy server/client split. |
 | `lerobot/cameras` | hardware-gated | 17 | OpenCV / RealSense capture backends. |
 | `lerobot/common` | unimplemented | 4 | Shared constants and mixins used by the unported families. |
-| `lerobot/configs` | partial | 11 | `configs.types` str-enums and `PolicyFeature` are ported and tested. The ACT policy's concrete config is too, including the `from_pretrained`/`_save_pretrained` checkpoint JSON path and the Draccus value conversions it decodes through. The Draccus CLI parser and train/eval configs are not. |
+| `lerobot/configs` | partial | 11 | `configs.types` str-enums and `PolicyFeature` are ported and tested. The ACT policy's concrete config is too, including the `from_pretrained`/`_save_pretrained` checkpoint JSON path and the Draccus value conversions it decodes through. The Draccus CLI parser is not, and neither is `configs.train`: `lerobot-train` consumes an explicit allow-list of flags instead, refusing everything else by name. |
 | `lerobot/data_processing` | unimplemented | 3 | Dataset-level batch processing helpers. |
-| `lerobot/datasets` | partial | 22 | The `meta/info.json` slice is ported and tested: `utils`' path constants and `DatasetInfo` (defaults, shape coercion, validation, `to_dict`/`from_dict`), plus `io_utils.load_info`/`write_info` against a local directory. `LeRobotDatasetMetadata`, tasks, stats, episodes, parquet, video decoding and Hub sync are not. |
+| `lerobot/datasets` | partial | 22 | A state-only LeRobot v3.0 dataset on local disk is ported and tested end to end: `utils`' path constants, `DatasetInfo`, `io_utils`' four loaders including `load_stats`, the tasks and episodes parquet tables, the frame data files, `feature_utils`' delta indices and tolerance check, `dataset_reader`'s episode-clamped windows and `<key>_is_pad` flags, and `sampler`'s `EpisodeAwareSampler` structure. Image and video features, video decoding, the streaming dataset, episode-filtered index remapping, dataset editing and Hub sync are not, and the sampler's per-epoch order is Rerobot's own rather than `torch.randperm`'s. |
 | `lerobot/envs` | unimplemented | 10 | Gymnasium environment factories. |
 | `lerobot/jobs` | unimplemented | 4 | Hugging Face Jobs launchers. |
 | `lerobot/model` | unimplemented | 2 | Shared model plumbing. |
 | `lerobot/motors` | hardware-gated | 16 | Feetech / Dynamixel / CAN motor buses. |
-| `lerobot/optim` | unimplemented | 4 | Optimizer and LR-scheduler configs bound to PyTorch. |
-| `lerobot/policies` | partial | 128 | ACTConfig validation, presets, delta indices and byte-exact checkpoint JSON read/write are ported. The ACT processor and tensor model, and every other policy architecture, are not. |
-| `lerobot/processor` | partial | 19 | `rename_processor` (step + `rename_stats`) and the value transform/stateless lifecycle of `newline_task_processor.NewLineTaskProcessorStep` are ported and tested. Python aliasing, registry/config reconstruction, the pipeline runtime, normalization, tokenizer, and device steps are not. |
+| `lerobot/optim` | partial | 4 | `torch.optim.AdamW` and `torch.nn.utils.clip_grad_norm_` are reimplemented with upstream's update order and save format, and checked against PyTorch. The Draccus optimizer and LR-scheduler registries, every other optimizer, and all schedulers are not ported. |
+| `lerobot/policies` | partial | 128 | ACTConfig validation, presets, delta indices and byte-exact checkpoint JSON read/write are ported, as is the ACT tensor model itself for the state-only case: the VAE encoder, transformer, action head and the L1-plus-KL objective, compared element by element against upstream running on PyTorch. The ResNet backbone, the 2-D camera position embedding, the temporal ensembler, the ACT processor pipeline and every other policy architecture are not. |
+| `lerobot/processor` | partial | 19 | `rename_processor` (step + `rename_stats`) and the value transform/stateless lifecycle of `newline_task_processor.NewLineTaskProcessorStep` are ported and tested, as is `normalize_processor`'s numeric transform for all four of its modes. The pre/postprocessor *artifacts* a checkpoint carries are written byte-identically to upstream's, including both normalizer state files. The pipeline runtime that would execute those steps, Python aliasing, registry/config reconstruction, and the tokenizer and device steps are not ported. |
 | `lerobot/rewards` | unimplemented | 24 | Reward classifiers and success detectors. |
 | `lerobot/rl` | unimplemented | 21 | HIL-SERL actor/learner infrastructure. |
 | `lerobot/robots` | hardware-gated | 53 | Per-robot drivers (SO-100/101, LeKiwi, Reachy2, Unitree, ...). |
 | `lerobot/rollout` | partial | 18 | `ring_buffer.RolloutRingBuffer` is ported and tested, including its byte-accounting quirks, as is the DAgger event state machine (`strategies.dagger.DAggerPhase`, its four transitions and `DAggerEvents`). The DAgger strategy itself, the input devices it listens to, the other rollout strategies and the policy loop are not. |
-| `lerobot/scripts` | partial | 20 | `lerobot_info` is ported and runnable. The other 17 entry points exist only as executables that fail with a stable unsupported error. |
+| `lerobot/scripts` | partial | 20 | `lerobot_info` and `lerobot_train` are ported and runnable, the latter for one vertical slice. The other 16 entry points exist only as executables that fail with a stable unsupported error. |
 | `lerobot/teleoperators` | hardware-gated | 59 | Leader arms, gamepads, keyboards, phone teleop. |
 | `lerobot/templates` | unimplemented | 0 | Non-Python scaffolding templates; nothing to port yet. |
 | `lerobot/transforms` | unimplemented | 2 | Image augmentation transforms built on torchvision. |
 | `lerobot/transport` | unimplemented | 4 | gRPC transport for async inference. |
-| `lerobot/utils` | partial | 25 | `action_interpolator` is ported and tested, as are `io_utils.load_json` and `io_utils.write_json` for local paths. Random/hub/train utilities, and the video and image writers in `io_utils`, are not. |
+| `lerobot/utils` | partial | 25 | `action_interpolator` is ported and tested, as are `io_utils.load_json` and `io_utils.write_json` for local paths. `common.train_utils`' checkpoint layout is ported by `rerobot-train`. `random_utils` is deliberately *not* ported: Rerobot seeds its own SplitMix64 rather than Python's, NumPy's and PyTorch's three generators, so its random values differ. Hub utilities and the video and image writers in `io_utils` are not ported. |
 
 ## What is actually ported
 
@@ -126,6 +126,91 @@ from upstream's own test-suite and from direct execution of the upstream Python.
 | `rerobot_core::policy::draccus` | Draccus 0.10.0's `parsers/decoding.py` conversions, and CPython's `int()`/`float()`/`str()`/`pathlib.PurePosixPath` for the values they reach | `crates/rerobot-core/tests/act_checkpoint.rs` |
 | `rerobot_core::sysinfo` | `lerobot/scripts/lerobot_info.py` (pure parts) | `crates/rerobot-core/tests/sysinfo.rs` |
 | `rerobot_cli::which` | `shutil.which`, as called by `get_ffmpeg_version` | `crates/rerobot-cli/tests/which.rs` |
+| `rerobot_core::random` | no upstream counterpart — SplitMix64, standing in for the three generators `lerobot/utils/random_utils.py` seeds. Rerobot's random *values* are its own; see the boundary note below | `crates/rerobot-core/tests/random.rs` |
+| `rerobot_core::dataset::delta` | `lerobot/datasets/feature_utils.py` (`get_delta_indices`, `check_delta_timestamps`), `dataset_reader.py`'s `_get_query_indices`, and `datasets/factory.py`'s `resolve_delta_timestamps` | `crates/rerobot-core/tests/dataset_delta.rs` |
+| `rerobot_core::dataset::sampler` | `lerobot/datasets/sampler.py` (`EpisodeAwareSampler` structure and `compute_sampler_state`; **not** the per-epoch order) | `crates/rerobot-core/tests/dataset_sampler.rs` |
+| `rerobot_core::dataset::stats` | `lerobot/datasets/io_utils.py`'s `load_stats` and `cast_stats_to_numpy` | `crates/rerobot-core/tests/dataset_stats.rs` |
+| `rerobot_core::policy::normalize` | `lerobot/processor/normalize_processor.py`'s `_NormalizationMixin._apply_transform` (all four numeric modes) | `crates/rerobot-core/tests/policy_normalize.rs` |
+| `rerobot_train::data` | `lerobot/datasets/{lerobot_dataset,dataset_reader,io_utils}.py`, state-only and local-directory only | `crates/rerobot-train/tests/dataset.rs`, against a fixture upstream itself wrote |
+| `rerobot_train::model` | `lerobot/policies/act/modeling_act.py` (`ACT`, `ACTEncoder`, `ACTDecoder`, `create_sinusoidal_pos_embedding`, `get_activation_fn`, and `ACTPolicy.forward`'s loss), plus `torch.nn.{Linear,LayerNorm,MultiheadAttention}` | `crates/rerobot-train/tests/model.rs`, and `tests/goldens.rs` against PyTorch |
+| `rerobot_train::optim` | `torch.optim.AdamW` and `torch.nn.utils.clip_grad_norm_`, plus `lerobot/optim/optimizers.py`'s save format | `crates/rerobot-train/tests/optimizer.rs`, and `tests/goldens.rs` against PyTorch |
+| `rerobot_train::checkpoint` | `lerobot/common/train_utils.py`'s directory layout and `training_step.json` | `crates/rerobot-train/tests/train.rs`, `crates/rerobot-train/tests/checkpoint_safety.rs` |
+| `rerobot_train::processor` | the four pre/postprocessor artifacts `save_checkpoint` writes, from `lerobot/policies/factory.py`'s `make_pre_post_processors` and `lerobot/processor/pipeline.py`'s `_save_pretrained` | `crates/rerobot-train/tests/processor.rs`, byte for byte against upstream's own output |
+| `rerobot_train::limits` | no upstream counterpart — the resource budget the reader and the model enforce on untrusted sizes | `crates/rerobot-train/tests/limits.rs`, `crates/rerobot-train/tests/parquet_budget.rs` |
+| `rerobot_train::run` | `lerobot/scripts/lerobot_train.py`'s offline step loop | `crates/rerobot-train/tests/train.rs`, `crates/rerobot-cli/tests/train_cli.rs` |
+| `rerobot_cli::train` | `lerobot-train`'s argument surface, as an explicit allow-list rather than a Draccus port | `crates/rerobot-cli/tests/train_cli.rs` |
+
+### The ACT training slice is checked against PyTorch, not only against itself
+
+`crates/rerobot-train/tests/goldens.rs` compares Rerobot's ACT path element by
+element against upstream running on PyTorch, at the reduced state-only
+configuration described in `tools/goldens/README.md`. The expected values were
+produced once by `tools/goldens/make_act_goldens.py` at the pinned commit and
+committed; the Rust tests read them and never invoke Python.
+
+What is compared: the normalized batch, the predicted action chunk, the latent
+distribution's `mu` and `log(sigma^2)`, the masked L1 loss, the mean KL
+divergence, the weighted total, eleven representative parameter gradients, the
+total gradient norm `clip_grad_norm_` reports, and the parameters after one AdamW
+step. Agreement is to `f32` round-off — measured worst case 9.4e-7 of each
+tensor's own scale, and better than 1e-7 relative on every scalar.
+
+The comparison is anchored at both ends. Upstream's exported `state_dict` loads
+into Rerobot's model, which only works because the 62 tensor names and shapes are
+upstream's; and `tools/goldens/verify_checkpoint_upstream.py` loads a checkpoint
+`lerobot-train` wrote back into a real `ACTPolicy` with `strict=True` and runs a
+forward pass on it.
+
+### What a training run refuses, and why that is part of the contract
+
+The training slice treats every number it did not compute itself as hostile, because
+each of them arrives from a command line, a `meta/info.json`, an episode table or a
+parquet footer, and two of its dependencies act on them: candle allocates tensors and
+Arrow decodes columns, both in code with a large unsafe surface that
+`#![forbid(unsafe_code)]` on this crate says nothing about.
+
+| Refused | Because |
+| --- | --- |
+| a non-finite or out-of-range float (`policy.dropout`, `kl_weight`, the three learning rates, `tolerance_s`) | `NaN` in `dropout` silently *disables* dropout, since `NaN > 0.0` is false, so the run trains a different configuration than the one asked for; `NaN` in a learning rate poisons every weight |
+| a non-finite loss, KL term, gradient norm or post-update parameter norm | the step trained nothing, and reporting it writes a checkpoint of `NaN` weights that looks like a successful run. Checked before the optimizer runs, so a poisoned gradient never reaches the weights |
+| a policy dimension, batch size or step count above `rerobot_train::limits` | each becomes a tensor shape or an allocation; a `chunk_size` of 10^29 is a request to abort the process, not a configuration |
+| a parquet file above its byte, row, column, value, text or element budget | checked from the footer before any decode, and accumulated across files so a dataset of many small files is bounded too |
+| a shape product that overflows | wrapping is worse than panicking: the allocation succeeds at the wrong size and the reader then walks past its end |
+| an episode range that is negative, inverted, overlapping, past `total_frames`, or disagrees with its own `length` | the reader treats these as arithmetic, and `i64::MIN` made the window clamp wrap onto unrelated frames |
+| a real directory at `checkpoints/last` | maintaining a one-line marker must never recursively delete a tree. A symlink is unlinked without being followed; anything else is refused |
+| a checkpoint tensor of the wrong dtype, shape or name, an RNG state of the wrong shape or with extra tensors, or an optimizer state with an unknown key, an out-of-range parameter index, a mismatched moment, or a non-finite step | each would otherwise be a silently wrong resume rather than an error. The optimizer validates every entry before installing any, so a rejected file leaves it untouched |
+
+None of these limits is below what upstream's own defaults need; static assertions in
+`crates/rerobot-train/tests/limits.rs` enforce that, so the budget cannot be tightened
+into refusing a command upstream accepts.
+
+### Where this slice's randomness diverges, and why
+
+`lerobot/utils/random_utils.py` seeds Python's `random`, NumPy's global
+`RandomState` and PyTorch's Mersenne Twister, and every random choice upstream
+makes draws from one of those. Rerobot reproduces none of those streams: it uses
+SplitMix64 (`rerobot_core::random`), whose entire state is one 64-bit word.
+
+The consequences are stated rather than hidden:
+
+* **parameter initialization** — the *distributions* are torch's
+  (`kaiming_uniform_(a=sqrt(5))` for `nn.Linear`, `xavier_uniform_` for the
+  transformer and for `nn.MultiheadAttention`'s packed projection, `N(0, 1)` for
+  embeddings), but the values differ. A same-seeded run does not reproduce
+  upstream's weights.
+* **the sampler's per-epoch order** — upstream derives it from `torch.randperm`
+  seeded through `numpy.random.SeedSequence([seed, epoch])`. Rerobot substitutes
+  its own documented permutation, which keeps every property the training loop
+  needs (a pure function of `(seed, epoch)`, reproducible across processes and
+  platforms, resumable from an offset) but is a different sequence.
+* **the VAE latent draw and dropout masks** — same seed, different numbers.
+* **`rng_state.safetensors`** — holds one tensor named
+  `rerobot_splitmix64_state`, not upstream's `random_state`,
+  `numpy_random_state` and `torch_random_state`. A reader expecting those fails
+  to find them rather than finding something that looks like them and is not.
+
+This is why the differential oracle supplies the weights and the latent draw
+instead of seeding both sides.
 | `lerobot-info` | `lerobot/scripts/lerobot_info.py` | `crates/rerobot-cli/tests/{info,cli,which}.rs` |
 
 `lerobot-info` prints upstream's 15 `get_sys_info` keys, in upstream's order,
@@ -414,12 +499,13 @@ can be exercised on one machine, so this is exactly what is checked where.
 
 ## Optional dependency and hardware boundaries
 
-Upstream gates most of its surface behind extras. None of these boundaries are
-crossed by Rerobot at this milestone, and none are simulated.
+Upstream gates most of its surface behind extras. Rerobot crosses only the narrow
+local dataset/training boundary listed below, using native Rust dependencies rather
+than loading the Python extras; the remaining boundaries are not simulated.
 
 | Upstream extra | Gates | Rerobot |
 | --- | --- | --- |
-| `dataset`, `training` | `datasets`, `torchcodec`, `pyarrow`, `wandb`, `accelerate` | not ported |
+| `dataset`, `training` | `datasets`, `torchcodec`, `pyarrow`, `wandb`, `accelerate` | partial: local state-only Parquet datasets, ACT normalization/training, AdamW and safetensors checkpoints use Arrow/Parquet and Candle in Rust. Images, video, Hub access, W&B, distributed/mixed-precision training and evaluation are refused. |
 | `hardware` | `pynput`, `pyserial`, `deepdiff` | hardware-gated |
 | `feetech`, `dynamixel`, `damiao`, `robstride` | motor SDKs, `python-can` | hardware-gated |
 | `intelrealsense`, `gamepad`, `hopejr`, `lekiwi`, `openarms`, `reachy2`, `rebot`, `unitree_g1`, `phone` | robot/teleop vendor SDKs | hardware-gated |
@@ -428,9 +514,18 @@ crossed by Rerobot at this milestone, and none are simulated.
 | `aloha`, `pusht`, `libero`, `metaworld` | Gymnasium simulation environments | not ported |
 | `async`, `kinematics`, `annotations` | `grpcio`, `placo`, `openai` | not ported |
 
+The training backend pins Candle to `0.9.1`: `0.9.2` uses a standard-library API
+that is unavailable on the declared Rust 1.85 floor. Candle 0.9.1 transitively
+contains both `gemm` 0.17 and 0.18 families; `cargo deny` reports those as duplicate
+warnings. It also reaches archived macro crate `paste` 1.0.15. The corresponding
+`RUSTSEC-2024-0436` entry is an unmaintained notice rather than a vulnerability and
+has no safe upgrade, so `deny.toml` carries a documented temporary exception until
+Candle can move without raising the MSRV. Arrow and Parquet are pinned to 56.2.0.
+
 ## Non-goals for this milestone
 
 * No Python sidecar, FFI bridge, or subprocess shim for the implemented core.
-* No model inference, no weight loading, and no dataset frame/Parquet reading;
-  only local `meta/info.json` metadata is read and written.
+* No image/video policy path, Hub dataset download, evaluation environment, or
+  training resume. The implemented state-only ACT path does read local Parquet,
+  load weights, and run inference when validating a checkpoint round trip.
 * No hardware access beyond invoking `ffmpeg -version` for `lerobot-info`.

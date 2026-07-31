@@ -1,0 +1,49 @@
+[package]
+name = "rerobot-train"
+description = "Pure-Rust LeRobot ACT training: state-only dataset reading, the ACT tensor model, AdamW, and the upstream checkpoint layout."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[dependencies]
+rerobot-core.workspace = true
+indexmap.workspace = true
+num-bigint.workspace = true
+
+# The tensor runtime. Pinned exactly: this crate reimplements PyTorch operator
+# semantics (`nn.MultiheadAttention`'s packed projection, `nn.LayerNorm`'s eps,
+# AdamW's update order) on top of it, and a minor bump that changed a reduction
+# or a broadcast rule would move the numbers the golden tests pin.
+#
+# Default features only, which for candle means CPU: no CUDA, no Metal, no MKL,
+# no Accelerate. `docs/compatibility.md` records that `--policy.device` accepts
+# nothing but `cpu`.
+candle-core = { version = "=0.9.1", default-features = false }
+candle-nn = { version = "=0.9.1", default-features = false }
+
+# Reading the dataset's parquet files. `default-features = false` drops the
+# async runtime, the CLI helpers and the object-store integration; `arrow` is the
+# reader this crate uses and `snap` is the codec pyarrow writes by default, which
+# is what the committed fixture is compressed with.
+arrow-array = "=56.2.0"
+arrow-schema = "=56.2.0"
+parquet = { version = "=56.2.0", default-features = false, features = ["arrow", "snap"] }
+
+[dev-dependencies]
+# The tests build deliberately malformed parquet files -- inverted episode ranges,
+# oversized row counts -- to prove the reader refuses them rather than panicking.
+# Writing one needs the same arrow stack the reader reads with, at the same pins, so
+# a fixture cannot be malformed in a way the reader would never see.
+arrow-array = "=56.2.0"
+arrow-schema = "=56.2.0"
+parquet = { version = "=56.2.0", default-features = false, features = ["arrow", "snap"] }
+
+[lints.rust]
+missing_docs = "warn"

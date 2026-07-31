@@ -8,7 +8,7 @@ name: CI
 # release each SHA was, so the pin stays readable and bumpable.
 #
 # Resolved and verified against the GitHub API at pin time:
-#   actions/checkout                 11d5960 = tag v4.4.0
+#   actions/checkout                 fbc6f39 = tag v5.0.0
 #   Swatinem/rust-cache              c193711 = tag v2.9.1
 #   EmbarkStudios/cargo-deny-action  3c63498 = tag v2.1.1
 #   dtolnay/rust-toolchain           4cda84d = head of the `stable` branch on
@@ -59,10 +59,10 @@ jobs:
         run: cargo fmt --all --check
 
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: cargo test
-        run: cargo test --workspace --all-targets --all-features
+        run: cargo test --workspace --all-targets --all-features --locked
 
       # The `cfg(windows)` half of the `shutil.which` port cannot run on the
       # machine it was written on, so `windows-latest` is where PATHEXT
@@ -76,13 +76,23 @@ jobs:
         if: runner.os == 'Windows'
         env:
           NoDefaultCurrentDirectoryInExePath: '1'
-        run: cargo test --workspace --all-targets --all-features
+        run: cargo test --workspace --all-targets --all-features --locked
 
       - name: cargo test --doc
         run: cargo test --workspace --doc
 
+      # Doctests run the code in the docs; they say nothing about whether the docs
+      # themselves resolve. A broken intra-doc link, an ambiguous one, or a private
+      # type named in a public signature is a rustdoc warning and never a test
+      # failure, so without this step the documentation can rot while every gate
+      # stays green. `--no-deps` keeps it to this workspace's own output.
+      - name: cargo doc (strict)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --all-features --no-deps --locked
+
       - name: cargo build --release
-        run: cargo build --workspace --release
+        run: cargo build --workspace --release --locked
 
   msrv:
     # The minimum supported Rust version is a published promise: `rust-version`
@@ -137,11 +147,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch, 2026-07-16
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      # --workspace is required rather than three -p runs: rerobot-cli depends
-      # on the other two, which are not on crates.io, so only the workspace
-      # form builds the temporary local registry that verification needs.
-      - name: cargo package
-        run: cargo package --workspace --allow-dirty
+      # Cargo's built-in verifier resolves normalized path dependencies from
+      # crates.io, where the unreleased sibling APIs do not exist yet. Build the
+      # normal archives, then test those exact archives against extracted sibling
+      # archives in a temporary local patch workspace.
+      - name: package and verify exact archives
+        run: python3 tools/verify_packages.py
 
   smoke:
     name: lerobot-* smoke test
@@ -152,7 +163,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Build executables
-        run: cargo build --workspace --release
+        run: cargo build --workspace --release --locked
 
       - name: lerobot-info runs for real
         run: |
@@ -172,13 +183,37 @@ jobs:
           # or `os.defpath`, when PATH is absent from the environment. A port
           # that returned None here would report an installed ffmpeg as missing
           # for every process started with a scrubbed environment.
-          if ! command -v ffmpeg > /dev/null; then
-            # Nothing to detect, so the assertion below would prove nothing.
+          # The precondition has to be "ffmpeg is on the *fallback* path", not
+          # "ffmpeg is on PATH". `command -v ffmpeg` is satisfied by a Homebrew,
+          # Nix or user-local install that `CS_PATH` knows nothing about, and this
+          # step then asserts a fallback that genuinely cannot succeed. That
+          # combination was observed on a developer machine.
+          #
+          # So probe the same directories CPython would: `confstr("CS_PATH")` if
+          # getconf can report it, else `os.defpath`, which is `:/bin:/usr/bin`.
+          fallback="$(getconf PATH 2>/dev/null || true)"
+          if [ -z "$fallback" ]; then
+            fallback="/bin:/usr/bin"
+          fi
+          found=""
+          IFS=':'
+          for dir in $fallback; do
+            [ -n "$dir" ] || continue
+            if [ -x "$dir/ffmpeg" ]; then
+              found="$dir/ffmpeg"
+              break
+            fi
+          done
+          unset IFS
+          if [ -z "$found" ]; then
+            # ffmpeg may still be on PATH, but not where the fallback looks, so the
+            # assertion below would be asserting something untrue of this runner.
             # The unit test `an_unset_search_path_falls_back_to_the_system_default`
-            # still covers the fallback on this runner.
-            echo "::warning::no ffmpeg on this runner; skipping the PATH-less probe"
+            # covers the fallback logic itself with a synthetic path.
+            echo "::warning::no ffmpeg under the CS_PATH fallback ($fallback); skipping the PATH-less probe"
             exit 0
           fi
+          echo "ffmpeg is on the fallback path at $found"
           out="$(env -u PATH ./target/release/lerobot-info)"
           printf '%s\n' "$out" | grep -q '^- FFmpeg version:'
           if printf '%s\n' "$out" | grep -qx -- '- FFmpeg version: N/A'; then
@@ -198,18 +233,23 @@ jobs:
             fi
           done
 
-      - name: unported commands fail with the documented contract
+      - name: lerobot-train performs a real one-step ACT training run
         run: |
-          set +e
-          ./target/release/lerobot-train > out.txt 2> err.txt
-          code=$?
-          set -e
-          test "$code" -eq 2 || { echo "expected exit 2, got $code"; exit 1; }
-          test ! -s out.txt || { echo "expected empty stdout"; cat out.txt; exit 1; }
-          grep -q '^lerobot-train: unsupported in Rerobot' err.txt
-          test "$(wc -l < err.txt)" -eq 1
-          # The error has to point somewhere a user without a checkout can go.
-          grep -q 'https://github.com/k1000dai/Rerobot/blob/main/docs/compatibility.md' err.txt
+          parent="$(mktemp -d)"
+          out="$parent/run"
+          ./target/release/lerobot-train \
+            --dataset.repo_id=rerobot/state_only_slice \
+            --dataset.root=crates/rerobot-train/tests/fixtures/state_only \
+            --output_dir="$out" --policy.type=act --steps=1 --batch_size=2 \
+            --policy.chunk_size=2 --policy.n_action_steps=2 --policy.dim_model=32 \
+            --policy.n_heads=4 --policy.dim_feedforward=64 \
+            --policy.n_encoder_layers=1 --policy.n_decoder_layers=1 \
+            --policy.n_vae_encoder_layers=1 --policy.latent_dim=8 > train.log
+          grep -q '^End of training$' train.log
+          grep -q '^step:1 loss:' train.log
+          test -s "$out/checkpoints/000001/pretrained_model/model.safetensors"
+          test -s "$out/checkpoints/000001/training_state/optimizer_state.safetensors"
+          test -s "$out/checkpoints/000001/training_state/rng_state.safetensors"
 
       - name: --help and --version work for every entry point
         run: |

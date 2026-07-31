@@ -13,17 +13,34 @@ so deployment tooling and documentation that reference them keep working:
 cargo install --path crates/rerobot-cli --locked
 ```
 
-Exactly one of them runs at this milestone.
+Two of them run at this milestone. The other sixteen exist and fail explicitly.
 
 ```shell
-lerobot-info                 # a real port of lerobot.scripts.lerobot_info
-lerobot-train --help         # works, and states that it is unimplemented
-lerobot-train; echo $?       # -> 2
+# `lerobot-info` is a full port of `lerobot.scripts.lerobot_info`.
+lerobot-info
+
+# `lerobot-train` trains for real, for one vertical slice: the ACT policy on a
+# state-only LeRobot v3.0 dataset on local disk, on CPU. It writes upstream's
+# checkpoint layout, which upstream can load back.
+lerobot-train --help         # lists exactly which arguments it accepts
+lerobot-train --dataset.repo_id=ID --dataset.root=DIR --output_dir=DIR \
+              --policy.type=act --steps=1
+
+# Anything outside that slice is refused with a reason, never ignored:
+lerobot-train --policy.type=diffusion; echo $?   # -> 2
+lerobot-train --wandb.project=demo;    echo $?   # -> 2
+
+# The sixteen unported commands say so and exit 2:
+lerobot-eval; echo $?        # -> 2
 ```
+
+`lerobot-train` invoked with no arguments is a *usage* error (exit 64) naming the
+first requirement it is missing, not an unsupported-command error: it is a
+command that runs, so a missing argument is the user's, not the port's.
 
 ## Contract for not-yet-ported commands
 
-A command that has not been ported never silently succeeds:
+Sixteen of the eighteen are not ported. None of them ever silently succeeds:
 
 * stdout is empty;
 * stderr carries exactly one line beginning `<name>: unsupported in Rerobot`,
@@ -37,12 +54,18 @@ compatibility status and the upstream version it targets.
 ```rust
 use rerobot_cli::{dispatch, help_text, unsupported_message, EXIT_UNSUPPORTED};
 
-let outcome = dispatch("lerobot-train", &[]);
+let outcome = dispatch("lerobot-eval", &[]);
 assert_eq!(outcome.code, EXIT_UNSUPPORTED);
 assert!(outcome.stdout.is_empty());
-assert!(outcome.stderr.starts_with("lerobot-train: unsupported"));
-assert!(outcome.stderr.contains("lerobot.scripts.lerobot_train:main"));
+assert!(outcome.stderr.starts_with("lerobot-eval: unsupported"));
+assert!(outcome.stderr.contains("lerobot.scripts.lerobot_eval:main"));
 assert!(!outcome.stderr.contains('\n')); // one greppable line
+
+// `lerobot-train` is runnable for one slice, so a bare invocation is a *usage*
+// error naming what is missing rather than an unsupported-command error.
+let outcome = dispatch("lerobot-train", &[]);
+assert_eq!(outcome.code, rerobot_cli::EXIT_USAGE);
+assert!(outcome.stderr.contains("--policy.type=act is required"));
 
 // --help wins over anything else on the command line.
 let args = vec!["--dataset.repo_id=x".to_string(), "--help".to_string()];
@@ -51,7 +74,7 @@ assert_eq!(outcome.code, 0);
 assert_eq!(outcome.stdout, help_text("lerobot-record"));
 
 // The same message the executable prints is available programmatically.
-assert_eq!(unsupported_message("lerobot-train"), dispatch("lerobot-train", &[]).stderr);
+assert_eq!(unsupported_message("lerobot-eval"), dispatch("lerobot-eval", &[]).stderr);
 ```
 
 ## `lerobot-info`

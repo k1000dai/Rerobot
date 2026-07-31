@@ -1,0 +1,49 @@
+Rerobot
+Copyright 2026 The Rerobot contributors
+
+This product includes software derived from LeRobot:
+
+    LeRobot
+    Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+    https://github.com/huggingface/lerobot
+    Licensed under the Apache License, Version 2.0.
+
+Rerobot is an independent Rust port. It is not an official Hugging Face
+product and is not endorsed by or affiliated with Hugging Face, Inc.
+
+Scope of the derivation
+-----------------------
+
+Rerobot contains no copied LeRobot source code. What is derived is the
+*observable behaviour and public interface* of the following upstream modules,
+taken from lerobot 0.6.1 at commit f37be3edbee60f3a09a5183788b91eb19f0c07d1:
+
+  * src/lerobot/configs/types.py         -> rerobot-core::types
+  * src/lerobot/types.py (TransitionKey) -> rerobot-core::types
+  * src/lerobot/utils/action_interpolator.py
+                                         -> rerobot-core::action_interpolator
+  * src/lerobot/rollout/ring_buffer.py   -> rerobot-core::ring_buffer
+  * src/lerobot/processor/rename_processor.py
+                                         -> rerobot-core::processor::rename
+  * src/lerobot/scripts/lerobot_info.py  -> rerobot-core::sysinfo, lerobot-info
+  * pyproject.toml [project.scripts]     -> rerobot-compat::ENTRY_POINTS
+
+Test expectations in this repository were derived in part from upstream's test
+suite, in particular:
+
+  * tests/policies/rtc/test_action_interpolator.py
+  * tests/processor/test_rename_processor.py
+
+The executable names lerobot-calibrate, lerobot-find-cameras, lerobot-find-port,
+lerobot-record, lerobot-replay, lerobot-setup-motors, lerobot-teleoperate,
+lerobot-eval, lerobot-train, lerobot-train-tokenizer, lerobot-dataset-viz,
+lerobot-info, lerobot-find-joint-limits, lerobot-imgtransform-viz,
+lerobot-edit-dataset, lerobot-setup-can, lerobot-annotate, and lerobot-rollout
+are kept byte-identical to upstream's so that deployment tooling and
+documentation continue to work. Commands that are not ported fail explicitly
+rather than pretending to be their upstream counterparts; see
+docs/compatibility.md.
+
+"LeRobot" and "Hugging Face" are marks of their respective owners. Their use
+here is nominative, to identify the upstream project this software is
+compatible with.

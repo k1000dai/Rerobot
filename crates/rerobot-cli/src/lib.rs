@@ -6,6 +6,7 @@
 #![deny(unsafe_code)]
 
 pub mod info;
+pub mod train;
 pub mod which;
 
 use rerobot_compat::{entry_point, EntryPoint, UPSTREAM_PACKAGE, UPSTREAM_VERSION};
@@ -76,8 +77,21 @@ pub fn help_text(name: &str) -> String {
     let e = entry_point(name).unwrap_or_else(|| panic!("{name} is not an upstream entry point"));
     let usage = if e.status.is_unsupported() {
         format!("Usage: {name} [ARGS...]    (all arguments are accepted and then rejected)")
+    } else if name == "lerobot-train" {
+        format!(
+            "Usage: {name} [--help] [--version] --dataset.repo_id=ID --dataset.root=DIR \\\n\
+                 \x20                   --output_dir=DIR --policy.type=act [OPTIONS...]"
+        )
     } else {
         format!("Usage: {name} [--help] [--version]")
+    };
+    // `lerobot-train` is the one command with an argument surface worth spelling
+    // out, and spelling it out is what makes "refused, never ignored" checkable by
+    // a user rather than only by a test.
+    let extra = if name == "lerobot-train" {
+        format!("\n\n{}", train::help_section())
+    } else {
+        String::new()
     };
     format!(
         "{name} {VERSION} (Rerobot)\n\
@@ -92,7 +106,7 @@ pub fn help_text(name: &str) -> String {
          \n\
          Rerobot is a partial Rust port of Hugging Face LeRobot.\n\
          Full boundary: {compatibility_url}\n\
-         Repository:    {repository}",
+         Repository:    {repository}{extra}",
         summary = e.summary,
         status = e.status,
         package = UPSTREAM_PACKAGE,
@@ -154,12 +168,50 @@ pub fn dispatch(name: &str, args: &[String]) -> Outcome {
                 EXIT_USAGE,
             ),
         },
-        // Unreachable while `lerobot-info` is the only supported command, but
-        // failing loudly beats silently succeeding if that changes.
+        "lerobot-train" => run_train(name, args),
+        // Unreachable while `lerobot-info` and `lerobot-train` are the only
+        // supported commands, but failing loudly beats silently succeeding if that
+        // changes.
         other => Outcome::err(
             format!("{other}: marked supported but has no implementation"),
             EXIT_UNSUPPORTED,
         ),
+    }
+}
+
+/// Parse `args` and train, or report exactly why not.
+///
+/// A usage problem exits [`EXIT_USAGE`]; an unsupported request or a run failure
+/// exits [`EXIT_UNSUPPORTED`]. Both are non-zero, so a script cannot mistake
+/// either for a completed run.
+fn run_train(name: &str, args: &[String]) -> Outcome {
+    let config = match train::parse(args) {
+        Ok(config) => config,
+        Err(error) => {
+            let code = match error {
+                train::ArgumentError::Unsupported { .. } => EXIT_UNSUPPORTED,
+                _ => EXIT_USAGE,
+            };
+            return Outcome::err(format!("{name}: {error}"), code);
+        }
+    };
+
+    // Progress is printed as it happens rather than collected, because a real run
+    // is long and a transcript returned at the end would be useless during it.
+    let mut lines = Vec::new();
+    let result = rerobot_train::run::train(&config, &mut |line| {
+        println!("{line}");
+        lines.push(line.to_owned());
+    });
+    match result {
+        Ok(outcome) => {
+            let mut stdout = String::new();
+            if let Some(last) = outcome.checkpoints.last() {
+                stdout = format!("Checkpoint: {}", last.display());
+            }
+            Outcome::ok(stdout)
+        }
+        Err(error) => Outcome::err(format!("{name}: {error}"), EXIT_UNSUPPORTED),
     }
 }
 

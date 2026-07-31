@@ -20,19 +20,24 @@ use rerobot_compat::{entry_point, module_family, Status, ENTRY_POINTS, MODULE_FA
 assert_eq!(ENTRY_POINTS.len(), 18);
 assert_eq!(ENTRY_POINTS[0].name, "lerobot-calibrate");
 
-// Only `lerobot-info` is runnable at this milestone.
+// Two are runnable at this milestone, in upstream declaration order.
 let runnable: Vec<&str> = ENTRY_POINTS
     .iter()
     .filter(|e| !e.status.is_unsupported())
     .map(|e| e.name)
     .collect();
-assert_eq!(runnable, vec!["lerobot-info"]);
+assert_eq!(runnable, vec!["lerobot-train", "lerobot-info"]);
+
+// `lerobot-train` runs one vertical slice: ACT, a state-only local dataset, CPU.
+let train = entry_point("lerobot-train").unwrap();
+assert_eq!(train.status, Status::Partial);
+assert_eq!(train.target, "lerobot.scripts.lerobot_train:main");
+assert!(!train.status.is_unsupported());
 
 // Everything else must fail rather than silently succeed.
-let train = entry_point("lerobot-train").unwrap();
-assert_eq!(train.status, Status::Unimplemented);
-assert_eq!(train.target, "lerobot.scripts.lerobot_train:main");
-assert!(train.status.is_unsupported());
+let eval = entry_point("lerobot-eval").unwrap();
+assert_eq!(eval.status, Status::Unimplemented);
+assert!(eval.status.is_unsupported());
 
 // Hardware is gated, never simulated.
 assert_eq!(module_family("robots").unwrap().status, Status::HardwareGated);

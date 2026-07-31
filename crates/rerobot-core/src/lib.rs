@@ -11,6 +11,7 @@ pub mod byte_count;
 pub mod dataset;
 pub mod policy;
 pub mod processor;
+pub mod random;
 pub mod ring_buffer;
 pub mod rollout;
 pub mod sysinfo;

@@ -119,13 +119,16 @@ fn lookup_finds_entry_points_and_rejects_unknown_names() {
 }
 
 #[test]
-fn exactly_one_entry_point_is_runnable_in_this_milestone() {
+fn exactly_two_entry_points_are_runnable_in_this_milestone() {
+    // In upstream declaration order, which is the order `ENTRY_POINTS` is in.
+    // Pinned as a list rather than a count so that promoting a command to
+    // runnable is a deliberate edit here as well as in the inventory.
     let runnable: Vec<&str> = ENTRY_POINTS
         .iter()
         .filter(|e| !e.status.is_unsupported())
         .map(|e| e.name)
         .collect();
-    assert_eq!(runnable, vec!["lerobot-info"]);
+    assert_eq!(runnable, vec!["lerobot-train", "lerobot-info"]);
 }
 
 #[test]
@@ -221,11 +224,16 @@ fn partially_ported_families_are_exactly_the_ones_with_tests() {
         .filter(|f| f.status == Status::Partial)
         .map(|f| f.name)
         .collect();
+    // Alphabetical, which is also the order `MODULE_FAMILIES` is declared in.
+    // Pinned as a list rather than a count: a family earns `partial` by having
+    // tests in this workspace that demonstrate some of its behaviour, so adding a
+    // name here should be a deliberate edit made alongside those tests.
     assert_eq!(
         partial,
         vec![
             "configs",
             "datasets",
+            "optim",
             "policies",
             "processor",
             "rollout",

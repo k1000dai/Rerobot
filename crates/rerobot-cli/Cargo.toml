@@ -11,10 +11,14 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 readme = "README.md"
+# This monorepo-only integration test reaches the dataset fixture that lives in
+# `rerobot-train`, which is outside this crate's publishable archive.
+exclude = ["tests/train_cli.rs"]
 
 [dependencies]
 rerobot-core.workspace = true
 rerobot-compat.workspace = true
+rerobot-train.workspace = true
 
 # `shutil.which` accepts a candidate on `os.access(name, F_OK | X_OK)`, and the
 # search path falls back to `os.confstr("CS_PATH")` when PATH is unset. Both are

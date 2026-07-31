@@ -894,6 +894,14 @@ fn resolve_shape(config: &ActConfig) -> Result<ActShape> {
                     &dimensions,
                     &format!("the shape of feature {key:?}"),
                 )?;
+                // Zero would build a projection with no input columns and reach
+                // `chunks(0)` in the collator; see `FeatureSpec::width`.
+                if product == 0 {
+                    return Err(TrainError::Metadata(format!(
+                        "feature {key:?} declares an empty shape, so it carries no scalars; \
+                         a policy cannot consume or produce it"
+                    )));
+                }
                 crate::limits::within(
                     product,
                     &format!("the width of feature {key:?}"),

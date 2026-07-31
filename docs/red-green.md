@@ -806,7 +806,7 @@ the optimizer untouched.
 ```
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-targets --all-features      # 774 tests
+cargo test --workspace --all-targets --all-features      # 795 tests
 cargo test --workspace --doc                             # 56 doctests
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
 cargo deny check                                         # advisories, bans, licenses, sources
@@ -963,6 +963,86 @@ Windows requires a directory symlink to be unlinked with `remove_dir`, while the
 Unix implementation correctly uses `remove_file`. The platform-specific unlink
 now handles both directory and file symlinks without following either target.
 
+## Cycle 11 — an independent robustness review
+
+One reviewer ran the slice against probes of its own rather than its tests, and found
+one crash, one non-transactional write and three narrower defects. Same method: the
+regression test first, run RED, then the fix.
+
+### A zero-width feature reached `chunks(0)` and panicked
+
+**RED** — `limits.rs`, five tests. Every bound in the budget is an *upper* one, and
+zero passes all of them: `FeatureSpec::width` returned 0, `collate` built a
+`[batch, window, 0]` tensor from it, and `Batch::normalized` divided the flat buffer
+into rows with `slice::chunks(0)`, which panics. A panic is the outcome the budget
+exists to prevent — no message, no exit code, no cleanup.
+
+**GREEN** — an empty shape is refused where it is declared, in `FeatureSpec::width` and
+in the policy's feature resolution, so it never reaches a tensor; `collate` and
+`normalize_tensor` refuse a zero extent as well, because both are public and neither
+may panic on data. The scalar shape `[]`, whose product is 1, still works — the
+convention `math.prod(())` uses, and the one upstream relies on.
+
+### `training_step.json` was read with defaults for malformed values
+
+**RED** — `checkpoint_safety.rs`, four tests. `num_processes` of `"not a number"` and a
+`batch_size` of `{"a": 1}` read back as `1` and `0`: `unwrap_or` discarded both the type
+error and the range error, so a damaged file reported a run configuration the
+checkpoint never had.
+
+**GREEN** — absence and malformation are now different findings. Upstream's
+`save_training_step` omits `num_processes` and `batch_size` when it has no value for
+them, so *absence* keeps its documented default and a minimal upstream file still
+reads. A value that is present and is a string, a float, an object, `null`, negative,
+zero processes, or a batch size beyond this build's limit is refused by name.
+
+### Concurrent marker writers shared one temporary
+
+**RED** — `threads_writing_the_marker_at_once_do_not_collide_on_one_temporary`: 444 of
+800 concurrent writes failed with `No such file or directory`. The temporary was named
+after the process alone, so every thread of one process used the same path and one
+thread's `rename` moved the file another was still writing.
+
+**GREEN** — the name carries a per-writer counter as well as the process id, and the
+temporary is claimed with `create_new` rather than assumed free, so two processes that
+do collide retry instead of overwriting each other.
+
+### The checkpoint write was already staged — but nothing proved it
+
+**RED (negative control)** — `save_checkpoint` builds its eleven files in a sibling
+staging directory and publishes them with one `rename`, and the three `run::tests`
+unit tests covered refusal and cleanup. None of them could tell staged from unstaged:
+with the staging bypassed, all three still passed.
+`the_destination_is_never_visible_half_written` watches the destination while a real
+save runs and fails on the unstaged version with *150 partial sightings*, the first
+with all eleven files missing.
+
+**GREEN** — the property is now pinned from both ends: a published checkpoint holds
+exactly the eleven files the save wrote and nothing it inherited, an occupied
+destination is refused with its contents untouched rather than merged into, and a save
+that cannot write leaves neither the destination nor a staging directory behind.
+
+### A Windows directory symlink is a directory to the filesystem API
+
+**RED** — reasoned rather than executed; the host is darwin. `MoveFileExW` with
+MOVEFILE_REPLACE_EXISTING refuses to replace a directory, and a directory symlink
+carries `FILE_ATTRIBUTE_DIRECTORY`, so the portable marker could not replace the
+symlink an earlier run left. `DeleteFileW` refuses one too, which is why unlinking
+picked its call by trial and error.
+
+**GREEN** — `unlink_symlink` reads the kind from the metadata (`is_symlink_dir`) and
+calls `RemoveDirectoryW` or `DeleteFileW` accordingly, keeping the other as a fallback
+for an entry that changed kind underneath it; neither follows the link. The portable
+marker retries its `rename` once after unlinking a symlink it finds in the way — the
+only case where the atomic path is given up, and only for a marker that was already a
+link. Two tests cover it on every platform, skipping where the OS will not grant a
+symlink; the `cfg(windows)` code is type-checked here with
+`cargo check --target x86_64-pc-windows-msvc`, and CI's `windows-latest` job runs it.
+
+**Not verified on this host:** the Windows behaviour itself. The two tests pass on
+darwin, where `rename` over a symlink already works, so they demonstrate the shared
+path is unchanged rather than that the Windows-specific one is fixed.
+
 ## Final GREEN totals
 
 `cargo test --workspace --all-targets --all-features`
@@ -998,16 +1078,16 @@ now handles both directory and file symlinks without following either target.
 | `rerobot-train` `tests/train.rs` | 36 |
 | `rerobot-train` `tests/goldens.rs` | 12 |
 | `rerobot-train` `tests/processor.rs` | 8 |
-| `rerobot-train` `tests/limits.rs` | 48 |
+| `rerobot-train` `tests/limits.rs` | 53 |
 | `rerobot-train` `tests/parquet_budget.rs` | 21 |
-| `rerobot-train` `tests/checkpoint_safety.rs` | 32 |
+| `rerobot-train` `tests/checkpoint_safety.rs` | 43 |
 | `rerobot-cli` `tests/cli.rs` | 21 |
 | `rerobot-cli` `tests/info.rs` | 18 |
 | `rerobot-cli` `tests/which.rs` | 21 |
 | `rerobot-cli` `tests/train_cli.rs` | 32 |
-| **Total** | **779** |
+| **Total** | **795** |
 
-Summing the `test result:` lines cargo prints gives 781, not 779.
+Summing the `test result:` lines cargo prints gives 797, not 795.
 `tests/dataset_json.rs` re-executes its own harness twice to drive a case that
 needs a fresh thread stack, and each re-execution prints a `1 passed; 50 filtered
 out` line of its own. The table above counts distinct tests.
@@ -1028,10 +1108,10 @@ covered by `tests/cli.rs`, which runs the built executables as subprocesses.
 | `rerobot-train` (crate README + `limits`) | 2 |
 | **Total** | **56** |
 
-The subtotals, which sum to the 779 above: 426 in `rerobot-core` (including its two
-`rollout::dagger` unit tests), 229 in `rerobot-train`, 93 in `rerobot-cli` (including
+The subtotals, which sum to the 795 above: 426 in `rerobot-core` (including its two
+`rollout::dagger` unit tests), 245 in `rerobot-train`, 93 in `rerobot-cli` (including
 its one library unit test) and 31 in `rerobot-compat`. `rerobot-core` is where the
-pure-behaviour parity claim lives; of `rerobot-train`'s 229, `tests/goldens.rs` is the
+pure-behaviour parity claim lives; of `rerobot-train`'s 245, `tests/goldens.rs` is the
 only file whose expected values came from PyTorch rather than from upstream's source,
 and `tests/processor.rs` is the only one comparing bytes against files upstream's own
 writer produced.

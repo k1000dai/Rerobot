@@ -89,6 +89,15 @@ fn normalize_tensor(normalizer: &Normalizer, key: &str, tensor: &Tensor) -> Resu
             "{key:?} is a scalar tensor and cannot be normalized"
         ))
     })?;
+    // `chunks(0)` panics. The width comes from a tensor built out of `info.json`, so
+    // this is a refusal rather than an assertion: the caller gets a message naming the
+    // feature instead of an abort.
+    if width == 0 {
+        return Err(TrainError::Metadata(format!(
+            "{key:?} has width 0, so it carries no scalars to normalize; a feature must \
+             declare at least one"
+        )));
+    }
     let flat = tensor.flatten_all()?.to_vec1::<f32>()?;
     let mut out = Vec::with_capacity(flat.len());
     for row in flat.chunks(width) {
@@ -121,6 +130,15 @@ pub fn collate(frames: &[Frame], device: &Device) -> Result<Batch> {
     for (key, first_window) in &first.windows {
         let window_length = first_window.len();
         let width = first_window.first().map_or(0, Vec::len);
+        // An empty window or an empty row is refused here rather than turned into a
+        // degenerate tensor: every consumer of a batch divides the flat buffer by one
+        // of these two, and `slice::chunks` panics on a zero divisor.
+        if window_length == 0 || width == 0 {
+            return Err(TrainError::Metadata(format!(
+                "{key:?} collates to {window_length} rows of width {width}; a feature with \
+                 no scalars cannot be batched"
+            )));
+        }
         // Checked, not `a * b * c`. All three operands come from outside the process:
         // the batch size from the command line, the window length from `chunk_size`,
         // and the width from `info.json`. An overflowing product panics in a checked

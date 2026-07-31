@@ -187,6 +187,36 @@ pub fn rewrite_episode_rows(root: &Path, rows: &[(i64, i64, i64, i64)]) {
     writer.close().expect("cannot close the writer");
 }
 
+/// Rewrite one feature's declared `shape` in a copied fixture's `meta/info.json`.
+///
+/// The shape is the one number every later allocation is derived from, and nothing
+/// downstream re-derives it from the parquet, so a declared shape that disagrees with
+/// the stored data has to be caught where it is declared.
+pub fn rewrite_feature_shape(root: &Path, feature: &str, shape: &[i64]) {
+    let path = root.join("meta/info.json");
+    let text = std::fs::read_to_string(&path).expect("the fixture has an info.json");
+    // Rewritten as text rather than through a JSON library so the test depends on
+    // nothing the reader under test also depends on.
+    let key = format!("\"{feature}\": {{");
+    let start = text.find(&key).expect("the fixture declares the feature");
+    let shape_at = text[start..]
+        .find("\"shape\": [")
+        .expect("the feature has a shape")
+        + start;
+    let open = shape_at + "\"shape\": [".len();
+    let close = text[open..].find(']').expect("the shape closes") + open;
+    let replacement = shape
+        .iter()
+        .map(|dimension| dimension.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut rewritten = String::with_capacity(text.len());
+    rewritten.push_str(&text[..open]);
+    rewritten.push_str(&replacement);
+    rewritten.push_str(&text[close..]);
+    std::fs::write(&path, rewritten).expect("cannot write the rewritten info.json");
+}
+
 /// Rewrite the `episode_index` column of a copied fixture's data file.
 ///
 /// The other half of `rewrite_episode_rows`: the frame rows carry their own

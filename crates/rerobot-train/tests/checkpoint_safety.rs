@@ -927,3 +927,466 @@ fn replacing_a_portable_marker_repeatedly_is_stable() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// `training_step.json` is data, not a suggestion
+// ---------------------------------------------------------------------------
+//
+// Upstream's `save_training_step` omits `num_processes` and `batch_size` when it has
+// no value for them, so *absence* has to keep meaning "not recorded". A value that is
+// present and malformed is a different thing: it means the file has been edited or
+// truncated, and the reader used to substitute a default for it — reporting
+// `num_processes=1, batch_size=0` for a file that said neither.
+
+/// Write a `training_step.json` holding exactly `body`.
+fn training_step_file(dir: &TempDir, label: &str, body: &str) -> PathBuf {
+    let state = dir.child(label);
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(state.join("training_step.json"), body).unwrap();
+    state
+}
+
+#[test]
+fn a_training_step_field_of_the_wrong_type_is_refused_rather_than_defaulted() {
+    let dir = TempDir::new("step-types");
+    for (label, body, field) in [
+        (
+            "string-processes",
+            r#"{"step": 1, "num_processes": "not a number", "batch_size": 2}"#,
+            "num_processes",
+        ),
+        (
+            "object-batch",
+            r#"{"step": 1, "num_processes": 1, "batch_size": {"a": 1}}"#,
+            "batch_size",
+        ),
+        (
+            "float-batch",
+            r#"{"step": 1, "num_processes": 1, "batch_size": 2.5}"#,
+            "batch_size",
+        ),
+        (
+            "null-processes",
+            r#"{"step": 1, "num_processes": null, "batch_size": 2}"#,
+            "num_processes",
+        ),
+    ] {
+        let state = training_step_file(&dir, label, body);
+        let error = rerobot_train::checkpoint::TrainingStep::read(&state)
+            .expect_err(&format!("{label}: a malformed field was accepted"));
+        let message = error.to_string();
+        assert!(
+            message.contains(field),
+            "{label}: the refusal does not name the field: {message}"
+        );
+    }
+}
+
+#[test]
+fn a_training_step_field_out_of_range_is_refused() {
+    let dir = TempDir::new("step-range");
+    for (label, body, field) in [
+        (
+            "negative-processes",
+            r#"{"step": 1, "num_processes": -1, "batch_size": 2}"#,
+            "num_processes",
+        ),
+        (
+            "zero-processes",
+            r#"{"step": 1, "num_processes": 0, "batch_size": 2}"#,
+            "num_processes",
+        ),
+        (
+            "huge-batch",
+            r#"{"step": 1, "num_processes": 1, "batch_size": 99999999999999999999}"#,
+            "batch_size",
+        ),
+        (
+            "negative-batch",
+            r#"{"step": 1, "num_processes": 1, "batch_size": -2}"#,
+            "batch_size",
+        ),
+    ] {
+        let state = training_step_file(&dir, label, body);
+        let error = rerobot_train::checkpoint::TrainingStep::read(&state)
+            .expect_err(&format!("{label}: an out-of-range field was accepted"));
+        assert!(
+            error.to_string().contains(field),
+            "{label}: the refusal does not name the field: {error}"
+        );
+    }
+}
+
+#[test]
+fn a_training_step_omitting_the_optional_fields_still_reads_because_upstream_omits_them() {
+    // `save_training_step` writes `num_processes` and `batch_size` only when it was
+    // given them, so a checkpoint from a single-process run legitimately has neither.
+    let dir = TempDir::new("step-absent");
+    let state = training_step_file(&dir, "minimal", r#"{"step": 7}"#);
+    let read = rerobot_train::checkpoint::TrainingStep::read(&state)
+        .expect("upstream's own minimal file must still read");
+    assert_eq!(read.step, 7);
+    assert_eq!(read.num_processes, 1);
+    assert_eq!(read.batch_size, 0);
+}
+
+#[test]
+fn a_well_formed_training_step_round_trips() {
+    let dir = TempDir::new("step-round-trip");
+    let state = training_step_file(
+        &dir,
+        "full",
+        r#"{"step": 12, "num_processes": 3, "batch_size": 8}"#,
+    );
+    let read = rerobot_train::checkpoint::TrainingStep::read(&state).unwrap();
+    assert_eq!((read.step, read.num_processes, read.batch_size), (12, 3, 8));
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent marker writers must not share a temporary name
+// ---------------------------------------------------------------------------
+
+#[test]
+fn threads_writing_the_marker_at_once_do_not_collide_on_one_temporary() {
+    // The temporary was named after the process alone, so every thread of one process
+    // used the same path: one thread's `rename` moved the file another was still
+    // writing, and the loser failed with ENOENT -- turning a checkpoint into an error
+    // for no reason the user can act on.
+    let dir = TempDir::new("marker-threads");
+    let checkpoints = dir.child("checkpoints");
+    for step in 1..=4 {
+        std::fs::create_dir_all(checkpoints.join(format!("00000{step}"))).unwrap();
+    }
+
+    let failures = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    std::thread::scope(|scope| {
+        for step in 1..=4 {
+            let checkpoints = checkpoints.clone();
+            let failures = std::sync::Arc::clone(&failures);
+            scope.spawn(move || {
+                for _ in 0..200 {
+                    let target = checkpoints.join(format!("00000{step}"));
+                    if let Err(error) = rerobot_train::checkpoint::write_last_checkpoint(
+                        &target,
+                        LastCheckpointKind::PortableFile,
+                    ) {
+                        failures.lock().unwrap().push(error.to_string());
+                    }
+                }
+            });
+        }
+    });
+
+    let failures = failures.lock().unwrap();
+    assert!(
+        failures.is_empty(),
+        "{} concurrent marker writes failed, first: {}",
+        failures.len(),
+        failures[0]
+    );
+    // Whoever wrote last, the marker resolves to a real checkpoint and no temporary
+    // survives.
+    checkpoint::read_last_checkpoint(&checkpoints).expect("the marker resolves");
+    let strays: Vec<_> = std::fs::read_dir(&checkpoints)
+        .unwrap()
+        .filter_map(|entry| {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            name.ends_with(".tmp").then_some(name)
+        })
+        .collect();
+    assert!(strays.is_empty(), "temporaries left behind: {strays:?}");
+}
+
+// ---------------------------------------------------------------------------
+// A checkpoint is published whole or not at all
+// ---------------------------------------------------------------------------
+//
+// `save_checkpoint` writes eleven files across two directories. Written straight
+// into the destination, a failure anywhere in that sequence leaves a directory that
+// looks exactly like a finished checkpoint minus whichever files came after the
+// error — and `pretrained_model/` alone is enough for a loader to believe it. The
+// contents are built in a sibling staging directory and published with one `rename`,
+// so the destination only ever exists complete.
+
+/// A session and config against the committed fixture, ready to checkpoint.
+fn checkpointable(
+    dir: &TempDir,
+) -> (
+    rerobot_train::config::TrainConfig,
+    rerobot_train::run::TrainSession,
+) {
+    let config = reduced_config(fixture_dataset(), dir.child("out"));
+    let session = rerobot_train::run::TrainSession::new(&config).expect("the session builds");
+    (config, session)
+}
+
+/// Every file a complete checkpoint holds, relative to its directory.
+const CHECKPOINT_FILES: [&str; 11] = [
+    "pretrained_model/config.json",
+    "pretrained_model/model.safetensors",
+    "pretrained_model/train_config.json",
+    "pretrained_model/policy_preprocessor.json",
+    "pretrained_model/policy_postprocessor.json",
+    "pretrained_model/policy_preprocessor_step_3_normalizer_processor.safetensors",
+    "pretrained_model/policy_postprocessor_step_0_unnormalizer_processor.safetensors",
+    "training_state/training_step.json",
+    "training_state/rng_state.safetensors",
+    "training_state/optimizer_state.safetensors",
+    "training_state/optimizer_param_groups.json",
+];
+
+#[test]
+fn a_successful_save_publishes_every_file_and_leaves_no_staging_directory() {
+    let dir = TempDir::new("save-complete");
+    let (config, session) = checkpointable(&dir);
+    let checkpoints = dir.child("checkpoints");
+    let destination = checkpoints.join("000001");
+    rerobot_train::run::save_checkpoint(&config, &session, 1, &destination).expect("the save");
+
+    for name in CHECKPOINT_FILES {
+        assert!(
+            destination.join(name).is_file(),
+            "the published checkpoint has no {name}"
+        );
+    }
+    let siblings: Vec<_> = std::fs::read_dir(&checkpoints)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        siblings,
+        vec!["000001".to_owned()],
+        "the staging directory outlived the save: {siblings:?}"
+    );
+
+    // And nothing *but* those eleven files. A checkpoint published by renaming a
+    // freshly created staging directory cannot inherit anything, which is the other
+    // half of the guarantee: no file from an earlier run, and no file a third party
+    // left in the way, can survive inside a checkpoint this call published.
+    let mut published = Vec::new();
+    let mut stack = vec![destination.clone()];
+    while let Some(directory) = stack.pop() {
+        for entry in std::fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                published.push(
+                    path.strip_prefix(&destination)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                );
+            }
+        }
+    }
+    published.sort();
+    let mut expected: Vec<String> = CHECKPOINT_FILES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+    expected.sort();
+    assert_eq!(
+        published, expected,
+        "the published checkpoint holds files the save did not write"
+    );
+}
+
+#[test]
+fn a_save_that_cannot_write_leaves_no_partial_checkpoint_behind() {
+    // The parent is made unwritable, so the very first thing the save does fails.
+    // What matters is not *which* write failed but that the failure is reported and
+    // the destination does not exist afterwards: a caller that sees an error must be
+    // able to trust that nothing was published.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("save-readonly");
+        let (config, session) = checkpointable(&dir);
+        let checkpoints = dir.child("checkpoints");
+        std::fs::create_dir_all(&checkpoints).unwrap();
+        let destination = checkpoints.join("000001");
+        std::fs::set_permissions(&checkpoints, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let error = rerobot_train::run::save_checkpoint(&config, &session, 1, &destination)
+            .expect_err("an unwritable parent must fail the save");
+
+        std::fs::set_permissions(&checkpoints, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            !destination.exists(),
+            "a failed save published a checkpoint anyway: {error}"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&checkpoints)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
+    }
+}
+
+#[test]
+fn saving_over_an_existing_checkpoint_is_refused_and_cannot_merge_into_it() {
+    // Renaming onto a populated directory would either fail with a platform errno or,
+    // worse, merge -- leaving one run's weights beside another's optimizer state. The
+    // destination is refused before anything is written, and what is already there is
+    // left exactly as it was.
+    let dir = TempDir::new("save-existing");
+    let (config, session) = checkpointable(&dir);
+    let destination = dir.child("checkpoints").join("000001");
+    std::fs::create_dir_all(destination.join("pretrained_model")).unwrap();
+    std::fs::write(destination.join("foreign.txt"), b"from another run").unwrap();
+
+    let error = rerobot_train::run::save_checkpoint(&config, &session, 1, &destination)
+        .expect_err("an occupied destination must be refused");
+    assert!(
+        error.to_string().contains("already exists"),
+        "the refusal does not say why: {error}"
+    );
+    assert_eq!(
+        std::fs::read(destination.join("foreign.txt")).unwrap(),
+        b"from another run"
+    );
+    assert!(
+        !destination
+            .join("pretrained_model/model.safetensors")
+            .exists(),
+        "a refused save wrote into the destination anyway"
+    );
+}
+
+#[test]
+fn the_destination_is_never_visible_half_written() {
+    // The distinguishing property of staging, and the one the other tests cannot see:
+    // an observer watching the destination must never find it existing-but-incomplete.
+    // Written directly, the directory appears at the first `create_dir_all` and fills
+    // up file by file, and anything that lists `checkpoints/` during that window sees
+    // what looks like a finished checkpoint missing whichever files come last.
+    //
+    // The assertion is one-sided: correct code publishes with a single `rename`, so a
+    // partial sighting is impossible rather than unlikely.
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let dir = TempDir::new("save-atomic");
+    let (config, session) = checkpointable(&dir);
+    let checkpoints = dir.child("checkpoints");
+    std::fs::create_dir_all(&checkpoints).unwrap();
+    let destination = checkpoints.join("000001");
+
+    let partial_sightings = Arc::new(Mutex::new(Vec::<String>::new()));
+    let done = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let destination = destination.clone();
+        let partial_sightings = Arc::clone(&partial_sightings);
+        let done = Arc::clone(&done);
+        std::thread::spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                if destination.is_dir() {
+                    let missing: Vec<&str> = CHECKPOINT_FILES
+                        .iter()
+                        .copied()
+                        .filter(|name| !destination.join(name).is_file())
+                        .collect();
+                    if !missing.is_empty() {
+                        partial_sightings
+                            .lock()
+                            .unwrap()
+                            .push(format!("{} of 11 files missing", missing.len()));
+                    }
+                }
+            }
+        })
+    };
+
+    rerobot_train::run::save_checkpoint(&config, &session, 1, &destination).expect("the save");
+    done.store(true, Ordering::Relaxed);
+    watcher.join().unwrap();
+
+    let sightings = partial_sightings.lock().unwrap();
+    assert!(
+        sightings.is_empty(),
+        "the destination was visible incomplete {} times, first: {}",
+        sightings.len(),
+        sightings[0]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A Windows directory symlink is a directory to the filesystem API
+// ---------------------------------------------------------------------------
+//
+// `update_last_checkpoint` writes a *directory* symlink where the platform allows
+// one, so the marker a later call finds may be one. On Unix that is just a link and
+// both `remove_file` and `rename` handle it. On Windows a directory symlink is a
+// reparse point with FILE_ATTRIBUTE_DIRECTORY: `DeleteFileW` refuses it, and
+// `MoveFileExW` with MOVEFILE_REPLACE_EXISTING refuses to replace it. Either turns
+// the second checkpoint of a run into an error.
+//
+// These run on every platform: the behaviour must be identical, and a Unix run is
+// what keeps the shared path honest between Windows CI runs.
+
+/// Create a directory symlink, or `None` when the platform will not allow one.
+fn directory_symlink(target: &Path, link: &Path) -> Option<()> {
+    #[cfg(unix)]
+    let result = std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    let result = std::os::windows::fs::symlink_dir(target, link);
+    #[cfg(not(any(unix, windows)))]
+    let result: std::io::Result<()> = Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no symlinks",
+    ));
+    // Windows needs SeCreateSymbolicLinkPrivilege or developer mode; when it is not
+    // available the marker never becomes a symlink in the first place.
+    result.ok()
+}
+
+#[test]
+fn a_portable_marker_replaces_a_directory_symlink_without_deleting_its_target() {
+    let dir = TempDir::new("portable-over-dirlink");
+    let (checkpoints, step) = checkpoints_with_one(&dir);
+    let second = checkpoints.join("000002");
+    std::fs::create_dir_all(&second).unwrap();
+    std::fs::write(second.join("payload.txt"), "payload").unwrap();
+
+    let link = checkpoints.join("last");
+    let Some(()) = directory_symlink(Path::new("000002"), &link) else {
+        return; // No symlink privilege: the marker can never be one here.
+    };
+
+    checkpoint::write_last_checkpoint(&step, LastCheckpointKind::PortableFile)
+        .expect("a directory symlink must not block the portable marker");
+    assert_eq!(
+        checkpoint::read_last_checkpoint(&checkpoints).unwrap(),
+        step
+    );
+    assert!(
+        second.join("payload.txt").is_file(),
+        "replacing the marker followed the link and deleted its target"
+    );
+}
+
+#[test]
+fn removing_a_directory_symlink_marker_unlinks_it_rather_than_its_target() {
+    let dir = TempDir::new("unlink-dirlink");
+    let (checkpoints, step) = checkpoints_with_one(&dir);
+    let second = checkpoints.join("000002");
+    std::fs::create_dir_all(&second).unwrap();
+    std::fs::write(second.join("payload.txt"), "payload").unwrap();
+
+    let link = checkpoints.join("last");
+    let Some(()) = directory_symlink(Path::new("000002"), &link) else {
+        return;
+    };
+
+    // `update_last_checkpoint` removes whatever marker it finds before writing its
+    // own; on Windows that removal is `RemoveDirectoryW`, not `DeleteFileW`.
+    checkpoint::update_last_checkpoint(&step)
+        .expect("a directory symlink marker must be replaceable");
+    assert_eq!(
+        checkpoint::read_last_checkpoint(&checkpoints).unwrap(),
+        step
+    );
+    assert!(second.join("payload.txt").is_file());
+    assert!(second.is_dir(), "the link's target directory was removed");
+}

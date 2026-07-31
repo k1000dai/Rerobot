@@ -190,21 +190,62 @@ fn write_portable_marker(parent: &Path, target: &std::ffi::OsStr) -> Result<()> 
     let link = parent.join(LAST_CHECKPOINT_LINK);
     refuse_non_marker(&link)?;
 
-    // Unique per process so two concurrent writers cannot collide on the temporary.
-    let temporary = parent.join(format!(
-        ".{LAST_CHECKPOINT_LINK}.{}.tmp",
-        std::process::id()
-    ));
+    // Unique per *writer*, not per process. The previous name held only the process
+    // id, so every thread of one process shared it: one thread's `rename` moved the
+    // file another was still writing, and the loser failed with ENOENT. The counter
+    // separates threads within a process, the process id separates processes, and
+    // `create_new` makes the claim itself exclusive rather than assumed — two
+    // processes that do collide on a name retry instead of overwriting each other.
+    static NEXT_MARKER_TEMPORARY: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
     let contents = format!("{}\n", target.to_string_lossy());
-    std::fs::write(&temporary, contents).map_err(|error| TrainError::io(&temporary, &error))?;
+    let temporary = loop {
+        let candidate = parent.join(format!(
+            ".{LAST_CHECKPOINT_LINK}.{}.{}.tmp",
+            std::process::id(),
+            NEXT_MARKER_TEMPORARY.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                if let Err(error) = file.write_all(contents.as_bytes()) {
+                    let _ = std::fs::remove_file(&candidate);
+                    return Err(TrainError::io(&candidate, &error));
+                }
+                break candidate;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(TrainError::io(&candidate, &error)),
+        }
+    };
     match std::fs::rename(&temporary, &link) {
         Ok(()) => Ok(()),
         Err(error) => {
+            // One replacement `rename` cannot do: on Windows the marker left by an
+            // earlier symlink-mode run is a *directory* symlink, and `MoveFileExW`
+            // refuses to replace a directory even when it is only a reparse point.
+            // Unlinking it first is safe -- `unlink_symlink` removes the link and
+            // never follows it -- and it is the only case where the atomic path is
+            // given up, so the window is a marker that was already a symlink.
+            if is_symlink(&link) && unlink_symlink(&link).is_ok() {
+                if let Ok(()) = std::fs::rename(&temporary, &link) {
+                    return Ok(());
+                }
+            }
             // Leave nothing behind on the failure path.
             let _ = std::fs::remove_file(&temporary);
             Err(TrainError::io(&link, &error))
         }
     }
+}
+
+/// Whether `path` is a symlink, without following it. `false` when it is absent.
+fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
 }
 
 /// Refuse anything at the reserved path that is not a marker this code may replace.
@@ -285,14 +326,40 @@ fn unlink_symlink(link: &Path) -> std::io::Result<()> {
     std::fs::remove_file(link)
 }
 
+/// Windows deletes a link by its *kind*, not by what it points at.
+///
+/// A directory symlink — and a junction, which `std::fs` also reports as a symlink —
+/// carries `FILE_ATTRIBUTE_DIRECTORY`, so `DeleteFileW` (`remove_file`) refuses it
+/// with `AccessDenied` and `RemoveDirectoryW` (`remove_dir`) is what unlinks it. A
+/// file symlink is the other way round. Both remove the link itself and never follow
+/// it to the target, which is the property that matters here.
+///
+/// The kind is read from the metadata rather than discovered by trying one and
+/// falling back, so the error a caller sees is the error of the operation that was
+/// actually appropriate. The fallback is kept for the case where the entry changed
+/// kind between the `symlink_metadata` above and this call.
 #[cfg(windows)]
 fn unlink_symlink(link: &Path) -> std::io::Result<()> {
-    match std::fs::remove_dir(link) {
+    use std::os::windows::fs::FileTypeExt;
+
+    let directory_link = std::fs::symlink_metadata(link)?
+        .file_type()
+        .is_symlink_dir();
+    let attempt = if directory_link {
+        std::fs::remove_dir(link)
+    } else {
+        std::fs::remove_file(link)
+    };
+    match attempt {
         Ok(()) => Ok(()),
-        Err(directory_error) => match std::fs::remove_file(link) {
-            Ok(()) => Ok(()),
-            Err(_) => Err(directory_error),
-        },
+        Err(error) => {
+            let fallback = if directory_link {
+                std::fs::remove_file(link)
+            } else {
+                std::fs::remove_dir(link)
+            };
+            fallback.map_err(|_| error)
+        }
     }
 }
 
@@ -345,21 +412,71 @@ impl TrainingStep {
         let JsonLike::Object(object) = document else {
             return Err(TrainError::checkpoint(&path, "is not a JSON object"));
         };
-        let field = |name: &str| -> Result<u64> {
+        // Absent and malformed are different findings and are reported differently.
+        // Upstream's `save_training_step` omits `num_processes` and `batch_size` when
+        // it was not given them, so their absence is a valid file and keeps its
+        // documented default. A value that is *present* and is a string, a float, an
+        // object, `null`, negative or beyond the range this crate runs in is a file
+        // that has been damaged or hand-edited, and substituting a default for it — as
+        // this reader used to — reports a run configuration the checkpoint never had.
+        let field = |name: &str| -> Result<Option<u64>> {
             match object.get(name) {
-                Some(JsonLike::Int(value)) => u64::try_from(value)
-                    .map_err(|_| TrainError::checkpoint(&path, format!("{name} is out of range"))),
-                Some(_) => Err(TrainError::checkpoint(
+                None => Ok(None),
+                Some(JsonLike::Int(value)) => u64::try_from(value).map(Some).map_err(|_| {
+                    TrainError::checkpoint(
+                        &path,
+                        format!(
+                            "{name} is {value}, which is not a non-negative whole number \
+                                 of the kind this field records"
+                        ),
+                    )
+                }),
+                Some(other) => Err(TrainError::checkpoint(
                     &path,
-                    format!("{name} is not an integer"),
+                    format!("{name} is {}, not an integer", other.type_name()),
                 )),
-                None => Err(TrainError::checkpoint(&path, format!("has no {name}"))),
             }
         };
+
+        let step = field("step")?.ok_or_else(|| TrainError::checkpoint(&path, "has no step"))?;
+        crate::limits::within_u64(step, "step", crate::limits::MAX_STEPS)
+            .map_err(|error| TrainError::checkpoint(&path, error.to_string()))?;
+
+        let num_processes = match field("num_processes")? {
+            // Recorded so a resumed run can detect a changed world size. Zero
+            // processes cannot have produced a checkpoint.
+            Some(0) => {
+                return Err(TrainError::checkpoint(
+                    &path,
+                    "num_processes is 0, but a checkpoint is written by at least one process",
+                ))
+            }
+            Some(value) => value,
+            None => 1,
+        };
+
+        let batch_size = match field("batch_size")? {
+            Some(value) => usize::try_from(value)
+                .ok()
+                .filter(|value| *value <= crate::limits::MAX_BATCH_SIZE)
+                .ok_or_else(|| {
+                    TrainError::checkpoint(
+                        &path,
+                        format!(
+                            "batch_size is {value}, which is above the {} this build runs",
+                            crate::limits::MAX_BATCH_SIZE
+                        ),
+                    )
+                })?,
+            // Upstream omits the field rather than writing a zero; zero is this
+            // reader's "not recorded", which is why it is not an error.
+            None => 0,
+        };
+
         Ok(Self {
-            step: field("step")?,
-            num_processes: field("num_processes").unwrap_or(1),
-            batch_size: field("batch_size").unwrap_or(0) as usize,
+            step,
+            num_processes,
+            batch_size,
         })
     }
 }

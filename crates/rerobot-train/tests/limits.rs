@@ -1138,3 +1138,134 @@ fn the_fixture_metadata_is_inside_its_budgets_at_exactly_its_own_extents() {
     rerobot_train::data::meta::DatasetMetadata::load_within(&fixture_dataset(), &budget)
         .expect("the fixture's own extents fit exactly");
 }
+
+// ---------------------------------------------------------------------------
+// Zero is an extent too
+// ---------------------------------------------------------------------------
+//
+// Every bound in this file is an upper one, and an upper bound says nothing about
+// zero. A feature declaring `shape: [0]` passed all of them, and the first code that
+// could not cope with it was `slice::chunks`, which panics on a zero chunk — the
+// abort-instead-of-refusal outcome the whole budget exists to prevent. Zero is
+// refused where it is declared, and again at each place that divides the flat buffer
+// by it.
+
+#[test]
+fn a_feature_declaring_a_zero_dimension_is_refused_when_the_metadata_is_read() {
+    let dir = TempDir::new("zero-width");
+    let root = dir.child("ds");
+    common::copy_fixture_dataset(&root);
+    common::rewrite_feature_shape(&root, "observation.state", &[0]);
+    let message = expect_refusal(&root, "a zero-width feature");
+    // Specifically the *declaration* check: the parquet reader also notices that the
+    // stored rows are two wide, but that refusal only happens once a data file has
+    // been opened and decoded. An empty feature is refusable from `info.json` alone.
+    assert!(
+        message.contains("observation.state") && message.contains("empty"),
+        "the refusal did not come from the declared shape: {message}"
+    );
+}
+
+#[test]
+fn a_feature_whose_shape_multiplies_out_to_zero_is_refused_too() {
+    // `[3, 0, 2]` is not obviously empty at a glance, and every individual dimension
+    // is inside `MAX_FEATURE_WIDTH`. The product is what the reader allocates by.
+    let dir = TempDir::new("zero-product");
+    let root = dir.child("ds");
+    common::copy_fixture_dataset(&root);
+    common::rewrite_feature_shape(&root, "observation.state", &[3, 0, 2]);
+    let message = expect_refusal(&root, "a shape whose product is zero");
+    assert!(
+        message.contains("observation.state") && message.contains("empty"),
+        "the refusal did not come from the declared shape: {message}"
+    );
+}
+
+#[test]
+fn feature_spec_width_refuses_zero_rather_than_returning_it() {
+    let spec = rerobot_train::data::meta::FeatureSpec {
+        dtype: "float32".to_owned(),
+        shape: vec![0],
+        names: None,
+    };
+    let error = spec.width().expect_err("a zero width is not a width");
+    assert!(
+        error.to_string().contains("empty"),
+        "the refusal does not say the feature is empty: {error}"
+    );
+    // The valid neighbours still work, including the scalar shape `[]`, whose
+    // product is 1 by the same convention `math.prod(())` uses.
+    for shape in [vec![], vec![1], vec![2, 3]] {
+        rerobot_train::data::meta::FeatureSpec {
+            dtype: "float32".to_owned(),
+            shape: shape.clone(),
+            names: None,
+        }
+        .width()
+        .unwrap_or_else(|error| panic!("shape {shape:?} is legitimate: {error}"));
+    }
+}
+
+#[test]
+fn collate_refuses_a_zero_width_window_instead_of_building_an_unusable_batch() {
+    use indexmap::IndexMap;
+    let mut windows: IndexMap<String, Vec<Vec<f32>>> = IndexMap::new();
+    windows.insert("observation.state".to_owned(), vec![vec![]]);
+    let frame = rerobot_train::data::dataset::Frame {
+        index: 0,
+        episode_index: 0,
+        frame_index: 0,
+        timestamp: 0.0,
+        task_index: 0,
+        task: "reach the target".to_owned(),
+        windows,
+        padding: IndexMap::new(),
+    };
+    let error = rerobot_train::data::batch::collate(&[frame], &candle_core::Device::Cpu)
+        .expect_err("a zero-width feature cannot be collated");
+    assert!(
+        error.to_string().contains("observation.state"),
+        "the refusal does not name the feature: {error}"
+    );
+}
+
+#[test]
+fn normalizing_a_zero_width_tensor_is_an_error_not_a_panic() {
+    // `Batch`'s fields are public, so this state is reachable without `collate`.
+    // `chunks(0)` panics, and a panic in a library is not a refusal: it takes the
+    // process down with no exit code a caller can act on.
+    use indexmap::IndexMap;
+
+    // Built from the fixture's own metadata rather than by hand, so the normalizer is
+    // exactly the one a real run holds and the only unusual thing is the tensor.
+    let metadata = rerobot_train::data::meta::DatasetMetadata::load(&fixture_dataset())
+        .expect("the fixture's metadata loads");
+    let (inputs, outputs) = metadata.policy_feature_split();
+    let normalizer = rerobot_core::policy::normalize::Normalizer::new(
+        &inputs.into_iter().chain(outputs).collect(),
+        &rerobot_core::policy::act::ActConfig::default().normalization_mapping,
+        &metadata.stats,
+    )
+    .expect("the normalizer resolves against the fixture's stats");
+
+    let mut features = IndexMap::new();
+    features.insert(
+        "observation.state".to_owned(),
+        candle_core::Tensor::from_vec(Vec::<f32>::new(), (1, 0), &candle_core::Device::Cpu)
+            .expect("an empty tensor is constructible"),
+    );
+    let batch = rerobot_train::data::batch::Batch {
+        features,
+        padding: IndexMap::new(),
+        tasks: vec!["reach the target".to_owned()],
+        indices: vec![0],
+    };
+
+    let error = batch
+        .normalized(&normalizer)
+        .expect_err("a zero-width tensor cannot be normalized");
+    assert!(
+        error.to_string().contains("observation.state"),
+        "the refusal does not name the feature: {error}"
+    );
+}

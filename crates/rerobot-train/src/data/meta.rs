@@ -64,6 +64,19 @@ impl FeatureSpec {
             )?);
         }
         let product = crate::limits::checked_product(&dimensions, "a feature shape")?;
+        // Zero is an extent the upper bounds say nothing about, and it is the one that
+        // does not survive the pipeline: the batch collator divides a flat buffer into
+        // rows with `slice::chunks`, which *panics* on a chunk size of zero. A panic is
+        // not a refusal — no message, no exit code, no partial-work cleanup — so a
+        // feature that carries no scalars is refused here, where it is declared, before
+        // anything is read or allocated.
+        if product == 0 {
+            return Err(TrainError::Metadata(format!(
+                "a feature declares shape {:?}, which is empty; a feature carrying no \
+                 scalars cannot be batched or normalized",
+                self.shape
+            )));
+        }
         crate::limits::within(product, "a feature width", crate::limits::MAX_FEATURE_WIDTH)
     }
 }

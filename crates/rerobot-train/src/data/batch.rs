@@ -13,6 +13,7 @@
 //! reuse sound rather than convenient.
 
 use crate::data::dataset::Frame;
+use crate::data::image::{camera_tensor, CameraNormalization};
 use crate::error::{Result, TrainError};
 use candle_core::{DType, Device, Tensor};
 use indexmap::IndexMap;
@@ -24,6 +25,18 @@ pub struct Batch {
     /// Per feature key, a `[batch, window, width]` tensor for windowed keys and a
     /// `[batch, width]` tensor for the rest.
     pub features: IndexMap<String, Tensor>,
+    /// Per camera key, a `[batch, channels, height, width]` `f32` tensor.
+    ///
+    /// Separate from [`Self::features`] rather than mixed into it, because the two
+    /// are handled differently at every step that touches them: the collator builds
+    /// features out of the dataset's flat parquet rows and cannot build these at all,
+    /// and [`Self::normalized`] resolves one statistic per scalar for a feature and
+    /// one per *channel* for a camera. Upstream keeps them in one dict only because
+    /// torch broadcasts the difference away.
+    ///
+    /// Attach them with [`Self::with_images`], which is where the contract in
+    /// [`crate::data::image`] is enforced.
+    pub images: IndexMap<String, Tensor>,
     /// Per windowed feature key, its `[batch, window]` `u8` padding mask.
     ///
     /// `u8` rather than a boolean dtype because candle has no `bool`; `1` is
@@ -56,6 +69,17 @@ impl Batch {
         })
     }
 
+    /// One camera's tensor, `[batch, channels, height, width]`.
+    pub fn image(&self, key: &str) -> Result<&Tensor> {
+        self.images.get(key).ok_or_else(|| {
+            TrainError::Metadata(format!(
+                "the batch has no camera {key:?}; it has {:?}. Attach camera tensors with \
+                 Batch::with_images",
+                self.images.keys().collect::<Vec<_>>()
+            ))
+        })
+    }
+
     /// One windowed feature's padding mask.
     pub fn padding_mask(&self, key: &str) -> Result<&Tensor> {
         self.padding
@@ -63,7 +87,53 @@ impl Batch {
             .ok_or_else(|| TrainError::Metadata(format!("the batch has no {key}_is_pad")))
     }
 
+    /// Attach raw camera tensors, checking each against the contract in
+    /// [`crate::data::image`] and applying `normalization` to it.
+    ///
+    /// `images` holds one entry per camera key, each `[batch, channels, height,
+    /// width]` — or `[batch, 1, channels, height, width]`, which is squeezed —  of
+    /// `f32` with every element in `[0, 1]`. Insertion order is preserved, and the
+    /// model consumes the cameras in the order its own config declares them rather
+    /// than in this one, so a batch cannot silently reorder them.
+    ///
+    /// Normalization happens here rather than in [`Self::normalized`] because it is
+    /// the raw `[0, 1]` tensor that the contract can be checked against: once the
+    /// statistics have been subtracted there is no range left to verify. The two
+    /// steps compose in either order — both are elementwise — so this is the same
+    /// computation upstream's collate-then-normalize performs.
+    ///
+    /// # Errors
+    ///
+    /// [`TrainError::Metadata`] naming the camera and what was wrong with it, or
+    /// when a key is attached twice.
+    pub fn with_images(
+        mut self,
+        images: &IndexMap<String, Tensor>,
+        normalization: &CameraNormalization,
+    ) -> Result<Self> {
+        crate::limits::within(
+            images.len(),
+            "the number of cameras",
+            crate::limits::MAX_CAMERAS,
+        )?;
+        let batch_size = self.len();
+        for (key, tensor) in images {
+            if self.images.contains_key(key) {
+                return Err(TrainError::Metadata(format!(
+                    "camera {key:?} is already attached to this batch"
+                )));
+            }
+            let checked = camera_tensor(key, tensor, batch_size)?;
+            self.images
+                .insert(key.clone(), normalization.apply(key, &checked)?);
+        }
+        Ok(self)
+    }
+
     /// This batch with every feature the normalizer knows about transformed.
+    ///
+    /// Camera tensors ride through untouched: they were normalized when
+    /// [`Self::with_images`] attached them.
     pub fn normalized(&self, normalizer: &Normalizer) -> Result<Self> {
         let mut features = IndexMap::with_capacity(self.features.len());
         for (key, tensor) in &self.features {
@@ -71,6 +141,7 @@ impl Batch {
         }
         Ok(Self {
             features,
+            images: self.images.clone(),
             padding: self.padding.clone(),
             tasks: self.tasks.clone(),
             indices: self.indices.clone(),
@@ -219,6 +290,9 @@ pub fn collate(frames: &[Frame], device: &Device) -> Result<Batch> {
 
     Ok(Batch {
         features,
+        // The collator reads flat parquet rows, which cannot hold a camera; a batch
+        // gets its cameras from `Batch::with_images`.
+        images: IndexMap::new(),
         padding,
         tasks: frames.iter().map(|frame| frame.task.clone()).collect(),
         indices: frames.iter().map(|frame| frame.index).collect(),

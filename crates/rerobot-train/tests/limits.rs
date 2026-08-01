@@ -1256,6 +1256,7 @@ fn normalizing_a_zero_width_tensor_is_an_error_not_a_panic() {
     );
     let batch = rerobot_train::data::batch::Batch {
         features,
+        images: IndexMap::new(),
         padding: IndexMap::new(),
         tasks: vec!["reach the target".to_owned()],
         indices: vec![0],

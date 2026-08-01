@@ -280,6 +280,9 @@ fn oracle_batch(tensors: &HashMap<String, Tensor>) -> Batch {
     let batch_size = features["observation.state"].dims()[0];
     Batch {
         features,
+        // The oracle exported by `tools/goldens/make_act_goldens.py` is the
+        // state-only configuration, so it carries no cameras.
+        images: indexmap::IndexMap::new(),
         padding,
         tasks: vec!["reach the target".to_owned(); batch_size],
         indices: (0..batch_size as i64).collect(),

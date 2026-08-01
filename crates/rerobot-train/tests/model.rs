@@ -501,22 +501,28 @@ fn an_eval_pass_has_no_kl_term() {
 // Refusals
 // ---------------------------------------------------------------------------
 
+/// The camera path is exercised in `tests/image.rs`; what belongs here is the
+/// state-only side of the same decision — a config with an image feature whose
+/// declared shape is not `[channels, height, width]` cannot size a backbone, and
+/// says so rather than guessing which of the two dimensions is the height.
 #[test]
-fn an_image_feature_in_the_policy_config_is_refused_with_a_reason() {
+fn an_image_feature_without_a_chw_shape_is_refused_with_a_reason() {
     let mut policy = config();
+    policy.pretrained_backbone_weights = None;
     policy.input_features.as_mut().unwrap().insert(
         "observation.images.top".to_owned(),
         rerobot_core::types::PolicyFeature::new(
             rerobot_core::types::FeatureType::Visual,
-            [BigInt::from(3), BigInt::from(96), BigInt::from(96)],
+            [BigInt::from(96), BigInt::from(96)],
         ),
     );
     let mut rng = SplitMix64::new(0);
     let error = ActModel::new(&policy, &Device::Cpu, &mut rng).unwrap_err();
-    assert!(matches!(error, TrainError::Unsupported(_)));
     assert!(
-        error.to_string().contains("ResNet backbone"),
-        "the refusal does not say what is missing: {error}"
+        error
+            .to_string()
+            .contains("a camera is [channels, height, width]"),
+        "the refusal does not say what shape a camera has: {error}"
     );
 }
 

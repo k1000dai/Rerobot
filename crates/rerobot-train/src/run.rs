@@ -138,8 +138,8 @@ impl TrainSession {
             StateOnlyDataset::load(&config.dataset_root, &delta_timestamps, config.tolerance_s)?;
 
         // `make_policy`: the dataset's features become the policy's, split by
-        // whether they are actions.
-        let (inputs, outputs) = dataset.metadata().policy_feature_split();
+        // whether they are actions, plus the cameras the config declares.
+        let (inputs, outputs) = resolved_policy_features(config, dataset.metadata());
         let mut policy_config = config.policy.clone();
         policy_config.input_features = Some(inputs);
         policy_config.output_features = Some(outputs);
@@ -243,6 +243,22 @@ impl TrainSession {
     /// caught.
     pub fn step(&mut self, step_number: u64) -> Result<StepMetrics> {
         let raw = self.next_batch()?;
+        self.step_on(step_number, &raw)
+    }
+
+    /// [`Self::step`] on a batch the caller supplies rather than one the sampler
+    /// produced.
+    ///
+    /// This is the entry point a camera policy trains through. The dataset reader is
+    /// state-only — neither on-disk camera form of a LeRobot v3.0 dataset can be
+    /// decoded here, and [`crate::data::meta::DatasetMetadata::load`] says so rather
+    /// than dropping the feature — so a run with cameras assembles its own batches:
+    /// [`Self::next_batch`] for the state and action columns, then
+    /// [`Batch::with_images`] for the camera tensors.
+    ///
+    /// `batch` is *raw*: this normalizes it with [`Self::normalizer`] exactly as
+    /// [`Self::step`] does, which is what keeps the two paths one computation.
+    pub fn step_on(&mut self, step_number: u64, raw: &Batch) -> Result<StepMetrics> {
         let batch = raw.normalized(&self.normalizer)?;
 
         let before = parameter_l2(self.model.parameters())?;
@@ -286,6 +302,41 @@ impl TrainSession {
             frame_indices: batch.indices.clone(),
         })
     }
+}
+
+/// The `(input_features, output_features)` the policy is built from.
+///
+/// Upstream's `make_policy` takes both entirely from the dataset. This adds one
+/// thing to that: any **camera** feature the config already declares is kept.
+///
+/// It has to be, because the two sources of truth are split here in a way they are
+/// not upstream. `DatasetMetadata::load` refuses a dataset that declares an on-disk
+/// camera — neither MP4 nor PNG can be decoded in this workspace — so a dataset that
+/// reaches this point never carries one, and taking the features from it alone would
+/// make the camera path unreachable through a [`TrainSession`] no matter what the
+/// user asked for. Declaring the camera on the policy config and supplying its
+/// tensors to [`TrainSession::step_on`] is the supported way in, and this is what
+/// makes the declaration survive into the model and into the `config.json` the
+/// checkpoint writes.
+///
+/// Everything that is not a camera still comes from the dataset, so a config cannot
+/// contradict the data it is trained on about the width of a state or an action.
+pub fn resolved_policy_features(
+    config: &TrainConfig,
+    metadata: &crate::data::meta::DatasetMetadata,
+) -> (
+    IndexMap<String, rerobot_core::types::PolicyFeature>,
+    IndexMap<String, rerobot_core::types::PolicyFeature>,
+) {
+    let (mut inputs, outputs) = metadata.policy_feature_split();
+    if let Some(declared) = &config.policy.input_features {
+        for (key, feature) in declared {
+            if feature.r#type == rerobot_core::types::FeatureType::Visual {
+                inputs.insert(key.clone(), feature.clone());
+            }
+        }
+    }
+    (inputs, outputs)
 }
 
 /// Refuse a quantity a training step cannot continue from.
@@ -481,7 +532,7 @@ fn write_checkpoint_contents(
     // resolved from the dataset -- not the one the user typed, which is what
     // `policy.config.save_pretrained` does upstream.
     let mut policy_config = config.policy.clone();
-    let (inputs, outputs) = session.dataset.metadata().policy_feature_split();
+    let (inputs, outputs) = resolved_policy_features(config, session.dataset.metadata());
     policy_config.input_features = Some(inputs);
     policy_config.output_features = Some(outputs);
     std::fs::write(

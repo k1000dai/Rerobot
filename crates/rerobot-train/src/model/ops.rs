@@ -12,6 +12,9 @@ use rerobot_core::random::SplitMix64;
 /// `torch.nn.LayerNorm`'s default epsilon.
 pub const LAYER_NORM_EPS: f64 = 1e-5;
 
+/// `torchvision.ops.misc.FrozenBatchNorm2d`'s default epsilon.
+pub const FROZEN_BATCH_NORM_EPS: f64 = 1e-5;
+
 /// `torch.nn.Linear`: `y = x @ weight.T + bias`.
 #[derive(Debug, Clone)]
 pub struct Linear {
@@ -206,6 +209,225 @@ pub fn sinusoidal_position_embedding(
         }
     }
     Ok(Tensor::from_vec(table, (num_positions, dimension), device)?)
+}
+
+/// `torch.nn.Conv2d` with `groups = 1` and `dilation = 1`.
+///
+/// Only that case exists in ACT: the ResNet backbone's convolutions and the 1×1
+/// `encoder_img_feat_input_proj` are all ungrouped and undilated. Dilation is not
+/// offered here because `replace_final_stride_with_dilation` cannot be honoured on
+/// a `BasicBlock` ResNet at all — see [`crate::model::backbone`].
+#[derive(Debug, Clone)]
+pub struct Conv2d {
+    /// `weight`, shaped `[out_channels, in_channels, kernel_h, kernel_w]`.
+    pub weight: Tensor,
+    /// `bias`, shaped `[out_channels]`. Absent for every ResNet convolution, which
+    /// torchvision builds with `bias=False` because a normalization layer follows.
+    pub bias: Option<Tensor>,
+    /// `stride`, the same in both spatial axes as torchvision uses it.
+    pub stride: usize,
+    /// `padding`, the same in both spatial axes.
+    pub padding: usize,
+}
+
+impl Conv2d {
+    /// Apply to a `[batch, in_channels, height, width]` tensor.
+    pub fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        let output = input.conv2d(&self.weight, self.padding, self.stride, 1, 1)?;
+        match &self.bias {
+            // `[out_channels]` reshaped to `[1, out_channels, 1, 1]`, which is the
+            // axis torch adds it on.
+            Some(bias) => {
+                let channels = bias.dims1()?;
+                Ok(output.broadcast_add(&bias.reshape((1, channels, 1, 1))?)?)
+            }
+            None => Ok(output),
+        }
+    }
+
+    /// `out_channels`.
+    pub fn out_channels(&self) -> usize {
+        self.weight.dims()[0]
+    }
+
+    /// `in_channels`.
+    pub fn in_channels(&self) -> usize {
+        self.weight.dims()[1]
+    }
+}
+
+/// `torchvision.ops.misc.FrozenBatchNorm2d`: batch normalization with the four
+/// statistics held as *buffers* and never updated.
+///
+/// Upstream builds every ResNet normalization layer as this, which is why the
+/// backbone has no trainable normalization parameters and why a backbone gradient
+/// flows only through the convolutions.
+#[derive(Debug, Clone)]
+pub struct FrozenBatchNorm2d {
+    /// `weight`, shaped `[num_features]`.
+    pub weight: Tensor,
+    /// `bias`, shaped `[num_features]`.
+    pub bias: Tensor,
+    /// `running_mean`, shaped `[num_features]`.
+    pub running_mean: Tensor,
+    /// `running_var`, shaped `[num_features]`.
+    pub running_var: Tensor,
+}
+
+impl FrozenBatchNorm2d {
+    /// Apply to a `[batch, num_features, height, width]` tensor.
+    ///
+    /// Written in torchvision's own order — `scale = weight * rsqrt(var + eps)` and
+    /// `shift = bias - mean * scale` — because the epsilon sits inside the square
+    /// root there, and folding it in afterwards would move the low bits.
+    pub fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        let channels = self.weight.dims1()?;
+        let shape = (1, channels, 1, 1);
+        let scale = (&self.weight / (&self.running_var + FROZEN_BATCH_NORM_EPS)?.sqrt()?)?;
+        let shift = (&self.bias - (&self.running_mean * &scale)?)?;
+        Ok(input
+            .broadcast_mul(&scale.reshape(shape)?)?
+            .broadcast_add(&shift.reshape(shape)?)?)
+    }
+}
+
+/// `torch.nn.MaxPool2d` with a square kernel, stride and zero-padding.
+///
+/// Written out of `index_select` and `maximum` rather than delegated to candle's
+/// fused `max_pool2d`, for two reasons that are both about the *backward* pass:
+/// candle refuses to differentiate a max-pool whose kernel differs from its stride,
+/// and ResNet's stem pools 3×3 with stride 2, and its fused op takes no padding at
+/// all. Both facts are structural, not incidental, so the operator is composed from
+/// differentiable primitives here instead.
+///
+/// The padding is `-inf`, which is what torch pools with, so a padded cell can never
+/// win a window. One divergence is worth naming: when several cells in a window hold
+/// the identical maximum, torch routes the whole gradient to the first of them and
+/// candle's `maximum` splits it evenly. The forward values are the same either way.
+pub fn max_pool2d(input: &Tensor, kernel: usize, stride: usize, padding: usize) -> Result<Tensor> {
+    let (_, _, height, width) = input.dims4()?;
+    if kernel == 0 || stride == 0 {
+        return Err(TrainError::Tensor(format!(
+            "max_pool2d needs a positive kernel and stride, got {kernel} and {stride}"
+        )));
+    }
+    let padded_height = height + 2 * padding;
+    let padded_width = width + 2 * padding;
+    if padded_height < kernel || padded_width < kernel {
+        return Err(TrainError::Tensor(format!(
+            "a {kernel}x{kernel} max-pool does not fit a {padded_height}x{padded_width} \
+             padded input; the image is too small for this backbone"
+        )));
+    }
+    let out_height = (padded_height - kernel) / stride + 1;
+    let out_width = (padded_width - kernel) / stride + 1;
+
+    let padded = if padding == 0 {
+        input.clone()
+    } else {
+        pad_with(
+            &pad_with(input, 2, padding, f32::NEG_INFINITY)?,
+            3,
+            padding,
+            f32::NEG_INFINITY,
+        )?
+    };
+
+    let device = input.device();
+    let mut pooled: Option<Tensor> = None;
+    for row_offset in 0..kernel {
+        let rows: Vec<u32> = (0..out_height)
+            .map(|index| (index * stride + row_offset) as u32)
+            .collect();
+        let rows = Tensor::from_vec(rows, out_height, device)?;
+        let selected_rows = padded.index_select(&rows, 2)?;
+        for column_offset in 0..kernel {
+            let columns: Vec<u32> = (0..out_width)
+                .map(|index| (index * stride + column_offset) as u32)
+                .collect();
+            let columns = Tensor::from_vec(columns, out_width, device)?;
+            let window = selected_rows.index_select(&columns, 3)?;
+            pooled = Some(match pooled {
+                None => window,
+                Some(best) => best.maximum(&window)?,
+            });
+        }
+    }
+    Ok(pooled.expect("a positive kernel produces at least one window"))
+}
+
+/// `dimension` extended by `width` cells of `value` on both sides.
+fn pad_with(input: &Tensor, dimension: usize, width: usize, value: f32) -> Result<Tensor> {
+    let mut shape = input.dims().to_vec();
+    shape[dimension] = width;
+    let block = Tensor::full(value, shape, input.device())?.to_dtype(input.dtype())?;
+    Ok(Tensor::cat(&[&block, input, &block], dimension)?)
+}
+
+/// `ACTSinusoidalPositionEmbedding2d`: the fixed 2-D table added to a camera feature
+/// map's tokens.
+///
+/// `dimension` is `dim_model / 2`; the y half and the x half are concatenated, so the
+/// result carries `2 * dimension` channels. Both halves interleave sine and cosine,
+/// which needs `dimension` itself to be even — hence `dim_model` divisible by four,
+/// checked by the caller.
+///
+/// Two details are upstream's rather than the textbook's, and are reproduced
+/// deliberately: the position indices run `1..=height` rather than `0..height`, and
+/// the normalization divides by `height + 1e-6` rather than by `height`.
+///
+/// Returns `[1, 2 * dimension, height, width]`, which broadcasts over the batch.
+pub fn sinusoidal_position_embedding_2d(
+    height: usize,
+    width: usize,
+    dimension: usize,
+    device: &candle_core::Device,
+) -> Result<Tensor> {
+    if dimension == 0 || dimension % 2 != 0 {
+        return Err(TrainError::Tensor(format!(
+            "the 2-D camera position embedding needs an even positive dimension, got {dimension}"
+        )));
+    }
+    if height == 0 || width == 0 {
+        return Err(TrainError::Tensor(
+            "the 2-D camera position embedding needs a non-empty feature map".to_owned(),
+        ));
+    }
+    const TWO_PI: f32 = 2.0 * std::f32::consts::PI;
+    const EPS: f32 = 1e-6;
+    const TEMPERATURE: f32 = 10_000.0;
+
+    let inverse_frequency: Vec<f32> = (0..dimension)
+        .map(|index| TEMPERATURE.powf(2.0 * (index / 2) as f32 / dimension as f32))
+        .collect();
+
+    let channels = 2 * dimension;
+    let mut table = vec![0f32; channels * height * width];
+    for row in 0..height {
+        // `cumsum` over a tensor of ones, so the first row is 1 rather than 0.
+        let y_range = (row + 1) as f32 / (height as f32 + EPS) * TWO_PI;
+        for column in 0..width {
+            let x_range = (column + 1) as f32 / (width as f32 + EPS) * TWO_PI;
+            for index in 0..dimension {
+                let y = y_range / inverse_frequency[index];
+                let x = x_range / inverse_frequency[index];
+                let (y, x) = if index % 2 == 0 {
+                    (y.sin(), x.sin())
+                } else {
+                    (y.cos(), x.cos())
+                };
+                // `cat((pos_embed_y, pos_embed_x), dim=3).permute(0, 3, 1, 2)`: the
+                // y half occupies the first `dimension` channels.
+                table[(index * height + row) * width + column] = y;
+                table[((dimension + index) * height + row) * width + column] = x;
+            }
+        }
+    }
+    Ok(Tensor::from_vec(
+        table,
+        (1, channels, height, width),
+        device,
+    )?)
 }
 
 /// `get_activation_fn`: the three activations upstream accepts.

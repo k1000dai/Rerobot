@@ -320,6 +320,19 @@ impl<'a> Initializer<'a> {
         Ok(Tensor::from_vec(values, shape.to_vec(), &self.device)?)
     }
 
+    /// `N(0, standard_deviation)` of the given shape.
+    ///
+    /// This is what `nn.init.kaiming_normal_` reduces to once its gain and its fan
+    /// have been resolved; torchvision's ResNet initializes every convolution with
+    /// it at `mode="fan_out"` and `nonlinearity="relu"`.
+    pub fn normal(&mut self, shape: &[usize], standard_deviation: f64) -> Result<Tensor> {
+        let count = element_count(shape)?;
+        let values: Vec<f32> = (0..count)
+            .map(|_| (self.rng.standard_normal() * standard_deviation) as f32)
+            .collect();
+        Ok(Tensor::from_vec(values, shape.to_vec(), &self.device)?)
+    }
+
     /// `nn.Linear.reset_parameters`, both tensors.
     pub fn linear(&mut self, out_features: usize, in_features: usize) -> Result<(Tensor, Tensor)> {
         let bound = if in_features == 0 {

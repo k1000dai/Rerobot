@@ -52,9 +52,24 @@ pub const MAX_LATENT_DIM: usize = 8_192;
 /// width. Upstream's default is 100.
 pub const MAX_CHUNK_SIZE: usize = 8_192;
 
-/// Scalars in one frame of one feature. A 512×512×3 image is 786 432, so this leaves
-/// room for the image slice that is not yet ported.
+/// Scalars in one frame of one feature. A 512×512×3 image is 786 432, so a camera
+/// frame five times that size still fits.
 pub const MAX_FEATURE_WIDTH: usize = 1 << 22;
+
+/// Either spatial extent of one camera image.
+///
+/// Upstream's ACT datasets are 96×96 to 640×480; this allows more than an order of
+/// magnitude above the largest of them. The bound is per axis as well as on the
+/// product ([`MAX_FEATURE_WIDTH`]) because a 1×4194304 image passes the product and
+/// is still a shape no backbone can pool.
+pub const MAX_IMAGE_EXTENT: usize = 8_192;
+
+/// Cameras one policy may consume.
+///
+/// Every camera adds a full ResNet evaluation to each forward pass and `h * w` tokens
+/// to the transformer encoder's sequence, so the count is the multiplier on both. The
+/// largest upstream ACT configuration uses four.
+pub const MAX_CAMERAS: usize = 64;
 
 /// `batch_size`. Upstream's default is 8.
 pub const MAX_BATCH_SIZE: usize = 65_536;

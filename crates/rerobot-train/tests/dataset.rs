@@ -176,6 +176,15 @@ fn a_dataset_declaring_a_camera_is_refused_rather_than_half_read() {
         error.to_string().contains("state-only"),
         "the refusal does not say why: {error}"
     );
+    // And it must say what the reader cannot decode and what the policy path *can*
+    // consume, so that a user with a camera dataset is not left guessing whether ACT
+    // supports cameras at all.
+    for expected in ["MP4", "PNG or JPEG", "Batch::with_images"] {
+        assert!(
+            error.to_string().contains(expected),
+            "the refusal does not mention {expected}: {error}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

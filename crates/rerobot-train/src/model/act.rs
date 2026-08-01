@@ -14,7 +14,7 @@
 //!
 //! **Not** ported: the temporal ensembler, which only runs at inference, and
 //! pretrained torchvision backbone weights, which are a download rather than a
-//! computation. [`ActModel::new`] refuses a config needing either rather than
+//! computation. [`crate::model::act::ActModel::new`] refuses a config needing either rather than
 //! quietly building a different model.
 
 use crate::data::batch::Batch;

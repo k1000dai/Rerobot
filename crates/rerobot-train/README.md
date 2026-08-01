@@ -4,10 +4,10 @@ The pure-Rust ACT training slice of [Rerobot][repo], a behaviour-compatible port
 of [Hugging Face LeRobot][upstream].
 
 This crate is what makes `lerobot-train` run for one narrow, honest case: a
-**state-only** LeRobot v3.0 dataset on local disk, the **ACT** policy on **CPU**,
-and the upstream checkpoint layout on the way out. There is no PyTorch, no Python
-sidecar and no FFI: the tensor work is [candle], the parquet work is [arrow], and
-the rest is this crate.
+**state-only** LeRobot v3.0 dataset on local disk, the **ACT** policy, and the
+upstream checkpoint layout on the way out. There is no PyTorch, no Python sidecar
+and no FFI: the tensor work is [candle], the parquet work is [arrow], and the
+rest is this crate.
 
 [repo]: https://github.com/k1000dai/Rerobot
 [upstream]: https://github.com/huggingface/lerobot
@@ -23,6 +23,39 @@ the rest is this crate.
 | `optim` — AdamW and `clip_grad_norm_` | `torch.optim.AdamW`, `torch.nn.utils.clip_grad_norm_` |
 | `checkpoint` — `checkpoints/<step>/{pretrained_model,training_state}/` | `lerobot/common/train_utils.py` |
 | `run` — the step loop | `lerobot/scripts/lerobot_train.py` |
+
+## Devices
+
+`--policy.device` accepts `cpu` by default, and `cuda` (or `cuda:0`, the
+spelling torch also accepts) when this crate is built with its **`cuda`**
+feature:
+
+```sh
+cargo build --release -p rerobot-cli --features cuda
+```
+
+That feature switches candle onto its CUDA backend, so it needs the NVIDIA CUDA
+toolkit at build time — `candle-kernels` compiles PTX from source. It is off by
+default and stays off in CI, because none of the hosted runners has a toolkit.
+
+Two properties hold on purpose:
+
+* **No fallback.** A run that asks for `cuda` and cannot have it — the feature
+  was not compiled, or the driver/GPU is missing — stops with a non-zero exit and
+  says which of the two it was. Upstream downgrades to the CPU with a warning;
+  this slice does not, because a run that reports success from a device nobody
+  chose is indistinguishable from one that worked.
+* **One device.** [`device::resolve`](crate::device::resolve) is called once in
+  `TrainSession::new`, and the batch, the normalized copy of it, the model
+  parameters, the latent and dropout draws, the AdamW moments and the optimizer
+  state all come from that one `Device`. Only the safetensors writer leaves it,
+  because serialization reads the bytes back to host memory.
+
+**Validation status.** The CUDA path is implemented and covered by
+`tests/device_smoke.rs`, which is compiled only under `--features cuda`. It has
+not yet been executed on real NVIDIA hardware from this repository, so treat GPU
+support as *available but not hardware-validated*. The CPU path is validated by
+CI on Linux, macOS and Windows, and element by element against upstream PyTorch.
 
 ## What is deliberately out of scope
 

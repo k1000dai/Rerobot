@@ -949,17 +949,98 @@ fn an_existing_output_directory_is_refused_because_resume_is_not_ported() {
     );
 }
 
+/// A default build has no CUDA backend compiled in, so the run stops and says
+/// how to get one. The alternative -- training on the CPU and reporting success
+/// -- is the failure this whole check exists to prevent.
+#[cfg(not(feature = "cuda"))]
 #[test]
-fn a_non_cpu_device_is_refused_with_the_reason() {
+fn a_cuda_run_on_a_build_without_cuda_is_refused_and_names_the_rebuild() {
     let dir = TempDir::new("cuda");
     let mut config = reduced_config(fixture_dataset(), dir.child("out"));
     config.policy.device = Some("cuda".to_owned());
     let error = train(&config, &mut |_| {}).unwrap_err();
     assert!(matches!(error, TrainError::Unsupported(_)));
+    let message = error.to_string();
     assert!(
-        error.to_string().contains("only \"cpu\" is accepted"),
+        message.contains("only \"cpu\" is accepted"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        message.contains("--features cuda"),
+        "the refusal must name the rebuild: {message}"
+    );
+}
+
+/// Not a device this port has any backend for, in either build.
+#[test]
+fn a_device_that_is_not_ported_at_all_is_refused_with_the_reason() {
+    let dir = TempDir::new("mps");
+    let mut config = reduced_config(fixture_dataset(), dir.child("out"));
+    config.policy.device = Some("mps".to_owned());
+    let error = train(&config, &mut |_| {}).unwrap_err();
+    assert!(matches!(error, TrainError::Unsupported(_)));
+    assert!(
+        error.to_string().contains("\"mps\""),
         "unexpected error: {error}"
     );
+}
+
+/// `TrainConfig`'s fields are public, so a library caller can reach
+/// `TrainSession::new` without going through `validate`. The session resolves
+/// the device itself for exactly that reason.
+#[cfg(not(feature = "cuda"))]
+#[test]
+fn a_session_built_by_hand_refuses_cuda_rather_than_falling_back_to_the_cpu() {
+    let dir = TempDir::new("session-cuda");
+    let mut config = reduced_config(fixture_dataset(), dir.child("out"));
+    config.policy.device = Some("cuda".to_owned());
+    // `TrainSession` is not `Debug`, so `expect_err` is not available here.
+    let Err(error) = TrainSession::new(&config) else {
+        panic!("a session must not silently fall back to the CPU");
+    };
+    assert!(matches!(error, TrainError::Unsupported(_)));
+}
+
+/// Every tensor a step touches comes from the session's device, so pinning the
+/// session's device pins all of them.
+#[test]
+fn the_session_and_everything_it_builds_live_on_the_named_device() {
+    let dir = TempDir::new("session-device");
+    let config = reduced_config(fixture_dataset(), dir.child("out"));
+    assert_eq!(config.policy.device.as_deref(), Some("cpu"));
+    let mut session = TrainSession::new(&config).expect("the session builds");
+
+    let device = session.device().clone();
+    assert!(device.is_cpu());
+    assert!(session.model.device().same_device(&device));
+    for (name, parameter) in session.model.state_dict().expect("the state dict builds") {
+        assert!(
+            parameter.device().same_device(&device),
+            "parameter {name} is not on the session device"
+        );
+    }
+    let batch = session.next_batch().expect("a batch collates");
+    for (name, tensor) in &batch.features {
+        assert!(
+            tensor.device().same_device(&device),
+            "batch feature {name} is not on the session device"
+        );
+    }
+    for (name, tensor) in &batch.padding {
+        assert!(
+            tensor.device().same_device(&device),
+            "padding mask {name} is not on the session device"
+        );
+    }
+    let normalized = batch
+        .normalized(&session.normalizer)
+        .expect("normalization succeeds");
+    for (name, tensor) in &normalized.features {
+        assert!(
+            tensor.device().same_device(&device),
+            "normalized feature {name} left the session device"
+        );
+    }
 }
 
 #[test]

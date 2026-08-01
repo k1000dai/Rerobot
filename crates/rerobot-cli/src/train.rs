@@ -625,7 +625,26 @@ fn optional_string(value: &Value, flag: &str) -> Result<Option<String>, Argument
 }
 
 /// The extra `--help` section listing what `lerobot-train` accepts.
+///
+/// The device lines are read from [`rerobot_train::device::CUDA_COMPILED`]
+/// rather than from a `cfg` of this crate, so the help describes the binary the
+/// user is holding and cannot drift from what the training crate will accept.
 pub fn help_section() -> String {
+    let (device_flag, scope_note) = if rerobot_train::device::CUDA_COMPILED {
+        (
+            "--policy.device=cpu|cuda",
+            "This binary was built with CUDA support, so --policy.device=cuda (or cuda:0)\n\
+             trains on NVIDIA GPU 0. A requested GPU that cannot be initialized is an\n\
+             error; the run never falls back to the CPU.",
+        )
+    } else {
+        (
+            "--policy.device=cpu",
+            "This binary has no CUDA backend compiled in, so `cpu` is the only device it\n\
+             accepts. Rebuild with `--features cuda` on a machine with the NVIDIA CUDA\n\
+             toolkit to enable --policy.device=cuda.",
+        )
+    };
     let mut text = String::from(
         "Supported arguments (every other upstream argument is refused, never ignored):\n\
          \n\
@@ -647,8 +666,11 @@ pub fn help_section() -> String {
          \x20 --policy.latent_dim --policy.use_vae --policy.pre_norm\n\
          \x20 --policy.dropout --policy.kl_weight --policy.optimizer_lr\n\
          \x20 --policy.optimizer_weight_decay --policy.optimizer_lr_backbone\n\
-         \x20 --policy.feedforward_activation --policy.device=cpu\n\
-         \x20 --policy.normalization_mapping.STATE=MEAN_STD\n\
+         \x20 --policy.feedforward_activation\n",
+    );
+    text.push_str(&format!("   {device_flag}\n"));
+    text.push_str(
+        "   --policy.normalization_mapping.STATE=MEAN_STD\n\
          \n\
          Refused, with a reason naming what is missing:\n",
     );
@@ -670,9 +692,10 @@ pub fn help_section() -> String {
         text.push('\n');
     }
     text.push_str(
-        "\nScope: a state-only LeRobot v3.0 dataset on local disk, ACT, CPU. Image and\n\
+        "\nScope: a state-only LeRobot v3.0 dataset on local disk, ACT. Image and\n\
          video features, the Hub, distributed training, mixed precision, LR\n\
-         schedulers and environment evaluation are not ported.",
+         schedulers and environment evaluation are not ported.\n\n",
     );
+    text.push_str(scope_note);
     text
 }

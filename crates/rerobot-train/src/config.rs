@@ -124,15 +124,10 @@ impl TrainConfig {
         crate::limits::within_u64(self.steps, "steps", crate::limits::MAX_STEPS)?;
         self.validate_policy_dimensions()?;
 
-        match self.policy.device.as_deref() {
-            Some("cpu") | None => {}
-            Some(other) => {
-                return Err(TrainError::unsupported(format!(
-                    "policy.device = {other:?}; candle is built here without a CUDA or Metal \
-                     backend, so only \"cpu\" is accepted"
-                )))
-            }
-        }
+        // Spelling and build support only: no device is initialized here, so a
+        // configuration can be validated on a machine with no GPU. The hardware is
+        // met in `TrainSession::new`, which resolves the same string again.
+        crate::device::parse(self.policy.device.as_deref())?;
         if self.policy.use_amp {
             return Err(TrainError::unsupported(
                 "policy.use_amp is set; mixed precision needs `accelerate`, which is not ported"

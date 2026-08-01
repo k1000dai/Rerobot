@@ -58,11 +58,43 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all --check
 
+      # Feature selection policy
+      # ------------------------
+      # These gates run on the *default* feature set, not `--all-features`, and
+      # that is deliberate. The workspace has exactly one non-default feature,
+      # `cuda` (on `rerobot-train`, re-exported by `rerobot-cli`), and enabling it
+      # requires the NVIDIA CUDA toolkit at build time because `candle-kernels`
+      # compiles PTX from source. None of the three runners here has one, so
+      # `--all-features` would turn every gate red on a machine that could never
+      # be right.
+      #
+      # The cost of dropping `--all-features` is that a future feature could go
+      # untested by accident, so the "no CUDA in a default build" step below
+      # asserts the split is real rather than assumed, and any feature added
+      # later has to be named here explicitly.
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: cargo test
-        run: cargo test --workspace --all-targets --all-features --locked
+        run: cargo test --workspace --all-targets --locked
+
+      # The other half of the feature policy: a default build must not link the
+      # CUDA backend. If `cuda` ever becomes a default feature, or a dependency
+      # starts enabling `candle-core/cuda` transitively, every runner above would
+      # suddenly need `nvcc` — this catches that in one cheap command instead.
+      - name: no CUDA backend in a default build
+        if: runner.os == 'Linux'
+        run: |
+          tree="$(cargo tree --workspace --locked --edges normal --prefix none)"
+          for crate in cudarc candle-kernels ug-cuda; do
+            if printf '%s\n' "$tree" | grep -q "^$crate "; then
+              echo "the default build pulled in $crate; --features cuda must stay opt-in"
+              exit 1
+            fi
+          done
+          # And the feature does exist, so this check is testing something.
+          cargo metadata --format-version 1 --no-deps \
+            | grep -q '"cuda":\["candle-core/cuda","candle-nn/cuda"\]'
 
       # The `cfg(windows)` half of the `shutil.which` port cannot run on the
       # machine it was written on, so `windows-latest` is where PATHEXT
@@ -76,7 +108,7 @@ jobs:
         if: runner.os == 'Windows'
         env:
           NoDefaultCurrentDirectoryInExePath: '1'
-        run: cargo test --workspace --all-targets --all-features --locked
+        run: cargo test --workspace --all-targets --locked
 
       - name: cargo test --doc
         run: cargo test --workspace --doc
@@ -89,7 +121,7 @@ jobs:
       - name: cargo doc (strict)
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --all-features --no-deps --locked
+        run: cargo doc --workspace --no-deps --locked
 
       - name: cargo build --release
         run: cargo build --workspace --release --locked
@@ -133,11 +165,17 @@ jobs:
       # --locked, because the MSRV is a property of the *locked* tree: a fresh
       # resolve could pull a newer dependency with a higher floor and pass here
       # while failing for anyone installing from the lockfile.
+      #
+      # Default features, for the reason given in the `gates` job: `--features
+      # cuda` needs a CUDA toolkit this runner does not have. The MSRV promise
+      # this asserts is therefore the one for a default install, which is what
+      # `cargo install rerobot-cli` performs; the CUDA build's floor is whatever
+      # `cudarc` and `candle-kernels` require and is not promised here.
       - name: cargo build (MSRV)
-        run: cargo build --workspace --all-features --locked
+        run: cargo build --workspace --locked
 
       - name: cargo test (MSRV)
-        run: cargo test --workspace --all-targets --all-features --locked
+        run: cargo test --workspace --all-targets --locked
 
   package:
     name: package publishable crates

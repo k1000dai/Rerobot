@@ -324,6 +324,32 @@ fn help_states_the_partial_status_and_lists_what_is_accepted_and_refused() {
     );
 }
 
+/// The help text must describe *this* binary, not the feature set the project
+/// can be built with: a user reading it should be able to tell whether the
+/// executable in front of them can reach a GPU.
+#[test]
+fn help_states_which_devices_this_build_can_actually_use() {
+    let result = run(&["--help".to_owned()]);
+    let stdout = stdout_of(&result);
+    assert!(stdout.contains("--policy.device"), "stdout:\n{stdout}");
+    if rerobot_train::device::CUDA_COMPILED {
+        assert!(
+            stdout.contains("--policy.device=cpu|cuda"),
+            "a CUDA build must offer the GPU:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("NVIDIA"),
+            "a CUDA build must say what the GPU path is:\n{stdout}"
+        );
+    } else {
+        assert!(stdout.contains("--policy.device=cpu"), "stdout:\n{stdout}");
+        assert!(
+            stdout.contains("--features cuda"),
+            "a CPU-only build must name the rebuild that adds the GPU:\n{stdout}"
+        );
+    }
+}
+
 #[test]
 fn help_wins_over_a_full_command_line() {
     let dir = TempDir::new("help-wins");
@@ -423,7 +449,11 @@ fn a_flag_whose_value_leaves_the_slice_is_refused_when_the_config_is_validated()
     let dir = TempDir::new("unsupported-validate");
     for (flag, fragment) in [
         ("--num_workers=4", "calling thread"),
-        ("--policy.device=mps", "only \"cpu\" is accepted"),
+        // What the rest of the message says about `mps` depends on whether this
+        // binary has a CUDA backend, so only the part that does not is asserted
+        // here; `a_device_with_no_backend_at_all_is_refused_at_the_command_line`
+        // covers the value itself.
+        ("--policy.device=mps", "policy.device"),
         ("--policy.use_amp=true", "mixed precision"),
         ("--policy.use_peft=true", "PEFT"),
         ("--use_policy_training_preset=false", "optimizer registry"),
@@ -688,12 +718,38 @@ fn another_policy_type_is_refused_by_name() {
     assert!(stderr.contains("only policy"), "stderr:\n{stderr}");
 }
 
+/// A default binary has no CUDA backend, and says so with the rebuild rather
+/// than training on the CPU behind the user's back.
+#[cfg(not(feature = "cuda"))]
 #[test]
-fn a_non_cpu_device_is_refused_at_the_command_line() {
+fn cuda_is_refused_at_the_command_line_by_a_binary_built_without_it() {
     let dir = TempDir::new("cli-cuda");
-    let result = run(&slice_args(&dir.child("out"), &["--policy.device=cuda"]));
+    for spelling in ["cuda", "cuda:0"] {
+        let result = run(&slice_args(
+            &dir.child(&spelling.replace(':', "-")),
+            &[&format!("--policy.device={spelling}")],
+        ));
+        assert_eq!(
+            result.status.code(),
+            Some(2),
+            "{spelling} must exit non-zero"
+        );
+        let stderr = stderr_of(&result);
+        assert!(stderr.contains("only \"cpu\" is accepted"), "{stderr}");
+        assert!(
+            stderr.contains("--features cuda"),
+            "the refusal must name the rebuild: {stderr}"
+        );
+    }
+}
+
+/// A device with no backend in either build.
+#[test]
+fn a_device_with_no_backend_at_all_is_refused_at_the_command_line() {
+    let dir = TempDir::new("cli-mps");
+    let result = run(&slice_args(&dir.child("out"), &["--policy.device=mps"]));
     assert_eq!(result.status.code(), Some(2));
-    assert!(stderr_of(&result).contains("only \"cpu\" is accepted"));
+    assert!(stderr_of(&result).contains("\"mps\""));
 }
 
 #[test]

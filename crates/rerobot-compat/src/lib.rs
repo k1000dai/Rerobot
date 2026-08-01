@@ -151,7 +151,9 @@ pub static ENTRY_POINTS: &[EntryPoint] = &[
         status: Status::Partial,
         summary: "Train a policy.",
         note: "Runnable for one vertical slice: the ACT policy on a state-only LeRobot v3.0 \
-            dataset on local disk, on CPU, writing upstream's checkpoint layout. Image and video \
+            dataset on local disk, writing upstream's checkpoint layout. `--policy.device` takes \
+            `cpu`, and `cuda`/`cuda:0` when built with the `cuda` feature; a GPU that was asked \
+            for and cannot be provided is an error rather than a silent fallback. Image and video \
             features, the Hub, accelerate, mixed precision, LR schedulers, PEFT, environment \
             evaluation and resume are refused with a reason rather than ignored.",
     },

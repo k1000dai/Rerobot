@@ -15,6 +15,14 @@ readme = "README.md"
 # `rerobot-train`, which is outside this crate's publishable archive.
 exclude = ["tests/train_cli.rs"]
 
+[features]
+default = []
+
+# Build `lerobot-train` with candle's CUDA backend, which makes
+# `--policy.device=cuda` selectable. Off by default: it needs the NVIDIA CUDA
+# toolkit at build time. See `rerobot-train`'s manifest for the full note.
+cuda = ["rerobot-train/cuda"]
+
 [dependencies]
 rerobot-core.workspace = true
 rerobot-compat.workspace = true

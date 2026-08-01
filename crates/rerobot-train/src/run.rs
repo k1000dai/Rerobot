@@ -113,7 +113,11 @@ impl TrainSession {
             "batch_size",
             crate::limits::MAX_BATCH_SIZE,
         )?;
-        let device = Device::Cpu;
+        // Resolved once, here, and then used for every tensor the run creates:
+        // the collated batch, the normalized copy of it, the model's parameters,
+        // the latent and dropout draws, the AdamW moments, and the optimizer state
+        // the checkpoint serializes. Nothing downstream picks a device of its own.
+        let device = crate::device::resolve(config.policy.device.as_deref())?;
         let seed = config.seed.unwrap_or(0);
 
         let metadata = crate::data::meta::DatasetMetadata::load(&config.dataset_root)?;

@@ -70,6 +70,14 @@ pub enum TrainError {
         /// The value, rendered — `NaN`, `inf` or `-inf`.
         value: String,
     },
+    /// The compute device the run named could not be initialized.
+    ///
+    /// Separate from [`TrainError::Unsupported`] because the request was in
+    /// scope and the *machine* could not serve it: a binary built with CUDA
+    /// support, asked for a GPU, on a host whose driver is missing. Upstream
+    /// downgrades this to the CPU with a warning; this slice stops, because the
+    /// alternative is a run that reports success from the wrong device.
+    Device(String),
     /// The run asked for something upstream supports and this slice does not.
     ///
     /// This is the variant that keeps the port honest: nothing is quietly
@@ -142,6 +150,7 @@ impl fmt::Display for TrainError {
                 "step {step}: {quantity} is not finite ({value}); the step trained nothing, so \
                  the run stops rather than reporting success"
             ),
+            Self::Device(message) => write!(formatter, "compute device unavailable: {message}"),
             Self::Unsupported(message) => write!(formatter, "unsupported in this slice: {message}"),
         }
     }

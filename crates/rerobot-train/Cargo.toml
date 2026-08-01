@@ -12,6 +12,21 @@ keywords.workspace = true
 categories.workspace = true
 readme = "README.md"
 
+[features]
+default = []
+
+# Compile candle's CUDA backend, which makes `--policy.device=cuda` selectable.
+#
+# It is off by default and always will be: turning it on requires the NVIDIA
+# CUDA toolkit (`nvcc`) at build time, because `candle-kernels` compiles PTX from
+# source, and it drags `cudarc` and `ug-cuda` into the tree. A default `cargo
+# build` on macOS, Windows or a GPU-less Linux box must not need any of that.
+#
+# This is why the CI gates name their features explicitly instead of passing
+# `--all-features`: `--all-features` would turn this on for every runner, none of
+# which has a CUDA toolkit. See `.github/workflows/ci.yml`.
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+
 [dependencies]
 rerobot-core.workspace = true
 indexmap.workspace = true
@@ -23,8 +38,7 @@ num-bigint.workspace = true
 # or a broadcast rule would move the numbers the golden tests pin.
 #
 # Default features only, which for candle means CPU: no CUDA, no Metal, no MKL,
-# no Accelerate. `docs/compatibility.md` records that `--policy.device` accepts
-# nothing but `cpu`.
+# no Accelerate. The optional `cuda` feature below is the single exception.
 candle-core = { version = "=0.9.1", default-features = false }
 candle-nn = { version = "=0.9.1", default-features = false }
 

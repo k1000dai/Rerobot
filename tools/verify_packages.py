@@ -133,6 +133,10 @@ def main() -> None:
             with manifest.open("a", encoding="utf-8") as handle:
                 handle.write("\n".join(patch_lines) + "\n")
 
+        # Verify the publishable default artifact here. `rerobot-train` has an
+        # explicit `cuda` feature, but these hosted package runners do not have
+        # nvcc; the feature is validated separately on a CUDA host rather than
+        # making archive verification pretend that CPU-only CI can exercise it.
         for name in CRATES:
             manifest = package_dirs[name] / "Cargo.toml"
             run(
@@ -143,7 +147,7 @@ def main() -> None:
                 "--manifest-path",
                 str(manifest),
                 "--all-targets",
-                "--all-features",
+                "--no-default-features",
                 cwd=extracted,
             )
             run(
@@ -154,7 +158,7 @@ def main() -> None:
                 "--manifest-path",
                 str(manifest),
                 "--doc",
-                "--all-features",
+                "--no-default-features",
                 cwd=extracted,
             )
     print("all packaged crates passed archive-only tests and doctests")

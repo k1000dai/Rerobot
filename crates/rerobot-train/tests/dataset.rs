@@ -173,7 +173,7 @@ fn a_dataset_declaring_a_camera_is_refused_rather_than_half_read() {
         "the refusal does not name the feature: {error}"
     );
     assert!(
-        error.to_string().contains("state-only"),
+        error.to_string().contains("video"),
         "the refusal does not say why: {error}"
     );
     // And it must say what the reader cannot decode and what the policy path *can*

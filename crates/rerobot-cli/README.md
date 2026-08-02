@@ -20,7 +20,8 @@ Two of them run at this milestone. The other sixteen exist and fail explicitly.
 lerobot-info
 
 # `lerobot-train` trains for real, for one vertical slice: the ACT policy on a
-# state-only LeRobot v3.0 dataset on local disk, on CPU. It writes upstream's
+# local LeRobot v3.0 dataset on disk, including embedded PNG/JPEG camera columns,
+# on CPU. It writes upstream's
 # checkpoint layout, which upstream can load back.
 lerobot-train --help         # lists exactly which arguments it accepts
 lerobot-train --dataset.repo_id=ID --dataset.root=DIR --output_dir=DIR \

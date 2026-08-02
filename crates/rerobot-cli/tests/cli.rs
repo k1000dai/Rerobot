@@ -149,7 +149,7 @@ fn sixteen_of_eighteen_commands_are_unsupported() {
         .count();
     assert_eq!(unsupported, 16);
     // The two that are not: `lerobot-info` in full, and `lerobot-train` for the
-    // ACT state-only slice.
+    // ACT local-dataset slice, including embedded PNG/JPEG camera columns.
     let runnable: Vec<&str> = ENTRY_POINTS
         .iter()
         .filter(|e| !e.status.is_unsupported())

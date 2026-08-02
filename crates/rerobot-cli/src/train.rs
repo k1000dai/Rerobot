@@ -3,7 +3,7 @@
 //! Upstream parses `TrainPipelineConfig` with Draccus, which accepts a dotted
 //! `--a.b.c=value` flag for every field of every nested dataclass, plus
 //! `--config_path` for a YAML or checkpoint config. This is not that parser: it is
-//! an explicit allow-list of the flags a state-only ACT run on CPU consumes.
+//! explicit allow-list of the flags the local ACT run consumes.
 //!
 //! The design rule is that there are exactly three outcomes for any flag, and
 //! never a fourth:
@@ -119,11 +119,10 @@ pub static UNSUPPORTED_ARGUMENTS: &[(&str, &str)] = &[
     ("optimizer", "a hand-specified optimizer needs the Draccus optimizer registry; the ACT preset is used instead"),
     ("dataset.streaming", "the streaming dataset needs the Hub client"),
     ("dataset.revision", "pinning a Hub revision needs the Hub client"),
-    ("dataset.image_transforms", "image transforms need the image pipeline, and this slice is state-only"),
-    ("dataset.video_backend", "video decoding is not ported, and this slice is state-only"),
-    ("dataset.return_uint8", "this affects image tensors only, and this slice is state-only"),
+    ("dataset.image_transforms", "image transforms need the image pipeline, which is not ported"),
+    ("dataset.video_backend", "video decoding is not ported; only embedded PNG/JPEG image columns are supported"),
+    ("dataset.return_uint8", "the CLI decodes supported image columns to f32 tensors, so this option is not ported"),
     ("dataset.depth_output_unit", "depth cameras are not ported"),
-    ("dataset.use_imagenet_stats", "this affects image statistics only, and this slice is state-only"),
     ("cudnn_deterministic", "there is no cuDNN here; the CPU backend is deterministic by construction"),
     ("prefetch_factor", "batches are loaded in the calling thread, so there is nothing to prefetch"),
     ("persistent_workers", "batches are loaded in the calling thread, so there are no workers"),
@@ -368,6 +367,7 @@ pub fn parse(args: &[String]) -> Result<TrainConfig, ArgumentError> {
     let mut tolerance_s: Option<f64> = None;
     let mut num_workers: Option<u32> = None;
     let mut use_preset: Option<bool> = None;
+    let mut use_imagenet_stats: Option<bool> = None;
 
     for (flag, raw) in &flags {
         let value = Value::parse(raw);
@@ -375,6 +375,7 @@ pub fn parse(args: &[String]) -> Result<TrainConfig, ArgumentError> {
             "dataset.repo_id" => repo_id = Some(value.as_string(flag)?),
             "dataset.root" => root = Some(PathBuf::from(value.as_string(flag)?)),
             "dataset.episodes" => episodes = Some(value.as_int_list(flag)?),
+            "dataset.use_imagenet_stats" => use_imagenet_stats = Some(value.as_bool(flag)?),
             "output_dir" => output_dir = Some(PathBuf::from(value.as_string(flag)?)),
             "job_name" => job_name = Some(value.as_string(flag)?),
             "seed" => {
@@ -485,6 +486,9 @@ pub fn parse(args: &[String]) -> Result<TrainConfig, ArgumentError> {
     }
     if let Some(value) = use_preset {
         config.use_policy_training_preset = value;
+    }
+    if let Some(value) = use_imagenet_stats {
+        config.dataset_use_imagenet_stats = value;
     }
     Ok(config)
 }
@@ -658,6 +662,9 @@ pub fn help_section() -> String {
          \x20 --steps=N --batch_size=N --seed=N|null --log_freq=N --save_freq=N\n\
          \x20 --save_checkpoint=BOOL --tolerance_s=SECONDS --job_name=NAME\n\
          \x20 --dataset.episodes=[0,1,..] --num_workers=0\n\
+         \x20 --dataset.use_imagenet_stats=BOOL  per-channel camera statistics;\n\
+         \x20                                    true (the default) uses IMAGENET_STATS,\n\
+         \x20                                    false leaves camera frames untouched\n\
          \n\
          Policy (ACTConfig fields):\n\
          \x20 --policy.chunk_size --policy.n_action_steps --policy.dim_model\n\
@@ -692,9 +699,11 @@ pub fn help_section() -> String {
         text.push('\n');
     }
     text.push_str(
-        "\nScope: a state-only LeRobot v3.0 dataset on local disk, ACT. Image and\n\
-         video features, the Hub, distributed training, mixed precision, LR\n\
-         schedulers and environment evaluation are not ported.\n\n",
+        "\nScope: a LeRobot v3.0 dataset on local disk, ACT. State and action columns\n\
+         are read, and so is a dtype=\"image\" camera column whose PNG or JPEG frames\n\
+         are embedded in the parquet file. Video features, the Hub, distributed\n\
+         training, mixed precision, LR schedulers and environment evaluation are not\n\
+         ported.\n\n",
     );
     text.push_str(scope_note);
     text

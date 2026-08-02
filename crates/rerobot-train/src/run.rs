@@ -13,8 +13,9 @@
 
 use crate::checkpoint;
 use crate::config::TrainConfig;
-use crate::data::batch::{collate, Batch};
+use crate::data::batch::{collate, collate_images, Batch};
 use crate::data::dataset::StateOnlyDataset;
+use crate::data::image::CameraNormalization;
 use crate::data::meta::ACTION;
 use crate::error::{Result, TrainError};
 use crate::model::act::{ActModel, Pass, Randomness};
@@ -87,6 +88,11 @@ pub struct TrainSession {
     pub rng: SplitMix64,
     /// `optimizer.grad_clip_norm`.
     pub grad_clip_norm: f64,
+    /// The per-channel statistics applied to every camera frame the dataset decodes.
+    ///
+    /// [`crate::config::TrainConfig::camera_normalization`], resolved once here so that
+    /// every batch the session produces is normalized the same way.
+    pub camera_normalization: CameraNormalization,
     /// Frame indices left over from the sampler's current epoch.
     queue: Vec<i64>,
     batch_size: usize,
@@ -146,14 +152,23 @@ impl TrainSession {
         policy_config.validate()?;
         policy_config.validate_features()?;
 
+        // Cameras are deliberately absent from this map. `Normalizer` resolves one
+        // statistic per *scalar* of a feature, which is what a state vector needs and
+        // what `Batch::normalized` applies; a camera's statistics are one per channel,
+        // they are applied by `Batch::with_images`, and its tensor never enters
+        // `Batch::features` at all. Leaving a camera in would ask `Normalizer::new` to
+        // match three per-channel numbers against `channels * height * width` scalars,
+        // which is a width mismatch on every real dataset rather than a normalization.
+        let normalized_features = policy_config
+            .input_features
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .chain(policy_config.output_features.clone().unwrap_or_default())
+            .filter(|(_, feature)| feature.r#type != rerobot_core::types::FeatureType::Visual)
+            .collect();
         let normalizer = Normalizer::new(
-            &policy_config
-                .input_features
-                .clone()
-                .unwrap_or_default()
-                .into_iter()
-                .chain(policy_config.output_features.clone().unwrap_or_default())
-                .collect(),
+            &normalized_features,
             &policy_config.normalization_mapping,
             &dataset.metadata().stats,
         )?;
@@ -190,6 +205,7 @@ impl TrainSession {
             sampler,
             rng: SplitMix64::new(rerobot_core::random::mix64(seed ^ RUN_SUBSTREAM)),
             grad_clip_norm: preset.grad_clip_norm,
+            camera_normalization: config.camera_normalization(),
             queue: Vec::new(),
             batch_size: config.batch_size,
             device,
@@ -202,6 +218,12 @@ impl TrainSession {
     }
 
     /// The next batch, cycling through epochs the way `utils.cycle` does.
+    ///
+    /// A dataset with an embedded `dtype: "image"` column has its decoded frames
+    /// attached here, through [`Batch::with_images`] and under
+    /// [`Self::camera_normalization`], so that [`Self::step`] trains on cameras
+    /// without the caller assembling anything. A dataset without one produces exactly
+    /// the batch it always did.
     pub fn next_batch(&mut self) -> Result<Batch> {
         // `Vec::with_capacity(batch_size)` is an allocation request, and `batch_size`
         // comes from the command line. `TrainConfig::validate` bounds it, and this
@@ -227,7 +249,12 @@ impl TrainSession {
             })?;
             frames.push(self.dataset.get(row)?);
         }
-        collate(&frames, &self.device)
+        let batch = collate(&frames, &self.device)?;
+        let images = collate_images(&frames, &self.device)?;
+        if images.is_empty() {
+            return Ok(batch);
+        }
+        batch.with_images(&images, &self.camera_normalization)
     }
 
     /// One optimization step: forward, loss, backward, clip, AdamW, zero.
@@ -249,12 +276,15 @@ impl TrainSession {
     /// [`Self::step`] on a batch the caller supplies rather than one the sampler
     /// produced.
     ///
-    /// This is the entry point a camera policy trains through. The dataset reader is
-    /// state-only — neither on-disk camera form of a LeRobot v3.0 dataset can be
-    /// decoded here, and [`crate::data::meta::DatasetMetadata::load`] says so rather
-    /// than dropping the feature — so a run with cameras assembles its own batches:
-    /// [`Self::next_batch`] for the state and action columns, then
-    /// [`Batch::with_images`] for the camera tensors.
+    /// The entry point for cameras this slice cannot decode from disk: a dataset whose
+    /// frames live outside its parquet files, or images a caller renders, records or
+    /// transforms itself. Such a run assembles its own batches — [`Self::next_batch`]
+    /// for the state and action columns, then [`Batch::with_images`] for the camera
+    /// tensors — and steps them through here.
+    ///
+    /// A dataset with an *embedded* `dtype: "image"` column needs none of that:
+    /// [`Self::next_batch`] already attaches its decoded frames, and [`Self::step`]
+    /// trains on them.
     ///
     /// `batch` is *raw*: this normalizes it with [`Self::normalizer`] exactly as
     /// [`Self::step`] does, which is what keeps the two paths one computation.
@@ -310,14 +340,17 @@ impl TrainSession {
 /// thing to that: any **camera** feature the config already declares is kept.
 ///
 /// It has to be, because the two sources of truth are split here in a way they are
-/// not upstream. `DatasetMetadata::load` refuses a dataset that declares an on-disk
-/// camera — neither MP4 nor PNG can be decoded in this workspace — so a dataset that
-/// reaches this point never carries one, and taking the features from it alone would
-/// make the camera path unreachable through a [`TrainSession`] no matter what the
-/// user asked for. Declaring the camera on the policy config and supplying its
-/// tensors to [`TrainSession::step_on`] is the supported way in, and this is what
-/// makes the declaration survive into the model and into the `config.json` the
-/// checkpoint writes.
+/// not upstream. A dataset whose cameras this slice cannot decode from disk — an MP4
+/// `dtype: "video"` feature, or frames stored outside the parquet file — reaches
+/// [`TrainSession::step_on`] as caller-supplied tensors instead, and taking the
+/// features from the dataset alone would make that path unreachable no matter what
+/// the user asked for. Declaring the camera on the policy config is the supported way
+/// in, and this is what makes the declaration survive into the model and into the
+/// `config.json` the checkpoint writes.
+///
+/// A dataset with an embedded `dtype: "image"` column needs no declaration: it is a
+/// feature of the dataset, so `policy_feature_split` already reports it as a visual
+/// input and the model is built with it.
 ///
 /// Everything that is not a camera still comes from the dataset, so a config cannot
 /// contradict the data it is trained on about the width of a state or an action.

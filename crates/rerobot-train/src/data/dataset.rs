@@ -3,13 +3,16 @@
 //!
 //! What is ported: reading the frame row, expanding every configured
 //! delta-timestamp window against the episode's boundaries, producing the
-//! `<key>_is_pad` flags, and attaching the task string behind `task_index`.
+//! `<key>_is_pad` flags, attaching the task string behind `task_index`, and decoding
+//! any embedded `dtype: "image"` column into RGB pixels — see [`crate::data::image`]
+//! for the codec set and the bounds every decode is subject to.
 //!
 //! What is not: video decoding, image transforms, depth dequantization, the
 //! streaming dataset, episode-filtered index remapping onto a subset of files,
 //! and the Hub. A dataset needing any of those is refused by
 //! [`crate::data::meta::DatasetMetadata::load`] or here, never partially read.
 
+use crate::data::image::DecodedImage;
 use crate::data::meta::{DatasetMetadata, ACTION};
 use crate::data::parquet::Table;
 use crate::error::{Result, TrainError};
@@ -37,6 +40,8 @@ pub struct Frame {
     /// A key with no configured delta window holds exactly one row: the frame's
     /// own. A key with one holds `delta_indices.len()` rows, in delta order.
     pub windows: IndexMap<String, Vec<Vec<f32>>>,
+    /// Per embedded camera key, the decoded RGB image for this frame.
+    pub images: IndexMap<String, DecodedImage>,
     /// Per feature key with a configured window, its `<key>_is_pad` flags.
     pub padding: IndexMap<String, Vec<bool>>,
 }
@@ -48,6 +53,11 @@ impl Frame {
             .get(key)
             .and_then(|rows| rows.first())
             .map(Vec::as_slice)
+    }
+
+    /// The decoded embedded camera image for one key.
+    pub fn image(&self, key: &str) -> Option<&DecodedImage> {
+        self.images.get(key)
     }
 
     /// The full window of a key, e.g. `action`.
@@ -94,13 +104,20 @@ impl Default for DatasetBudget {
     }
 }
 
-/// A state-only LeRobot v3.0 dataset on local disk.
+/// A LeRobot v3.0 dataset on local disk, with optional embedded camera images.
+///
+/// The name is the slice's history rather than its scope: the reader began state-only
+/// and now also decodes an embedded `dtype: "image"` column into [`Frame::images`].
+/// What it still refuses is a `dtype: "video"` feature, the streaming dataset and the
+/// Hub — see [`crate::data::meta::DatasetMetadata::load`].
 #[derive(Debug)]
 pub struct StateOnlyDataset {
     metadata: DatasetMetadata,
     delta_indices: IndexMap<String, Vec<i64>>,
     /// Per feature key, every frame of the dataset, in absolute index order.
     columns: IndexMap<String, Vec<Vec<f32>>>,
+    /// Per embedded camera key, every decoded frame in absolute index order.
+    image_columns: IndexMap<String, Vec<DecodedImage>>,
     timestamps: Vec<f32>,
     frame_indices: Vec<i64>,
     episode_indices: Vec<i64>,
@@ -142,9 +159,15 @@ impl StateOnlyDataset {
         let delta_indices = get_delta_indices(delta_timestamps, fps);
 
         for key in delta_indices.keys() {
-            if metadata.feature(key).is_none() {
+            let Some(feature) = metadata.feature(key) else {
                 return Err(TrainError::Metadata(format!(
                     "delta_timestamps names {key:?}, which the dataset does not have"
+                )));
+            };
+            if feature.dtype == "image" {
+                return Err(TrainError::unsupported(format!(
+                    "delta_timestamps for embedded camera {key:?} are not supported; ACT image inputs \
+                     are one RGB frame per dataset item"
                 )));
             }
         }
@@ -166,11 +189,29 @@ impl StateOnlyDataset {
 
         let value_keys: Vec<String> = metadata
             .feature_keys()
-            .filter(|key| !SCALAR_COLUMNS.contains(key))
+            .filter(|key| {
+                !SCALAR_COLUMNS.contains(key)
+                    && metadata
+                        .feature(key)
+                        .is_some_and(|spec| spec.dtype != "image")
+            })
+            .map(str::to_owned)
+            .collect();
+        let image_keys: Vec<String> = metadata
+            .feature_keys()
+            .filter(|key| {
+                metadata
+                    .feature(key)
+                    .is_some_and(|spec| spec.dtype == "image")
+            })
             .map(str::to_owned)
             .collect();
 
         let mut columns: IndexMap<String, Vec<Vec<f32>>> = value_keys
+            .iter()
+            .map(|key| (key.clone(), Vec::new()))
+            .collect();
+        let mut image_columns: IndexMap<String, Vec<DecodedImage>> = image_keys
             .iter()
             .map(|key| (key.clone(), Vec::new()))
             .collect();
@@ -215,6 +256,62 @@ impl StateOnlyDataset {
                     .expect("initialized above")
                     .extend(rows);
             }
+            for key in &image_keys {
+                let spec = metadata
+                    .feature(key)
+                    .expect("image_keys came from the feature map");
+                let shape = image_shape(key, spec)?;
+                // The decoded cost, budgeted before a single cell is decoded. One
+                // frame is `channels * height * width` f32s, which the declared shape
+                // already bounds, and the row count multiplies it.
+                total_values = crate::limits::checked_add(
+                    total_values,
+                    crate::limits::checked_mul(
+                        table.rows(),
+                        spec.width()?,
+                        "an image column's decoded size",
+                    )?,
+                    "the dataset's total decoded size",
+                )?;
+                crate::limits::within(
+                    total_values,
+                    "the dataset's total decoded size",
+                    budget.max_values,
+                )?;
+                // A v3.0 dataset carries its frames *inside* the parquet file. A
+                // declaration with no column is the other on-disk layout, and saying so
+                // is more use than "column is missing" from the generic reader.
+                if !table.has_column(key) {
+                    return Err(TrainError::unsupported(format!(
+                        "info.json declares camera {key:?} but {} has no such column; this \
+                         reader decodes the embedded LeRobot v3.0 form only, where the frames \
+                         are a struct<bytes: binary, path: string> column of the data file \
+                         rather than separate files on disk",
+                        path.display()
+                    )));
+                }
+                let encoded = table.image_column(&path, key)?;
+                if encoded.len() != table.rows() {
+                    return Err(TrainError::column(
+                        &path,
+                        format!(
+                            "image column {key:?} has {} rows but the file has {}",
+                            encoded.len(),
+                            table.rows()
+                        ),
+                    ));
+                }
+                let decoded = encoded
+                    .into_iter()
+                    .map(|(bytes, image_path)| {
+                        DecodedImage::from_encoded(key, &bytes, image_path, shape)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                image_columns
+                    .get_mut(key)
+                    .expect("initialized above")
+                    .extend(decoded);
+            }
             timestamps.extend(table.f32_column(&path, "timestamp")?);
             frame_indices.extend(table.i64_column(&path, "frame_index")?);
             episode_indices.extend(table.i64_column(&path, "episode_index")?);
@@ -226,6 +323,7 @@ impl StateOnlyDataset {
             metadata,
             delta_indices,
             columns,
+            image_columns,
             timestamps,
             frame_indices,
             episode_indices,
@@ -242,6 +340,14 @@ impl StateOnlyDataset {
             if values.len() != rows {
                 return Err(TrainError::Metadata(format!(
                     "feature {key:?} has {} rows but timestamp has {rows}",
+                    values.len()
+                )));
+            }
+        }
+        for (key, values) in &self.image_columns {
+            if values.len() != rows {
+                return Err(TrainError::Metadata(format!(
+                    "image feature {key:?} has {} rows but timestamp has {rows}",
                     values.len()
                 )));
             }
@@ -402,6 +508,22 @@ impl StateOnlyDataset {
                 ))
             })?
             .to_owned();
+        let images = self
+            .image_columns
+            .iter()
+            .map(|(key, values)| {
+                values
+                    .get(index)
+                    .cloned()
+                    .map(|image| (key.clone(), image))
+                    .ok_or_else(|| {
+                        TrainError::Metadata(format!(
+                            "embedded image feature {key:?} reached row {index}, past the {} rows read",
+                            values.len()
+                        ))
+                    })
+            })
+            .collect::<Result<IndexMap<_, _>>>()?;
 
         Ok(Frame {
             index: absolute,
@@ -411,6 +533,7 @@ impl StateOnlyDataset {
             task_index,
             task,
             windows,
+            images,
             padding,
         })
     }
@@ -438,6 +561,67 @@ impl StateOnlyDataset {
     pub fn has_action_window(&self) -> bool {
         self.delta_indices.contains_key(ACTION)
     }
+}
+
+/// The `(channels, height, width)` one embedded camera frame must decode to.
+///
+/// Derived from `info.json` rather than from the file, and bounded here, because it is
+/// what every later allocation is sized from: the per-frame decode budget, the
+/// reservation in [`crate::data::image::DecodedImage::from_encoded`], and the check
+/// that a decoded cell is the frame the dataset says it is.
+fn image_shape(key: &str, spec: &crate::data::meta::FeatureSpec) -> Result<(usize, usize, usize)> {
+    use crate::data::image::CAMERA_CHANNELS;
+
+    if spec.dtype != "image" {
+        return Err(TrainError::Metadata(format!(
+            "feature {key:?} is not an image"
+        )));
+    }
+    if spec.shape.len() != 3 {
+        return Err(TrainError::Metadata(format!(
+            "image feature {key:?} declares shape {:?}; an embedded camera is \
+             [channels, height, width]",
+            spec.shape
+        )));
+    }
+    let mut dimensions = [0usize; 3];
+    for (index, dimension) in spec.shape.iter().enumerate() {
+        dimensions[index] = usize::try_from(*dimension).map_err(|_| {
+            TrainError::Metadata(format!(
+                "image feature {key:?} has a dimension {dimension} that is not a valid extent"
+            ))
+        })?;
+        if dimensions[index] == 0 {
+            return Err(TrainError::Metadata(format!(
+                "image feature {key:?} declares shape {:?}, which is empty; a frame with no \
+                 pixels cannot be batched",
+                spec.shape
+            )));
+        }
+    }
+    if dimensions[0] != CAMERA_CHANNELS {
+        return Err(TrainError::unsupported(format!(
+            "image feature {key:?} declares {} channels; an embedded camera decodes as RGB \
+             with {CAMERA_CHANNELS}, and nothing reshapes a frame to fit a different count",
+            dimensions[0]
+        )));
+    }
+    crate::limits::within(
+        dimensions[1],
+        &format!("the height of image feature {key:?}"),
+        crate::limits::MAX_IMAGE_EXTENT,
+    )?;
+    crate::limits::within(
+        dimensions[2],
+        &format!("the width of image feature {key:?}"),
+        crate::limits::MAX_IMAGE_EXTENT,
+    )?;
+    crate::limits::within(
+        crate::limits::checked_product(&dimensions, &format!("the size of image feature {key:?}"))?,
+        &format!("the size of image feature {key:?}"),
+        crate::limits::MAX_FEATURE_WIDTH,
+    )?;
+    Ok((dimensions[0], dimensions[1], dimensions[2]))
 }
 
 /// Columns `info.json` declares as features but that are per-frame scalars rather

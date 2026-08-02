@@ -290,11 +290,87 @@ pub fn collate(frames: &[Frame], device: &Device) -> Result<Batch> {
 
     Ok(Batch {
         features,
-        // The collator reads flat parquet rows, which cannot hold a camera; a batch
-        // gets its cameras from `Batch::with_images`.
+        // Cameras are attached separately, by `Batch::with_images`, which is the one
+        // place the contract in `crate::data::image` is enforced and the per-channel
+        // statistics are applied. `collate_images` produces what it takes.
         images: IndexMap::new(),
         padding,
         tasks: frames.iter().map(|frame| frame.task.clone()).collect(),
         indices: frames.iter().map(|frame| frame.index).collect(),
     })
+}
+
+/// Stack the frames' decoded embedded cameras into `[batch, channels, height, width]`
+/// tensors, one per camera key.
+///
+/// The counterpart of [`collate`] for [`crate::data::dataset::Frame::images`]. What it
+/// returns is what [`Batch::with_images`] takes, deliberately: the range check, the
+/// camera count bound and the normalization all live there, and going through it is
+/// what keeps a dataset-decoded camera and a caller-supplied one the same computation.
+///
+/// The map is empty for a dataset with no embedded camera, which is the state-only
+/// case, and `with_images` on an empty map is a no-op.
+///
+/// # Errors
+///
+/// When `frames` is empty, when two frames disagree about which cameras they carry or
+/// about a camera's extent, or when the stacked size is past [`crate::limits`].
+pub fn collate_images(frames: &[Frame], device: &Device) -> Result<IndexMap<String, Tensor>> {
+    let Some(first) = frames.first() else {
+        return Err(TrainError::Metadata(
+            "cannot collate an empty batch".to_owned(),
+        ));
+    };
+    crate::limits::within(
+        first.images.len(),
+        "the number of cameras",
+        crate::limits::MAX_CAMERAS,
+    )?;
+
+    let mut out = IndexMap::with_capacity(first.images.len());
+    for (key, first_image) in &first.images {
+        let extent = (first_image.channels, first_image.height, first_image.width);
+        let per_frame = crate::limits::checked_product(
+            &[extent.0, extent.1, extent.2],
+            &format!("the size of one frame of camera {key:?}"),
+        )?;
+        let reservation = crate::limits::checked_mul(
+            per_frame,
+            frames.len(),
+            &format!("the collated size of camera {key:?}"),
+        )?;
+        crate::limits::within(
+            reservation,
+            &format!("the collated size of camera {key:?}"),
+            crate::limits::MAX_DECODED_VALUES,
+        )?;
+        let mut values = Vec::with_capacity(reservation);
+        for frame in frames {
+            let image = frame.images.get(key).ok_or_else(|| {
+                TrainError::Metadata(format!("frame {} has no camera {key:?}", frame.index))
+            })?;
+            // A ragged batch is the failure this prevents: `Tensor::from_vec` would
+            // accept the flat buffer against the first frame's shape and silently
+            // reinterpret every later frame's pixels.
+            if (image.channels, image.height, image.width) != extent {
+                return Err(TrainError::Metadata(format!(
+                    "frame {} carries camera {key:?} as {}x{}x{} but the batch expects \
+                     {}x{}x{}",
+                    frame.index,
+                    image.channels,
+                    image.height,
+                    image.width,
+                    extent.0,
+                    extent.1,
+                    extent.2
+                )));
+            }
+            values.extend_from_slice(&image.pixels);
+        }
+        out.insert(
+            key.clone(),
+            Tensor::from_vec(values, (frames.len(), extent.0, extent.1, extent.2), device)?,
+        );
+    }
+    Ok(out)
 }

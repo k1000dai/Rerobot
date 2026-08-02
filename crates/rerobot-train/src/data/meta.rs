@@ -4,18 +4,18 @@
 //!
 //! Upstream is `LeRobotDatasetMetadata` (`lerobot/datasets/lerobot_dataset.py`)
 //! plus `datasets/io_utils.py`'s four loaders, and it can also reach the Hub. This
-//! port is local-directory only, and it is state-only: a dataset declaring an
-//! `image`/`video` feature is refused rather than half-read.
+//! port is local-directory only. Embedded `image` columns in LeRobot v3.0 parquet
+//! are decoded natively; `video` features are refused rather than half-read.
 
 use crate::data::parquet::Table;
 use crate::error::{Result, TrainError};
 use indexmap::IndexMap;
 use num_bigint::BigInt;
 use rerobot_core::dataset::info::DatasetInfo;
-use rerobot_core::dataset::io::load_info;
+use rerobot_core::dataset::io::{load_info, load_json};
 use rerobot_core::dataset::json::JsonLike;
-use rerobot_core::dataset::stats::{load_stats, DatasetStats};
-use rerobot_core::dataset::{DATA_DIR, DEFAULT_TASKS_PATH, EPISODES_DIR};
+use rerobot_core::dataset::stats::{stats_from_value, DatasetStats};
+use rerobot_core::dataset::{DATA_DIR, DEFAULT_TASKS_PATH, EPISODES_DIR, STATS_PATH};
 use rerobot_core::types::{FeatureType, PolicyFeature};
 use std::path::{Path, PathBuf};
 
@@ -143,6 +143,32 @@ impl Default for MetadataBudget {
     }
 }
 
+/// Load scalar statistics while ignoring the nested image statistics emitted by
+/// LeRobot v3.0. Image normalization is selected explicitly by
+/// `dataset.use_imagenet_stats`; the nested `[channels, 1, 1]` image statistics are
+/// not valid inputs to the scalar normalizer and must not make an otherwise valid
+/// image dataset unreadable.
+fn load_stats_for_features(
+    root: &Path,
+    features: &IndexMap<String, FeatureSpec>,
+) -> Result<DatasetStats> {
+    let path = root.join(STATS_PATH);
+    if !path.exists() {
+        return Ok(DatasetStats::default());
+    }
+    let mut document = load_json(&path).map_err(|error| {
+        TrainError::Metadata(format!("cannot read {}: {error}", path.display()))
+    })?;
+    if let JsonLike::Object(values) = &mut document {
+        values.retain(|feature, _| {
+            !features
+                .get(feature)
+                .is_some_and(|spec| spec.dtype == "image")
+        });
+    }
+    stats_from_value(&document)
+        .map_err(|error| TrainError::Metadata(format!("cannot read {}: {error}", path.display())))
+}
 /// Everything under `meta/`, typed.
 #[derive(Debug, Clone)]
 pub struct DatasetMetadata {
@@ -175,14 +201,14 @@ impl DatasetMetadata {
         }
         let info = load_info(root).map_err(|error| TrainError::Metadata(error.to_string()))?;
         let features = parse_features(&info)?;
-        refuse_visual_features(&features)?;
+        refuse_video_features(&features)?;
         // Every declared width bounded up front, so the name of the offending feature
         // is in the message rather than only the number.
         for (key, spec) in &features {
             spec.width()
                 .map_err(|error| TrainError::Metadata(format!("feature {key:?}: {error}")))?;
         }
-        let stats = load_stats(root)?.unwrap_or_default();
+        let stats = load_stats_for_features(root, &features)?;
         let tasks = load_tasks(root)?;
         let episodes = load_episodes(root, budget)?;
         let metadata = Self {
@@ -550,31 +576,26 @@ fn parse_features(info: &DatasetInfo) -> Result<IndexMap<String, FeatureSpec>> {
     Ok(out)
 }
 
-fn refuse_visual_features(features: &IndexMap<String, FeatureSpec>) -> Result<()> {
+fn refuse_video_features(features: &IndexMap<String, FeatureSpec>) -> Result<()> {
     let visual: Vec<&str> = features
         .iter()
-        .filter(|(_, spec)| spec.dtype == "image" || spec.dtype == "video")
+        .filter(|(_, spec)| spec.dtype == "video")
         .map(|(key, _)| key.as_str())
         .collect();
     if visual.is_empty() {
         return Ok(());
     }
-    // Named per feature *with its dtype*, because the two on-disk forms fail for
-    // different reasons and a user reading this needs to know which one they have.
     let named: Vec<String> = features
         .iter()
-        .filter(|(_, spec)| spec.dtype == "image" || spec.dtype == "video")
+        .filter(|(_, spec)| spec.dtype == "video")
         .map(|(key, spec)| format!("{key} (dtype {:?})", spec.dtype))
         .collect();
     Err(TrainError::unsupported(format!(
-        "dataset declares camera features ({}), and this reader is state-only: a \"video\" \
-         feature is stored as an MP4 shard under videos/, which needs an AV1 or H.264 decoder, \
-         and an \"image\" feature is stored as PNG or JPEG files under images/, which needs an \
-         image codec. Neither codec is ported, so the feature is refused rather than dropped \
-         from a dataset that has it. The ACT camera path itself *is* ported and trains on \
-         camera tensors supplied in memory: f32 of shape [batch, channels, height, width] with \
-         every element in [0, 1], attached with Batch::with_images and stepped through \
-         TrainSession::step_on",
+        "dataset declares video camera features ({}), and video shards are MP4 files \
+         needing an AV1 or H.264 decoder. Video is not supported by this Rust-native \
+         reader. LeRobot v3 image features are supported when their parquet column is \
+         struct<bytes: binary, path: string> containing PNG or JPEG bytes; ACT consumes \
+         their decoded RGB tensors through Batch::with_images and TrainSession::step_on",
         named.join(", ")
     )))
 }

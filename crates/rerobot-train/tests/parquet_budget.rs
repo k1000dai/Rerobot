@@ -39,6 +39,7 @@ fn generous() -> ReadBudget {
         max_list_elements: usize::MAX,
         max_cells: usize::MAX,
         max_decoded_bytes: usize::MAX,
+        max_image_bytes: usize::MAX,
     }
 }
 

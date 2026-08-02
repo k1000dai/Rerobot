@@ -161,9 +161,9 @@ fn load_stats_for_features(
     })?;
     if let JsonLike::Object(values) = &mut document {
         values.retain(|feature, _| {
-            !features
+            features
                 .get(feature)
-                .is_some_and(|spec| spec.dtype == "image")
+                .is_none_or(|spec| spec.dtype != "image")
         });
     }
     stats_from_value(&document)

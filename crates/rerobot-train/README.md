@@ -52,10 +52,13 @@ Two properties hold on purpose:
   because serialization reads the bytes back to host memory.
 
 **Validation status.** The CUDA path is implemented and covered by
-`tests/device_smoke.rs`, which is compiled only under `--features cuda`. It has
-not yet been executed on real NVIDIA hardware from this repository, so treat GPU
-support as *available but not hardware-validated*. The CPU path is validated by
-CI on Linux, macOS and Windows, and element by element against upstream PyTorch.
+`tests/device_smoke.rs`, which is compiled only under `--features cuda`. Those
+tests have been run on real NVIDIA hardware — an RTX 5080 Laptop (sm_120) on CUDA
+12.8 — and so has a 10 000-step ACT training run on a LIBERO dataset whose
+checkpoint upstream `lerobot` then loaded and evaluated in simulation; see
+`docs/red-green.md`, cycle 13. CI still has no GPU, so the CUDA path is not
+covered by any automated gate. The CPU path is validated by CI on Linux, macOS and
+Windows, and element by element against upstream PyTorch.
 
 ## What is deliberately out of scope
 

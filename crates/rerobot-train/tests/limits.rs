@@ -491,6 +491,7 @@ fn collating_a_batch_uses_checked_arithmetic_for_its_reservation() {
         task_index: 0,
         task: "t".to_owned(),
         windows,
+        images: rerobot_train::indexmap::IndexMap::new(),
         padding: rerobot_train::indexmap::IndexMap::new(),
     };
 
@@ -537,6 +538,7 @@ fn a_batch_larger_than_the_budget_is_refused_by_collate_itself() {
         task_index: 0,
         task: "t".to_owned(),
         windows,
+        images: rerobot_train::indexmap::IndexMap::new(),
         padding: rerobot_train::indexmap::IndexMap::new(),
     };
     let frames = vec![frame; limits::MAX_BATCH_SIZE + 1];
@@ -1219,6 +1221,7 @@ fn collate_refuses_a_zero_width_window_instead_of_building_an_unusable_batch() {
         task_index: 0,
         task: "reach the target".to_owned(),
         windows,
+        images: IndexMap::new(),
         padding: IndexMap::new(),
     };
     let error = rerobot_train::data::batch::collate(&[frame], &candle_core::Device::Cpu)

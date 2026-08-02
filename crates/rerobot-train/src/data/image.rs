@@ -1,7 +1,7 @@
 //! The camera-image contract: what a camera tensor must be, and the per-channel
 //! normalization applied to it on the way into a [`crate::data::batch::Batch`].
 //!
-//! # The one supported input form
+//! # The in-memory input form
 //!
 //! A camera arrives as a **candle tensor already in memory**:
 //!
@@ -17,25 +17,232 @@
 //!   the `uint8` frame has been divided by 255, and the range
 //!   `dataset.return_uint8 = false` promises.
 //!
-//! # What is *not* supported, and why it is an error rather than a gap
+//! # The other supported input form: an embedded `image` column
 //!
-//! Neither on-disk camera form of a LeRobot v3.0 dataset can be read here:
+//! A LeRobot v3.0 dataset whose `info.json` declares `dtype: "image"` stores one
+//! encoded frame per row *inside* the parquet file, as
+//! `struct<bytes: binary, path: string>`. [`crate::data::image::DecodedImage::from_encoded`] decodes those
+//! bytes natively — PNG and JPEG, through the `image` crate with exactly those two
+//! codecs compiled in — and produces the same `[0, 1]` CHW `f32` values the in-memory
+//! contract above describes. Nothing shells out: no Python, no PIL, no ffmpeg.
+//!
+//! Every decode is bounded before it starts. The encoded cell is capped at
+//! [`crate::limits::MAX_EMBEDDED_IMAGE_BYTES`], the format must be one of the two
+//! compiled in, the decoded extent is checked against the shape `info.json` declares
+//! *before* any pixel buffer is allocated, and the decoder is additionally given the
+//! same limits of its own. A cell that disagrees with `info.json` about its size is an
+//! error rather than a silently resized frame.
+//!
+//! # What is *not* supported, and why it is an error rather than a gap
 //!
 //! * `dtype: "video"` features live in `videos/<key>/chunk-XXX/file-XXX.mp4`. Reading
 //!   one frame means an AV1 or H.264 decoder; upstream shells out to `torchcodec` or
 //!   `pyav`, and neither has a pure-Rust equivalent in this workspace.
-//! * `dtype: "image"` features live as PNG or JPEG files under
-//!   `images/<key>/episode-XXXXXX/`, which needs an image codec that is likewise not
-//!   ported.
-//!
-//! [`crate::data::meta::DatasetMetadata::load`] refuses a dataset declaring either,
-//! naming the feature and both formats. It does not drop the feature and read the
-//! rest: a policy trained on a silently state-only view of a dataset that has
-//! cameras is not the policy that was asked for.
+//!   [`crate::data::meta::DatasetMetadata::load`] refuses a dataset declaring one,
+//!   naming the feature. It does not drop the feature and read the rest: a policy
+//!   trained on a silently state-only view of a dataset that has cameras is not the
+//!   policy that was asked for.
+//! * Any encoded format other than PNG and JPEG. The codec set is deliberately narrow
+//!   and is named in the error, so a dataset carrying WebP says so rather than
+//!   producing an opaque decoder failure.
 
 use crate::error::{Result, TrainError};
-use candle_core::{DType, Tensor};
+use candle_core::{DType, Device, Tensor};
 use rerobot_core::policy::normalize::NORMALIZATION_EPS;
+use std::io::Cursor;
+// Qualified at every use site as `::image::` too, because this module is itself
+// named `image`; the import is what brings the decoder trait's methods into scope.
+use ::image::ImageDecoder as _;
+
+/// The encoded formats an embedded camera cell may carry.
+///
+/// The `image` dependency is compiled with exactly these two codecs, so this constant
+/// and the manifest's feature list are the same fact stated twice; `tests/image.rs`
+/// asserts a third format is refused by name rather than by decoder failure.
+pub const SUPPORTED_IMAGE_FORMATS: [&str; 2] = ["PNG", "JPEG"];
+
+/// A decoded LeRobot v3.0 embedded camera frame, in RGB channel-first layout.
+///
+/// `pixels` holds `channels * height * width` values in CHW order, each the encoded
+/// sample divided by 255 — the same `[0, 1]` range `torchvision`'s decoder produces
+/// and the range the rest of this module's contract requires. The `path` field that
+/// travels beside the bytes in the parquet struct is kept as provenance; the encoded
+/// bytes are not retained after the decode.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedImage {
+    /// The `path` field carried beside the embedded bytes, when the cell has one.
+    pub path: Option<String>,
+    /// Channels. Always three: an embedded ACT camera decodes as RGB.
+    pub channels: usize,
+    /// Height in pixels.
+    pub height: usize,
+    /// Width in pixels.
+    pub width: usize,
+    /// RGB pixels in CHW order, each in `[0, 1]`.
+    pub pixels: Vec<f32>,
+}
+
+impl DecodedImage {
+    /// Decode one embedded cell, against the shape `info.json` declared for it.
+    ///
+    /// `declared_shape` is `(channels, height, width)`, already validated to be a
+    /// three-channel shape inside [`crate::limits`] by the dataset reader. It is
+    /// checked against the encoded header *before* the pixel buffer is allocated, so a
+    /// cell that does not match costs one header parse rather than a full decode.
+    ///
+    /// # Errors
+    ///
+    /// [`TrainError::Metadata`] naming `key` and which contract was broken: an empty
+    /// or oversized cell, an unidentifiable or unsupported format, an extent past
+    /// [`crate::limits::MAX_IMAGE_EXTENT`], a decoded size past
+    /// [`crate::limits::MAX_FEATURE_WIDTH`], a shape disagreeing with `info.json`, or
+    /// a decoder failure on truncated or corrupt bytes.
+    pub fn from_encoded(
+        key: &str,
+        bytes: &[u8],
+        path: Option<String>,
+        declared_shape: (usize, usize, usize),
+    ) -> Result<Self> {
+        // Both ends first, and before a decoder exists: an empty cell has no header to
+        // parse, and an oversized one must not reach a decoder at all.
+        if bytes.is_empty() {
+            return Err(TrainError::Metadata(format!(
+                "embedded image {key:?} has no encoded bytes"
+            )));
+        }
+        if bytes.len() > crate::limits::MAX_EMBEDDED_IMAGE_BYTES {
+            return Err(TrainError::Metadata(format!(
+                "embedded image {key:?} carries {} encoded bytes, above the {} the reader will \
+                 hand to an image decoder",
+                bytes.len(),
+                crate::limits::MAX_EMBEDDED_IMAGE_BYTES
+            )));
+        }
+
+        let reader = ::image::ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .map_err(|error| {
+                TrainError::Metadata(format!("embedded image {key:?} could not be read: {error}"))
+            })?;
+        // The format allow-list is checked by name rather than left to the decoder.
+        // `image` is compiled with two codecs, so a WebP cell would otherwise fail as
+        // "unsupported by this build", which reads like a build fault rather than the
+        // deliberate boundary it is.
+        match reader.format() {
+            Some(::image::ImageFormat::Png | ::image::ImageFormat::Jpeg) => {}
+            Some(other) => {
+                return Err(TrainError::unsupported(format!(
+                    "embedded image {key:?} is {other:?}; this reader decodes {} only",
+                    SUPPORTED_IMAGE_FORMATS.join(" and ")
+                )))
+            }
+            None => {
+                return Err(TrainError::Metadata(format!(
+                    "embedded image {key:?} does not begin with a {} header",
+                    SUPPORTED_IMAGE_FORMATS.join(" or ")
+                )))
+            }
+        }
+        let mut decoder = reader.into_decoder().map_err(|error| {
+            TrainError::Metadata(format!(
+                "embedded image {key:?} could not be decoded as {}: {error}",
+                SUPPORTED_IMAGE_FORMATS.join(" or ")
+            ))
+        })?;
+
+        let (width, height) = decoder.dimensions();
+        let width = usize::try_from(width).map_err(|_| {
+            TrainError::Metadata(format!("embedded image {key:?} has a width past usize"))
+        })?;
+        let height = usize::try_from(height).map_err(|_| {
+            TrainError::Metadata(format!("embedded image {key:?} has a height past usize"))
+        })?;
+        for (name, value) in [("height", height), ("width", width)] {
+            crate::limits::within(
+                value,
+                &format!("the {name} of embedded image {key:?}"),
+                crate::limits::MAX_IMAGE_EXTENT,
+            )?;
+        }
+        let pixels = crate::limits::checked_product(
+            &[CAMERA_CHANNELS, height, width],
+            &format!("the decoded size of embedded image {key:?}"),
+        )?;
+        crate::limits::within(
+            pixels,
+            &format!("the decoded size of embedded image {key:?}"),
+            crate::limits::MAX_FEATURE_WIDTH,
+        )?;
+        if (CAMERA_CHANNELS, height, width) != declared_shape {
+            let (declared_channels, declared_height, declared_width) = declared_shape;
+            return Err(TrainError::Metadata(format!(
+                "embedded image {key:?} decodes as [{CAMERA_CHANNELS}, {height}, {width}] but \
+                 info.json declares [{declared_channels}, {declared_height}, {declared_width}]; \
+                 the frame is not resized to fit a declaration it contradicts"
+            )));
+        }
+
+        // The decoder's own budget, on top of the checks above, because a malformed
+        // header can declare one size and the stream then demand another.
+        let mut limits = ::image::Limits::no_limits();
+        let extent = u32::try_from(crate::limits::MAX_IMAGE_EXTENT).unwrap_or(u32::MAX);
+        limits.max_image_width = Some(extent);
+        limits.max_image_height = Some(extent);
+        limits.max_alloc = Some(crate::limits::MAX_EMBEDDED_IMAGE_BYTES as u64);
+        decoder.set_limits(limits).map_err(|error| {
+            TrainError::Metadata(format!(
+                "embedded image {key:?} is past the decoder's allocation budget: {error}"
+            ))
+        })?;
+        let decoded = ::image::DynamicImage::from_decoder(decoder).map_err(|error| {
+            TrainError::Metadata(format!(
+                "embedded image {key:?} could not be decoded as {}: {error}",
+                SUPPORTED_IMAGE_FORMATS.join(" or ")
+            ))
+        })?;
+
+        // `into_rgb8` is `PIL.Image.convert("RGB")`: a greyscale or palette frame
+        // becomes three channels, and a 16-bit one is narrowed to 8. The declared
+        // shape is three-channel either way, so the conversion is what makes the
+        // dataset's own declaration true rather than an assumption about the file.
+        let rgb = decoded.into_rgb8();
+        let interleaved = rgb.as_raw();
+        let plane = height * width;
+        let mut chw = vec![0.0f32; pixels];
+        for channel in 0..CAMERA_CHANNELS {
+            for offset in 0..plane {
+                chw[channel * plane + offset] =
+                    f32::from(interleaved[offset * CAMERA_CHANNELS + channel]) / 255.0;
+            }
+        }
+        Ok(Self {
+            path,
+            channels: CAMERA_CHANNELS,
+            height,
+            width,
+            pixels: chw,
+        })
+    }
+
+    /// The `[channels, height, width]` tensor of this frame, on `device`.
+    ///
+    /// One frame, not a batch: [`crate::data::batch::collate`] stacks these into the
+    /// `[batch, channels, height, width]` tensor [`crate::data::batch::Batch::with_images`]
+    /// takes.
+    pub fn tensor(&self, device: &Device) -> Result<Tensor> {
+        Ok(Tensor::from_vec(
+            self.pixels.clone(),
+            (self.channels, self.height, self.width),
+            device,
+        )?)
+    }
+}
+
+/// Channels an embedded camera frame decodes to.
+///
+/// Three, because torchvision's ResNet stem convolves three input planes and nothing
+/// in this slice reshapes a frame to fit a different count.
+pub const CAMERA_CHANNELS: usize = 3;
 
 /// `IMAGENET_STATS["mean"]`, the per-channel mean `LeRobotDataset` attaches to every
 /// camera feature when `dataset.use_imagenet_stats` is true — which is its default,

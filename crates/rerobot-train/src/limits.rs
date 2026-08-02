@@ -64,6 +64,16 @@ pub const MAX_FEATURE_WIDTH: usize = 1 << 22;
 /// is still a shape no backbone can pool.
 pub const MAX_IMAGE_EXTENT: usize = 8_192;
 
+/// Compressed bytes one embedded camera cell may carry.
+///
+/// A LeRobot v3.0 `image` column stores one PNG or JPEG per frame inside the
+/// parquet file. The file-level budget bounds the file, and it does not bound the
+/// cell: a single 2 GiB binary value is inside [`MAX_PARQUET_FILE_BYTES`] and would
+/// still be handed whole to an image decoder. 16 MiB is roughly twenty times a
+/// 640×480 PNG and four times the largest buffer [`MAX_FEATURE_WIDTH`] permits a
+/// decode to produce, so a real frame fits and a decompression bomb does not.
+pub const MAX_EMBEDDED_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+
 /// Cameras one policy may consume.
 ///
 /// Every camera adds a full ResNet evaluation to each forward pass and `h * w` tokens

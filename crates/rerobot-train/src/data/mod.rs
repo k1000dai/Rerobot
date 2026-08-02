@@ -1,4 +1,5 @@
-//! Reading a state-only LeRobot v3.0 dataset from a local directory.
+//! Reading a local LeRobot v3.0 dataset from a local directory, including embedded
+//! PNG/JPEG camera columns.
 //!
 //! Layered deliberately: [`parquet`] knows arrow types and nothing about
 //! LeRobot, [`meta`] knows `meta/` and nothing about tensors, [`dataset`] knows

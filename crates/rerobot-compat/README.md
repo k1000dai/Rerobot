@@ -28,7 +28,8 @@ let runnable: Vec<&str> = ENTRY_POINTS
     .collect();
 assert_eq!(runnable, vec!["lerobot-train", "lerobot-info"]);
 
-// `lerobot-train` runs one vertical slice: ACT, a state-only local dataset, CPU.
+// `lerobot-train` runs one vertical slice: ACT, a local dataset (including embedded
+// PNG/JPEG camera columns), CPU.
 let train = entry_point("lerobot-train").unwrap();
 assert_eq!(train.status, Status::Partial);
 assert_eq!(train.target, "lerobot.scripts.lerobot_train:main");

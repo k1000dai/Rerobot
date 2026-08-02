@@ -1,4 +1,4 @@
-//! The narrow parquet reader the state-only dataset slice needs.
+//! The narrow parquet reader the local dataset slice needs.
 //!
 //! Upstream reaches a parquet file through `datasets.load_dataset` and pandas,
 //! which will coerce almost anything into almost anything. This reader does the
@@ -15,6 +15,7 @@
 //! | `frame_index`, `episode_index`, `index`, `task_index`, `length`, `dataset_*_index` | `Int64` or `Int32` | `datasets.Value("int64")` |
 //! | `task` | `Utf8` or `LargeUtf8` | pandas' string index |
 //! | `tasks` | `List<Utf8>` or `LargeList<Utf8>` | `datasets.Sequence(Value("string"))` |
+//! | `observation.images.*` | `Struct<bytes: Binary, path: Utf8>` | `datasets.Image()` |
 //!
 //! `List<Float32>` is accepted alongside `FixedSizeList` because a dataset
 //! converted from v2.1 carries the variable-length spelling of the same data; the
@@ -76,6 +77,12 @@ pub struct ReadBudget {
     /// Cells do not bound bytes either: one cell of a wide list column costs far more
     /// than one cell of an `int64`.
     pub max_decoded_bytes: usize,
+    /// Compressed bytes one embedded camera cell may carry.
+    ///
+    /// Per *cell*, not per column: an image column inside every other bound can still
+    /// hold one binary value large enough to be a decompression bomb on its own, and
+    /// the decoder is where that would be paid for.
+    pub max_image_bytes: usize,
 }
 
 impl Default for ReadBudget {
@@ -89,6 +96,7 @@ impl Default for ReadBudget {
             max_list_elements: crate::limits::MAX_LIST_ELEMENTS,
             max_cells: crate::limits::MAX_PARQUET_CELLS,
             max_decoded_bytes: crate::limits::MAX_DECODED_BYTES,
+            max_image_bytes: crate::limits::MAX_EMBEDDED_IMAGE_BYTES,
         }
     }
 }
@@ -415,6 +423,109 @@ impl Table {
                 }
                 out.push((start..start + length).map(|i| scalars.value(i)).collect());
             }
+        }
+        Ok(out)
+    }
+
+    /// Embedded LeRobot v3.0 camera cells, as `(encoded_bytes, path)` per row.
+    ///
+    /// The accepted Arrow spelling is exactly `struct<bytes: binary, path: string>`,
+    /// which is what a `datasets.Image()` feature writes. Anything else is refused by
+    /// name rather than coerced, on the same principle as every other column here.
+    ///
+    /// Every cell is bounded before it is copied — per cell against
+    /// [`ReadBudget::max_image_bytes`] and cumulatively against
+    /// [`ReadBudget::max_decoded_bytes`] — because a binary column is the one place
+    /// where a row count says nothing about the cost of reading it. Decoding, the
+    /// format allow-list and the shape check all happen afterwards, in
+    /// [`crate::data::image::DecodedImage::from_encoded`].
+    ///
+    /// # Errors
+    ///
+    /// [`TrainError::Column`] naming the file, the column and the row: a wrong Arrow
+    /// type, a null cell or null `bytes` field, or a cell or column past its budget.
+    pub fn image_column(&self, path: &Path, name: &str) -> Result<Vec<(Vec<u8>, Option<String>)>> {
+        let mut out = Vec::with_capacity(self.rows);
+        let mut encoded_bytes = 0usize;
+        let mut row_offset = 0usize;
+        for column in self.columns(path, name)? {
+            let structure = column
+                .as_any()
+                .downcast_ref::<arrow_array::StructArray>()
+                .ok_or_else(|| {
+                    TrainError::column(
+                        path,
+                        format!(
+                            "column {name:?} must be struct<bytes: binary, path: string>, found {}",
+                            column.data_type()
+                        ),
+                    )
+                })?;
+            let fields = structure.fields();
+            let has_expected_fields = fields.len() == 2
+                && fields
+                    .iter()
+                    .any(|field| field.name() == "bytes" && field.data_type() == &DataType::Binary)
+                && fields
+                    .iter()
+                    .any(|field| field.name() == "path" && field.data_type() == &DataType::Utf8);
+            if !has_expected_fields {
+                return Err(TrainError::column(
+                    path,
+                    format!(
+                        "column {name:?} must be struct<bytes: binary, path: string>, found {}",
+                        column.data_type()
+                    ),
+                ));
+            }
+            let bytes = structure
+                .column_by_name("bytes")
+                .expect("the struct field was checked above")
+                .as_binary::<i32>();
+            let paths = structure
+                .column_by_name("path")
+                .expect("the struct field was checked above")
+                .as_string::<i32>();
+            for row in 0..column.len() {
+                nonnull(path, name, row_offset + row, column.is_null(row))?;
+                nonnull(path, name, row_offset + row, bytes.is_null(row))?;
+                let encoded = bytes.value(row);
+                if encoded.len() > self.budget.max_image_bytes {
+                    return Err(TrainError::column(
+                        path,
+                        format!(
+                            "column {name:?} row {} carries {} encoded bytes, above the {} the \
+                             reader will hand to an image decoder",
+                            row_offset + row,
+                            encoded.len(),
+                            self.budget.max_image_bytes
+                        ),
+                    ));
+                }
+                encoded_bytes = crate::limits::checked_add(
+                    encoded_bytes,
+                    encoded.len(),
+                    &format!("the encoded size of image column {name:?}"),
+                )?;
+                if encoded_bytes > self.budget.max_decoded_bytes {
+                    return Err(TrainError::column(
+                        path,
+                        format!(
+                            "column {name:?} holds {encoded_bytes} encoded bytes, above the {} \
+                             the reader will materialize",
+                            self.budget.max_decoded_bytes
+                        ),
+                    ));
+                }
+                let optional_path = if paths.is_null(row) {
+                    None
+                } else {
+                    Some(paths.value(row).to_owned())
+                };
+                out.push((encoded.to_vec(), optional_path));
+            }
+            row_offset =
+                crate::limits::checked_add(row_offset, column.len(), "the image row count")?;
         }
         Ok(out)
     }

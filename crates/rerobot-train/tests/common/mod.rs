@@ -19,6 +19,16 @@ pub fn fixture_dataset() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/state_only")
 }
 
+/// The committed embedded-camera fixture.
+///
+/// The state-only fixture with one `observation.images.top` column of 32×32 PNGs added
+/// in upstream's `struct<bytes: binary, path: string>` spelling. See
+/// `examples/make_embedded_image_fixture.rs`, which wrote it and records which of its
+/// bytes are upstream's and which are not.
+pub fn embedded_image_fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/embedded_image")
+}
+
 /// A unique directory that deletes itself when the test ends.
 pub struct TempDir(PathBuf);
 
@@ -114,6 +124,217 @@ pub fn copy_fixture_dataset(root: &Path) {
     }
     let _ = std::fs::remove_dir_all(root);
     copy_tree(&fixture_dataset(), root);
+}
+
+/// [`copy_fixture_dataset`] for the embedded-camera fixture.
+pub fn copy_embedded_image_fixture(root: &Path) {
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).expect("cannot create the destination");
+        for entry in std::fs::read_dir(from).expect("cannot read the fixture") {
+            let entry = entry.expect("cannot read a fixture entry");
+            let target = to.join(entry.file_name());
+            if entry.file_type().expect("file type").is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).expect("cannot copy a fixture file");
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(root);
+    copy_tree(&embedded_image_fixture(), root);
+}
+
+// ---------------------------------------------------------------------------
+// Encoding images, and corrupting the camera column of a copied fixture
+// ---------------------------------------------------------------------------
+
+/// The camera key the embedded-image fixture carries.
+pub const CAMERA_KEY: &str = "observation.images.top";
+
+/// A `width`×`height` RGB PNG, encoded here rather than committed.
+pub fn png_of(width: usize, height: usize) -> Vec<u8> {
+    encode(width, height, image::ImageFormat::Png)
+}
+
+/// A `width`×`height` RGB JPEG.
+pub fn jpeg_of(width: usize, height: usize) -> Vec<u8> {
+    encode(width, height, image::ImageFormat::Jpeg)
+}
+
+fn encode(width: usize, height: usize, format: image::ImageFormat) -> Vec<u8> {
+    let mut pixels = Vec::with_capacity(width * height * 3);
+    for y in 0..height {
+        for x in 0..width {
+            pixels.push((x * 8) as u8);
+            pixels.push((y * 8) as u8);
+            pixels.push(0);
+        }
+    }
+    let buffer: image::RgbImage = image::ImageBuffer::from_raw(width as u32, height as u32, pixels)
+        .expect("the pixel buffer matches the extent");
+    let mut encoded = Vec::new();
+    image::DynamicImage::ImageRgb8(buffer)
+        .write_to(&mut std::io::Cursor::new(&mut encoded), format)
+        .expect("the encoder runs");
+    encoded
+}
+
+/// The `Fields` of an embedded camera column.
+fn image_struct_fields() -> arrow_schema::Fields {
+    arrow_schema::Fields::from(vec![
+        arrow_schema::Field::new("bytes", arrow_schema::DataType::Binary, true),
+        arrow_schema::Field::new("path", arrow_schema::DataType::Utf8, true),
+    ])
+}
+
+/// Replace the camera column of a copied fixture's data file, column by column.
+///
+/// `build` receives the row count and returns the replacement column, or `None` to drop
+/// the camera entirely. Every other column, and the schema of every other column, is
+/// the fixture's own.
+fn rewrite_image_column(
+    root: &Path,
+    build: impl FnOnce(usize) -> Option<(arrow_schema::DataType, arrow_array::ArrayRef)>,
+) {
+    use arrow_array::{ArrayRef, RecordBatch};
+    use parquet::arrow::ArrowWriter;
+    use std::sync::Arc;
+
+    let path = root.join("data/chunk-000/file-000.parquet");
+    let existing = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+        std::fs::File::open(&path).expect("the fixture data file opens"),
+    )
+    .expect("it is parquet")
+    .build()
+    .expect("the reader builds")
+    .next()
+    .expect("it has a batch")
+    .expect("the batch decodes");
+
+    let replacement = build(existing.num_rows());
+    let mut fields: Vec<Arc<arrow_schema::Field>> = Vec::new();
+    let mut columns: Vec<ArrayRef> = Vec::new();
+    for (index, field) in existing.schema().fields().iter().enumerate() {
+        if field.name() == CAMERA_KEY {
+            if let Some((data_type, array)) = &replacement {
+                fields.push(Arc::new(arrow_schema::Field::new(
+                    CAMERA_KEY,
+                    data_type.clone(),
+                    true,
+                )));
+                columns.push(Arc::clone(array));
+            }
+            continue;
+        }
+        fields.push(Arc::clone(field));
+        columns.push(Arc::clone(existing.column(index)));
+    }
+
+    let schema = Arc::new(arrow_schema::Schema::new(arrow_schema::Fields::from(
+        fields,
+    )));
+    let batch =
+        RecordBatch::try_new(Arc::clone(&schema), columns).expect("the frame batch is well formed");
+    let file = std::fs::File::create(&path).expect("cannot create the data file");
+    let mut writer = ArrowWriter::try_new(file, schema, None).expect("cannot open the writer");
+    writer.write(&batch).expect("cannot write the frames");
+    writer.close().expect("cannot close the writer");
+}
+
+/// Replace every camera cell's bytes, keeping the column's arrow type.
+pub fn rewrite_image_cells(root: &Path, cells: &[Vec<u8>]) {
+    use arrow_array::{ArrayRef, BinaryArray, StringArray, StructArray};
+    use std::sync::Arc;
+
+    let cells = cells.to_vec();
+    rewrite_image_column(root, move |rows| {
+        assert_eq!(cells.len(), rows, "one replacement cell per frame");
+        let bytes = Arc::new(BinaryArray::from(
+            cells
+                .iter()
+                .map(|cell| Some(cell.as_slice()))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef;
+        let paths = Arc::new(StringArray::from(vec![Some("frame.png"); rows])) as ArrayRef;
+        let fields = image_struct_fields();
+        Some((
+            arrow_schema::DataType::Struct(fields.clone()),
+            Arc::new(StructArray::new(fields, vec![bytes, paths], None)) as ArrayRef,
+        ))
+    });
+}
+
+/// Null the `bytes` field of one row, keeping every other row intact.
+pub fn rewrite_image_cells_with_nulls(root: &Path, null_row: usize) {
+    use arrow_array::{ArrayRef, BinaryArray, StringArray, StructArray};
+    use std::sync::Arc;
+
+    let png = png_of(32, 32);
+    rewrite_image_column(root, move |rows| {
+        let bytes = Arc::new(BinaryArray::from(
+            (0..rows)
+                .map(|row| {
+                    if row == null_row {
+                        None
+                    } else {
+                        Some(png.as_slice())
+                    }
+                })
+                .collect::<Vec<_>>(),
+        )) as ArrayRef;
+        let paths = Arc::new(StringArray::from(vec![Some("frame.png"); rows])) as ArrayRef;
+        let fields = image_struct_fields();
+        Some((
+            arrow_schema::DataType::Struct(fields.clone()),
+            Arc::new(StructArray::new(fields, vec![bytes, paths], None)) as ArrayRef,
+        ))
+    });
+}
+
+/// Remove the camera column while leaving `info.json` declaring it.
+pub fn drop_image_column(root: &Path) {
+    rewrite_image_column(root, |_| None);
+}
+
+/// Replace the camera column with a bare `Binary` one, which is the wrong spelling.
+pub fn replace_image_column_with_binary(root: &Path) {
+    use arrow_array::{ArrayRef, BinaryArray};
+    use std::sync::Arc;
+
+    let png = png_of(32, 32);
+    rewrite_image_column(root, move |rows| {
+        Some((
+            arrow_schema::DataType::Binary,
+            Arc::new(BinaryArray::from(vec![Some(png.as_slice()); rows])) as ArrayRef,
+        ))
+    });
+}
+
+/// Add a `dtype: "video"` feature to a copied fixture's `meta/info.json`.
+pub fn declare_video_feature(root: &Path, key: &str) {
+    let path = root.join("meta/info.json");
+    let text = std::fs::read_to_string(&path).expect("the fixture has an info.json");
+    let anchor = "        \"action\": {";
+    assert!(
+        text.contains(anchor),
+        "info.json does not declare \"action\" where expected"
+    );
+    let declaration = format!(
+        "        \"{key}\": {{\n\
+         \x20           \"dtype\": \"video\",\n\
+         \x20           \"shape\": [\n\
+         \x20               3,\n\
+         \x20               32,\n\
+         \x20               32\n\
+         \x20           ],\n\
+         \x20           \"names\": null\n\
+         \x20       }},\n"
+    );
+    std::fs::write(
+        &path,
+        text.replacen(anchor, &format!("{declaration}{anchor}"), 1),
+    )
+    .expect("cannot write the rewritten info.json");
 }
 
 /// Rewrite the single episode row of a copied fixture with the given boundaries.

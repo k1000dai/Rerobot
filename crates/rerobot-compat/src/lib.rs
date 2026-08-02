@@ -150,12 +150,13 @@ pub static ENTRY_POINTS: &[EntryPoint] = &[
         target: "lerobot.scripts.lerobot_train:main",
         status: Status::Partial,
         summary: "Train a policy.",
-        note: "Runnable for one vertical slice: the ACT policy on a state/action LeRobot v3.0 \
-            dataset on local disk, or through the in-memory camera batch API. `--policy.device` \
-            takes `cpu`, and `cuda`/`cuda:0` when built with the `cuda` feature; a GPU that was \
-            asked for and cannot be provided is an error rather than a silent fallback. On-disk \
-            image/video decoding, the Hub, accelerate, mixed precision, LR schedulers, PEFT, \
-            environment evaluation and resume are refused with a reason rather than ignored.",
+        note: "Runnable for one vertical slice: the ACT policy on a local LeRobot v3.0 with \
+            state/action columns and embedded PNG/JPEG camera columns, or through the in-memory \
+            camera batch API. `--policy.device` takes `cpu`, and `cuda`/`cuda:0` when built with \
+            the `cuda` feature; a GPU that was asked for and cannot be provided is an error rather \
+            than a silent fallback. Video decoding, external image files, image transforms, the Hub, \
+            accelerate, mixed precision, LR schedulers, PEFT, environment evaluation and resume \
+            are refused with a reason rather than ignored.",
     },
     EntryPoint {
         name: "lerobot-train-tokenizer",
@@ -272,15 +273,15 @@ pub static MODULE_FAMILIES: &[ModuleFamily] = &[
         name: "datasets",
         status: Status::Partial,
         upstream_modules: 22,
-        note: "State/action columns of a LeRobot v3.0 dataset on local disk are ported and tested \
-               end to end: `utils`' path constants, `DatasetInfo`, `io_utils`' four loaders \
-               including `load_stats`, the tasks and episodes parquet tables, the frame data \
-               files, `feature_utils`' delta indices and tolerance check, `dataset_reader`'s \
-               episode-clamped windows and `<key>_is_pad` flags, and `sampler`'s \
-               `EpisodeAwareSampler` structure. On-disk image and video features, video decoding, \
-               the streaming dataset, episode-filtered index remapping, dataset editing and Hub \
-               sync are not, and the sampler's per-epoch order is Rerobot's own rather than \
-               `torch.randperm`'s. ACT's separate in-memory camera batch contract is implemented \
+        note: "State/action columns and embedded PNG/JPEG `dtype: \"image\"` columns of a \
+               LeRobot v3.0 dataset on local disk are ported and tested end to end: `utils`' path \
+               constants, `DatasetInfo`, `io_utils`' four loaders including `load_stats`, the tasks \
+               and episodes parquet tables, the frame data files, `feature_utils`' delta indices and \
+               tolerance check, `dataset_reader`'s episode-clamped windows and `<key>_is_pad` flags, \
+               and `sampler`'s `EpisodeAwareSampler` structure. Video shards, external image files, \
+               image transforms, the streaming dataset, episode-filtered index remapping, dataset \
+               editing and Hub sync are not, and the sampler's per-epoch order is Rerobot's own rather \
+               than `torch.randperm`'s. ACT's separate in-memory camera batch contract is implemented \
                by `rerobot-train` rather than this dataset reader.",
     },
     ModuleFamily {
@@ -321,10 +322,11 @@ pub static MODULE_FAMILIES: &[ModuleFamily] = &[
         status: Status::Partial,
         upstream_modules: 128,
         note: "ACTConfig validation, presets, delta indices and byte-exact checkpoint JSON \
-               read/write are ported, as is the ACT tensor model for state-only and in-memory \
-               camera inputs: the VAE encoder, ResNet18/34 backbone, 1-D/2-D camera position \
-               embeddings, transformer, action head and the L1-plus-KL objective. The temporal \
-               ensembler, ACT processor pipeline and every other policy architecture are not.",
+               read/write are ported, as is the ACT tensor model for state/action and embedded or \
+               in-memory camera inputs: the VAE encoder, ResNet18/34 backbone, 1-D/2-D camera \
+               position embeddings, transformer, action head and the L1-plus-KL objective. The \
+               temporal ensembler, ACT processor pipeline and every other policy architecture are \
+               not.",
     },
     ModuleFamily {
         name: "processor",

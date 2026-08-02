@@ -52,7 +52,7 @@ All 18 upstream console scripts exist as executables with byte-identical names.
 | `lerobot-setup-motors` | hardware-gated | `lerobot.scripts.lerobot_setup_motors:main` | Set motor ids and baudrate on a motor bus. | Drives physical hardware through a vendor SDK; nothing is faked, so it stays hardware-gated until a real driver layer exists. |
 | `lerobot-teleoperate` | hardware-gated | `lerobot.scripts.lerobot_teleoperate:main` | Drive a robot from a teleoperator. | Drives physical hardware through a vendor SDK; nothing is faked, so it stays hardware-gated until a real driver layer exists. |
 | `lerobot-eval` | unimplemented | `lerobot.scripts.lerobot_eval:main` | Evaluate a policy by running environment rollouts. | Needs policy inference and a Gymnasium environment; neither is ported, and fabricating metrics would be worse than failing. |
-| `lerobot-train` | partial | `lerobot.scripts.lerobot_train:main` | Train a policy. | Runnable for one vertical slice: the ACT policy on a state/action LeRobot v3.0 dataset on local disk, or through the in-memory camera batch API. `--policy.device` takes `cpu`, and `cuda`/`cuda:0` when built with the `cuda` feature; a GPU that was asked for and cannot be provided is an error rather than a silent fallback. On-disk image/video decoding, the Hub, accelerate, mixed precision, LR schedulers, PEFT, environment evaluation and resume are refused with a reason rather than ignored. |
+| `lerobot-train` | partial | `lerobot.scripts.lerobot_train:main` | Train a policy. | Runnable for one vertical slice: the ACT policy on a local LeRobot v3.0 with state/action columns and embedded PNG/JPEG camera columns, or through the in-memory camera batch API. `--policy.device` takes `cpu`, and `cuda`/`cuda:0` when built with the `cuda` feature; a GPU that was asked for and cannot be provided is an error rather than a silent fallback. Video decoding, external image files, image transforms, the Hub, accelerate, mixed precision, LR schedulers, PEFT, environment evaluation and resume are refused with a reason rather than ignored. |
 | `lerobot-train-tokenizer` | unimplemented | `lerobot.scripts.lerobot_train_tokenizer:main` | Train the FAST action tokenizer. | Needs LeRobotDataset loading and the tokenizer training stack. |
 | `lerobot-dataset-viz` | unimplemented | `lerobot.scripts.lerobot_dataset_viz:main` | Visualize every frame of a dataset episode. | Needs the dataset reader plus a Rerun/Foxglove viewer bridge. |
 | `lerobot-info` | partial | `lerobot.scripts.lerobot_info:main` | Print a markdown summary of the system configuration. | Ported and runnable. Keys that report Python package versions cannot apply to a Rust build and are reported as not ported rather than invented. |
@@ -85,13 +85,13 @@ pinned commit; it is a size indicator, not a progress metric.
 | `lerobot/common` | unimplemented | 4 | Shared constants and mixins used by the unported families. |
 | `lerobot/configs` | partial | 11 | `configs.types` str-enums and `PolicyFeature` are ported and tested. The ACT policy's concrete config is too, including the `from_pretrained`/`_save_pretrained` checkpoint JSON path and the Draccus value conversions it decodes through. The Draccus CLI parser is not, and neither is `configs.train`: `lerobot-train` consumes an explicit allow-list of flags instead, refusing everything else by name. |
 | `lerobot/data_processing` | unimplemented | 3 | Dataset-level batch processing helpers. |
-| `lerobot/datasets` | partial | 22 | State/action columns of a LeRobot v3.0 dataset on local disk are ported and tested end to end: `utils`' path constants, `DatasetInfo`, `io_utils`' four loaders including `load_stats`, the tasks and episodes parquet tables, the frame data files, `feature_utils`' delta indices and tolerance check, `dataset_reader`'s episode-clamped windows and `<key>_is_pad` flags, and `sampler`'s `EpisodeAwareSampler` structure. On-disk image and video features, video decoding, the streaming dataset, episode-filtered index remapping, dataset editing and Hub sync are not, and the sampler's per-epoch order is Rerobot's own rather than `torch.randperm`'s. ACT's separate in-memory camera batch contract is implemented by `rerobot-train` rather than this dataset reader. |
+| `lerobot/datasets` | partial | 22 | State/action columns and embedded PNG/JPEG `dtype: "image"` columns of a LeRobot v3.0 dataset on local disk are ported and tested end to end: `utils`' path constants, `DatasetInfo`, `io_utils`' four loaders including `load_stats`, the tasks and episodes parquet tables, the frame data files, `feature_utils`' delta indices and tolerance check, `dataset_reader`'s episode-clamped windows and `<key>_is_pad` flags, and `sampler`'s `EpisodeAwareSampler` structure. Video shards, external image files, image transforms, the streaming dataset, episode-filtered index remapping, dataset editing and Hub sync are not, and the sampler's per-epoch order is Rerobot's own rather than `torch.randperm`'s. ACT's separate in-memory camera batch contract is implemented by `rerobot-train` rather than this dataset reader. |
 | `lerobot/envs` | unimplemented | 10 | Gymnasium environment factories. |
 | `lerobot/jobs` | unimplemented | 4 | Hugging Face Jobs launchers. |
 | `lerobot/model` | unimplemented | 2 | Shared model plumbing. |
 | `lerobot/motors` | hardware-gated | 16 | Feetech / Dynamixel / CAN motor buses. |
 | `lerobot/optim` | partial | 4 | `torch.optim.AdamW` and `torch.nn.utils.clip_grad_norm_` are reimplemented with upstream's update order and save format, and checked against PyTorch. The Draccus optimizer and LR-scheduler registries, every other optimizer, and all schedulers are not ported. |
-| `lerobot/policies` | partial | 128 | ACTConfig validation, presets, delta indices and byte-exact checkpoint JSON read/write are ported, as is the ACT tensor model for state-only and in-memory camera inputs: the VAE encoder, ResNet18/34 backbone, 1-D/2-D camera position embeddings, transformer, action head and the L1-plus-KL objective. The temporal ensembler, ACT processor pipeline and every other policy architecture are not. |
+| `lerobot/policies` | partial | 128 | ACTConfig validation, presets, delta indices and byte-exact checkpoint JSON read/write are ported, as is the ACT tensor model for state/action and embedded or in-memory camera inputs: the VAE encoder, ResNet18/34 backbone, 1-D/2-D camera position embeddings, transformer, action head and the L1-plus-KL objective. The temporal ensembler, ACT processor pipeline and every other policy architecture are not. |
 | `lerobot/processor` | partial | 19 | `rename_processor` (step + `rename_stats`) and the value transform/stateless lifecycle of `newline_task_processor.NewLineTaskProcessorStep` are ported and tested, as is `normalize_processor`'s numeric transform for all four of its modes. The pre/postprocessor *artifacts* a checkpoint carries are written byte-identically to upstream's, including both normalizer state files. The pipeline runtime that would execute those steps, Python aliasing, registry/config reconstruction, and the tokenizer and device steps are not ported. |
 | `lerobot/rewards` | unimplemented | 24 | Reward classifiers and success detectors. |
 | `lerobot/rl` | unimplemented | 21 | HIL-SERL actor/learner infrastructure. |
@@ -131,7 +131,7 @@ from upstream's own test-suite and from direct execution of the upstream Python.
 | `rerobot_core::dataset::sampler` | `lerobot/datasets/sampler.py` (`EpisodeAwareSampler` structure and `compute_sampler_state`; **not** the per-epoch order) | `crates/rerobot-core/tests/dataset_sampler.rs` |
 | `rerobot_core::dataset::stats` | `lerobot/datasets/io_utils.py`'s `load_stats` and `cast_stats_to_numpy` | `crates/rerobot-core/tests/dataset_stats.rs` |
 | `rerobot_core::policy::normalize` | `lerobot/processor/normalize_processor.py`'s `_NormalizationMixin._apply_transform` (all four numeric modes) | `crates/rerobot-core/tests/policy_normalize.rs` |
-| `rerobot_train::data` | `lerobot/datasets/{lerobot_dataset,dataset_reader,io_utils}.py`, state-only and local-directory only | `crates/rerobot-train/tests/dataset.rs`, against a fixture upstream itself wrote |
+| `rerobot_train::data` | `lerobot/datasets/{lerobot_dataset,dataset_reader,io_utils}.py`, local-directory state/action plus embedded PNG/JPEG image columns | `crates/rerobot-train/tests/dataset.rs`, `tests/embedded_image.rs` |
 | `rerobot_train::model` | `lerobot/policies/act/modeling_act.py` (`ACT`, `ACTEncoder`, `ACTDecoder`, `create_sinusoidal_pos_embedding`, `get_activation_fn`, and `ACTPolicy.forward`'s loss), plus `torch.nn.{Linear,LayerNorm,MultiheadAttention}` | `crates/rerobot-train/tests/model.rs`, and `tests/goldens.rs` against PyTorch |
 | `rerobot_train::optim` | `torch.optim.AdamW` and `torch.nn.utils.clip_grad_norm_`, plus `lerobot/optim/optimizers.py`'s save format | `crates/rerobot-train/tests/optimizer.rs`, and `tests/goldens.rs` against PyTorch |
 | `rerobot_train::checkpoint` | `lerobot/common/train_utils.py`'s directory layout and `training_step.json` | `crates/rerobot-train/tests/train.rs`, `crates/rerobot-train/tests/checkpoint_safety.rs` |
@@ -505,7 +505,7 @@ than loading the Python extras; the remaining boundaries are not simulated.
 
 | Upstream extra | Gates | Rerobot |
 | --- | --- | --- |
-| `dataset`, `training` | `datasets`, `torchcodec`, `pyarrow`, `wandb`, `accelerate` | partial: local state/action Parquet datasets, ACT normalization/training, and ACT in-memory camera batches use Arrow/Parquet and Candle in Rust. On-disk image/video decoding, Hub access, W&B, distributed/mixed-precision training and evaluation are refused. |
+| `dataset`, `training` | `datasets`, `torchcodec`, `pyarrow`, `wandb`, `accelerate` | partial: local state/action Parquet datasets, embedded PNG/JPEG image columns, ACT normalization/training, and ACT in-memory camera batches use Arrow/Parquet, the Rust image codecs and Candle. Video decoding, external image files, Hub access, W&B, distributed/mixed-precision training and evaluation are refused. |
 | `hardware` | `pynput`, `pyserial`, `deepdiff` | hardware-gated |
 | `feetech`, `dynamixel`, `damiao`, `robstride` | motor SDKs, `python-can` | hardware-gated |
 | `intelrealsense`, `gamepad`, `hopejr`, `lekiwi`, `openarms`, `reachy2`, `rebot`, `unitree_g1`, `phone` | robot/teleop vendor SDKs | hardware-gated |
@@ -525,9 +525,9 @@ Candle can move without raising the MSRV. Arrow and Parquet are pinned to 56.2.0
 ## Non-goals for this milestone
 
 * No Python sidecar, FFI bridge, or subprocess shim for the implemented core.
-* No on-disk image/video decoder, Hub dataset download, evaluation environment, or
-  training resume. The implemented ACT path reads local state/action Parquet and
-  can additionally consume validated in-memory camera tensors through
-  `Batch::with_images`; it loads weights and runs inference when validating a
-  checkpoint round trip.
+* No video decoder, external image-file loader, image augmentation pipeline, Hub
+  dataset download, evaluation environment, or training resume. The implemented ACT
+  path reads local state/action Parquet plus embedded PNG/JPEG camera columns and can
+  additionally consume validated in-memory camera tensors through `Batch::with_images`;
+  it loads weights and runs inference when validating a checkpoint round trip.
 * No hardware access beyond invoking `ffmpeg -version` for `lerobot-info`.

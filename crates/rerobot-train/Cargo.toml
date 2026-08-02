@@ -1,6 +1,6 @@
 [package]
 name = "rerobot-train"
-description = "Pure-Rust LeRobot ACT training: state-only dataset reading, the ACT tensor model, AdamW, and the upstream checkpoint layout."
+description = "Pure-Rust LeRobot ACT training: local state/action and embedded-image dataset reading, the ACT tensor model, AdamW, and the upstream checkpoint layout."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -49,6 +49,10 @@ candle-nn = { version = "=0.9.1", default-features = false }
 arrow-array = "=56.2.0"
 arrow-schema = "=56.2.0"
 parquet = { version = "=56.2.0", default-features = false, features = ["arrow", "snap"] }
+# LeRobot v3 image columns embed PNG/JPEG bytes in Arrow. Decode them natively;
+# no Python, PyTorch, ffmpeg, or other runtime is involved. Keep the format set
+# deliberately narrow and portable.
+image = { version = "=0.25.6", default-features = false, features = ["jpeg", "png"] }
 
 [dev-dependencies]
 # The tests build deliberately malformed parquet files -- inverted episode ranges,
@@ -58,6 +62,10 @@ parquet = { version = "=56.2.0", default-features = false, features = ["arrow", 
 arrow-array = "=56.2.0"
 arrow-schema = "=56.2.0"
 parquet = { version = "=56.2.0", default-features = false, features = ["arrow", "snap"] }
+# Same reasoning for the camera column: `tests/embedded_image.rs` encodes the PNG and
+# JPEG cells it feeds the decoder, and `examples/make_embedded_image_fixture.rs` writes
+# the committed fixture, both at the pin the decoder itself is built against.
+image = { version = "=0.25.6", default-features = false, features = ["jpeg", "png"] }
 
 [lints.rust]
 missing_docs = "warn"

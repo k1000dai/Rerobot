@@ -4,8 +4,8 @@ The pure-Rust ACT training slice of [Rerobot][repo], a behaviour-compatible port
 of [Hugging Face LeRobot][upstream].
 
 This crate is what makes `lerobot-train` run for one narrow, honest case: a
-LeRobot v3.0 dataset on local disk with state/action columns, or an ACT policy
-fed camera tensors in memory, on **CPU** or **CUDA**, with the upstream checkpoint
+LeRobot v3.0 dataset on local disk with state/action columns and embedded PNG/JPEG
+camera columns, or an ACT policy fed camera tensors in memory, on **CPU** or **CUDA**, with the upstream checkpoint
 layout on the way out. There is no PyTorch, no Python sidecar and no FFI: the
 tensor work is [candle], the parquet work is [arrow], and the rest is this crate.
 
@@ -59,12 +59,12 @@ CI on Linux, macOS and Windows, and element by element against upstream PyTorch.
 
 ## What is deliberately out of scope
 
-On-disk image/video decoding, the Hub, `accelerate`, distributed training, mixed
-precision, LR schedulers, PEFT, environment evaluation, `wandb`, and every policy
-other than ACT. On-disk camera features are refused rather than silently dropped;
-ACT camera inputs supplied as `f32` Candle tensors through `Batch::with_images` and
-`TrainSession::step_on` are supported. See `docs/compatibility.md` for the exact
-boundary and
+Video decoding, external image files, image transforms, the Hub, `accelerate`,
+distributed training, mixed precision, LR schedulers, PEFT, environment evaluation,
+`wandb`, and every policy other than ACT. Embedded PNG/JPEG camera columns are
+decoded into ACT inputs; camera inputs supplied as `f32` Candle tensors through
+`Batch::with_images` and `TrainSession::step_on` are also supported. See
+`docs/compatibility.md` for the exact boundary and
 `rerobot_core::random` for why Rerobot's random numbers are its own rather than
 PyTorch's.
 

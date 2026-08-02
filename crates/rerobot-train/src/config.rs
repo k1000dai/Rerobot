@@ -2,7 +2,7 @@
 //!
 //! Upstream is `TrainPipelineConfig` (`lerobot/configs/train.py`), a Draccus
 //! dataclass with 28 fields plus five nested config objects. This is not that
-//! type: it is the subset a state-only ACT run on CPU actually consumes, and it
+//! type: it is the subset the local ACT run actually consumes, and it
 //! carries no field this slice would ignore.
 //!
 //! `train_config.json` is nevertheless written with **upstream's full field set**,
@@ -22,6 +22,8 @@ use std::path::{Path, PathBuf};
 pub const DEFAULT_SEED: u64 = 1000;
 /// The default `TrainPipelineConfig.tolerance_s`.
 pub const DEFAULT_TOLERANCE_S: f64 = 1e-4;
+/// The default `DatasetConfig.use_imagenet_stats`.
+pub const DEFAULT_USE_IMAGENET_STATS: bool = true;
 
 /// A resolved, validated training run.
 #[derive(Debug, Clone, PartialEq)]
@@ -32,6 +34,18 @@ pub struct TrainConfig {
     pub dataset_root: PathBuf,
     /// `dataset.episodes`.
     pub dataset_episodes: Option<Vec<i64>>,
+    /// `dataset.use_imagenet_stats`.
+    ///
+    /// Upstream defaults it to `true`, and at `true` `LeRobotDataset` replaces every
+    /// camera feature's statistics with `IMAGENET_STATS` — the per-channel mean and
+    /// standard deviation the ResNet backbone was trained under. At `false` a camera
+    /// keeps whatever `meta/stats.json` holds for it, and upstream's normalizer leaves
+    /// a feature with no statistics entry untouched; this slice spells that second case
+    /// [`crate::data::image::CameraNormalization::identity`].
+    ///
+    /// It only affects cameras. A state-only run reads and writes the same bytes
+    /// whichever way it is set.
+    pub dataset_use_imagenet_stats: bool,
     /// The ACT policy configuration.
     pub policy: ActConfig,
     /// `output_dir`.
@@ -74,6 +88,7 @@ impl TrainConfig {
             dataset_repo_id,
             dataset_root,
             dataset_episodes: None,
+            dataset_use_imagenet_stats: DEFAULT_USE_IMAGENET_STATS,
             policy,
             output_dir,
             job_name: None,
@@ -356,6 +371,21 @@ impl TrainConfig {
             .unwrap_or_else(|| self.policy.optimizer_preset())
     }
 
+    /// The per-channel statistics this run applies to every camera frame it decodes.
+    ///
+    /// The whole of what [`Self::dataset_use_imagenet_stats`] does:
+    /// `LeRobotDataset.__init__` overwrites each camera's statistics with
+    /// `IMAGENET_STATS` when the flag is set, and leaves them alone when it is not —
+    /// and a camera with no statistics is returned unchanged by upstream's normalizer,
+    /// which is [`crate::data::image::CameraNormalization::identity`].
+    pub fn camera_normalization(&self) -> crate::data::image::CameraNormalization {
+        if self.dataset_use_imagenet_stats {
+            crate::data::image::CameraNormalization::imagenet()
+        } else {
+            crate::data::image::CameraNormalization::identity()
+        }
+    }
+
     /// The `checkpoints/` directory of this run.
     pub fn checkpoints_dir(&self) -> PathBuf {
         self.output_dir.join(crate::checkpoint::CHECKPOINTS_DIR)
@@ -479,7 +509,10 @@ impl TrainConfig {
         transforms.insert("tfs".into(), JsonLike::Object(JsonObject::new()));
         object.insert("image_transforms".into(), JsonLike::Object(transforms));
         object.insert("revision".into(), JsonLike::Null);
-        object.insert("use_imagenet_stats".into(), JsonLike::Bool(true));
+        object.insert(
+            "use_imagenet_stats".into(),
+            JsonLike::Bool(self.dataset_use_imagenet_stats),
+        );
         object.insert("video_backend".into(), JsonLike::Str("pyav".into()));
         object.insert("return_uint8".into(), JsonLike::Bool(false));
         object.insert("depth_output_unit".into(), JsonLike::Str("m".into()));

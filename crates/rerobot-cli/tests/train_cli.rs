@@ -43,6 +43,17 @@ fn fixture_dataset() -> PathBuf {
     path
 }
 
+fn embedded_image_fixture_dataset() -> PathBuf {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../rerobot-train/tests/fixtures/embedded_image");
+    assert!(
+        path.join("meta/info.json").is_file(),
+        "the embedded-image dataset fixture is missing at {}",
+        path.display()
+    );
+    path
+}
+
 struct TempDir(PathBuf);
 
 impl TempDir {
@@ -96,6 +107,19 @@ fn slice_args(output_dir: &Path, extra: &[&str]) -> Vec<String> {
         "--policy.latent_dim=8".to_owned(),
     ];
     args.extend(extra.iter().map(|argument| (*argument).to_owned()));
+    args
+}
+
+fn embedded_image_slice_args(output_dir: &Path, extra: &[&str]) -> Vec<String> {
+    let mut args = slice_args(output_dir, extra);
+    args[0] = "--dataset.repo_id=rerobot/embedded_image_slice".to_owned();
+    args[1] = format!(
+        "--dataset.root={}",
+        embedded_image_fixture_dataset().display()
+    );
+    // Keep this E2E test offline: no torchvision checkpoint or network lookup is needed
+    // to exercise the embedded PNG -> CHW -> ACT path.
+    args.push("--policy.pretrained_backbone_weights=null".to_owned());
     args
 }
 
@@ -166,6 +190,31 @@ fn the_documented_invocation_trains_for_one_step_and_writes_a_checkpoint() {
     assert!(
         stdout.contains("Checkpoint: ") && stdout.contains("000001"),
         "stdout does not name the checkpoint:\n{stdout}"
+    );
+}
+
+#[test]
+fn the_lerobot_train_command_trains_on_an_embedded_image_dataset() {
+    let dir = TempDir::new("embedded-image-e2e");
+    let output_dir = dir.child("out");
+    let result = run(&embedded_image_slice_args(
+        &output_dir,
+        &["--dataset.use_imagenet_stats=false"],
+    ));
+    let stdout = stdout_of(&result);
+    let stderr = stderr_of(&result);
+    assert!(
+        result.status.success(),
+        "lerobot-train image run exited {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        result.status.code()
+    );
+    assert!(stdout.contains("dataset.num_frames=4"), "stdout:\n{stdout}");
+    assert!(stdout.contains("step:1 loss:"), "stdout:\n{stdout}");
+    assert!(
+        output_dir
+            .join("checkpoints/000001/pretrained_model/model.safetensors")
+            .is_file(),
+        "the image CLI run did not publish a checkpoint"
     );
 }
 
@@ -319,8 +368,12 @@ fn help_states_the_partial_status_and_lists_what_is_accepted_and_refused() {
         );
     }
     assert!(
-        stdout.contains("state-only"),
-        "help does not state the dataset restriction:\n{stdout}"
+        stdout.contains("dtype=\"image\""),
+        "help does not state the embedded-image dataset support:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Video features"),
+        "help does not state the video boundary:\n{stdout}"
     );
 }
 
@@ -418,7 +471,7 @@ fn a_flag_naming_an_unported_feature_is_refused_by_the_parser() {
         ("--sample_weighting=x", "per-sample loss weighting"),
         ("--cudnn_deterministic=true", "no cuDNN here"),
         ("--prefetch_factor=2", "nothing to prefetch"),
-        ("--dataset.image_transforms=x", "state-only"),
+        ("--dataset.image_transforms=x", "image pipeline"),
     ] {
         let result = run(&slice_args(&dir.child("out"), &[flag]));
         assert_eq!(

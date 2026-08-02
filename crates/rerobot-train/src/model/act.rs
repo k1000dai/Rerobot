@@ -1,31 +1,42 @@
 //! Port of `lerobot.policies.act.modeling_act`: the `ACT` module and the loss
 //! `ACTPolicy.forward` computes.
 //!
-//! Ported in full for the state-only case: the BERT-style VAE encoder over
-//! `[cls, robot_state, *actions]` with its fixed sinusoidal positions and its
-//! `action_is_pad` key-padding mask, the reparameterization trick, the
-//! transformer encoder over `[latent, robot_state, env_state]`, the DETR-style
-//! decoder with learned object queries, the action head, and the masked L1 plus
-//! KL objective.
+//! Ported: the BERT-style VAE encoder over `[cls, robot_state, *actions]` with its
+//! fixed sinusoidal positions and its `action_is_pad` key-padding mask, the
+//! reparameterization trick, the ResNet image backbone with its 1×1 token
+//! projection and 2-D sinusoidal camera embedding, the transformer encoder over
+//! `[latent, robot_state, env_state, *camera_tokens]`, the DETR-style decoder with
+//! learned object queries, the action head, and the masked L1 plus KL objective.
 //!
-//! **Not** ported: the ResNet backbone, the 2-D sinusoidal camera embedding, and
-//! the temporal ensembler. The first two only exist when the config has image
-//! features, which [`crate::data::meta::DatasetMetadata::load`] refuses; the third
-//! only runs at inference. [`crate::model::act::ActModel::new`] refuses a config that would need any
-//! of them rather than quietly building a smaller model.
+//! Cameras arrive as tensors already in memory — see [`crate::data::image`] for the
+//! exact contract and for why neither on-disk camera form of a LeRobot v3.0 dataset
+//! can be read here.
+//!
+//! **Not** ported: the temporal ensembler, which only runs at inference, and
+//! pretrained torchvision backbone weights, which are a download rather than a
+//! computation. [`crate::model::act::ActModel::new`] refuses a config needing either rather than
+//! quietly building a different model.
 
 use crate::data::batch::Batch;
+use crate::data::image::{camera_view, require_finite};
 use crate::data::meta::{ACTION, OBS_ENV_STATE, OBS_STATE};
 use crate::error::{Result, TrainError};
+use crate::model::backbone::{stage_blocks, ResNetBackbone, FEATURE_CHANNELS};
 use crate::model::ops::{
-    dropout_mask, sinusoidal_position_embedding, Activation, LayerNorm, Linear, MultiheadAttention,
+    dropout_mask, sinusoidal_position_embedding, sinusoidal_position_embedding_2d, Activation,
+    Conv2d, LayerNorm, Linear, MultiheadAttention,
 };
 use crate::model::params::{Initializer, NamedParameter, ParameterStore};
 use candle_core::{DType, Device, Tensor};
-use rerobot_core::policy::act::ActConfig;
+use rerobot_core::policy::act::{ActConfig, PythonIntBool};
 use rerobot_core::random::SplitMix64;
+use rerobot_core::types::FeatureType;
 use std::collections::BTreeMap;
 use std::path::Path;
+
+/// Channels ACT's backbone takes, which is what torchvision's ResNet stem is built
+/// for: `conv1` is `nn.Conv2d(3, 64, kernel_size=7, ...)` and nothing reshapes it.
+pub const CAMERA_CHANNELS: usize = 3;
 
 /// The prefix `ACTPolicy.state_dict()` puts on the `ACT` module's parameters.
 pub const MODEL_PREFIX: &str = "model";
@@ -110,6 +121,26 @@ pub struct ActShape {
     pub env_state_dim: Option<usize>,
     /// Width of `action`.
     pub action_dim: usize,
+    /// The camera features, in `input_features` order.
+    ///
+    /// That order is `config.image_features`', which is what upstream iterates when
+    /// it builds `batch[OBS_IMAGES]`, so it is also the order the encoder's camera
+    /// tokens appear in. Preserving it is what makes a multi-camera forward pass
+    /// deterministic rather than dependent on a hash order.
+    pub cameras: Vec<CameraSpec>,
+}
+
+/// One camera input feature, narrowed to machine sizes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CameraSpec {
+    /// The `input_features` key, e.g. `observation.images.top`.
+    pub key: String,
+    /// Channels the feature declares. Always [`CAMERA_CHANNELS`].
+    pub channels: usize,
+    /// Height the feature declares.
+    pub height: usize,
+    /// Width the feature declares.
+    pub width: usize,
 }
 
 #[derive(Debug)]
@@ -151,6 +182,9 @@ pub struct ActModel {
     vae_encoder_action_input_proj: Option<Linear>,
     vae_encoder_latent_output_proj: Option<Linear>,
     vae_encoder_pos_enc: Option<Tensor>,
+
+    backbone: Option<ResNetBackbone>,
+    encoder_img_feat_input_proj: Option<Conv2d>,
 
     encoder: Vec<EncoderLayer>,
     encoder_norm: Option<LayerNorm>,
@@ -249,6 +283,22 @@ impl ActModel {
             (None, None, None, None, None)
         };
 
+        // `if self.config.image_features: self.backbone = IntermediateLayerGetter(...)`,
+        // registered here so that `named_parameters()` — and therefore the optimizer's
+        // parameter indices — run in upstream's order: the VAE encoder, the backbone,
+        // then the transformer.
+        let backbone = if shape.cameras.is_empty() {
+            None
+        } else {
+            Some(ResNetBackbone::new(
+                &config.vision_backbone,
+                CAMERA_CHANNELS,
+                &mut store,
+                &mut init,
+                &format!("{MODEL_PREFIX}.backbone"),
+            )?)
+        };
+
         let encoder = (0..shape.n_encoder_layers)
             .map(|index| {
                 encoder_layer(
@@ -313,6 +363,19 @@ impl ActModel {
             dimension,
             shape.latent_dim,
         )?;
+        // `nn.Conv2d(backbone_model.fc.in_features, config.dim_model, kernel_size=1)`,
+        // which turns one feature-map cell into one encoder token.
+        let encoder_img_feat_input_proj = if shape.cameras.is_empty() {
+            None
+        } else {
+            Some(conv_1x1(
+                &mut store,
+                &mut init,
+                &format!("{MODEL_PREFIX}.encoder_img_feat_input_proj"),
+                dimension,
+                FEATURE_CHANNELS,
+            )?)
+        };
 
         let one_d_tokens = 1
             + usize::from(shape.robot_state_dim.is_some())
@@ -349,6 +412,8 @@ impl ActModel {
             vae_encoder_action_input_proj,
             vae_encoder_latent_output_proj,
             vae_encoder_pos_enc,
+            backbone,
+            encoder_img_feat_input_proj,
             encoder,
             encoder_norm,
             decoder,
@@ -429,9 +494,13 @@ impl ActModel {
 
     /// `ACTPolicy.get_optim_params`: the non-backbone group, then the backbone one.
     ///
-    /// The backbone group is always empty here, because a state-only config has no
-    /// image features and therefore no backbone. It is still reported, because
-    /// upstream reports it and `optimizer_param_groups.json` records both.
+    /// The split is by name, `model.backbone` against everything else, which is what
+    /// upstream's `n.startswith("model.backbone")` does. A state-only config has no
+    /// backbone and so an empty second group; it is still reported, because upstream
+    /// reports it and `optimizer_param_groups.json` records both.
+    ///
+    /// `encoder_img_feat_input_proj` is deliberately *not* in the backbone group:
+    /// upstream matches on the prefix alone, and that projection does not carry it.
     pub fn optimizer_parameter_groups(&self) -> [Vec<usize>; 2] {
         let backbone_prefix = format!("{MODEL_PREFIX}.backbone");
         let mut main = Vec::new();
@@ -585,11 +654,45 @@ impl ActModel {
                     .reshape((batch_size, 1, dimension))?,
             );
         }
+        // `encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))`,
+        // one `[1, dim]` row per 1-D token, before the camera embeddings extend it.
+        let one_d_tokens = encoder_tokens.len();
+        let mut encoder_position_parts =
+            vec![self
+                .encoder_1d_feature_pos_embed
+                .reshape((1, one_d_tokens, dimension))?];
+
+        // `for img in batch[OBS_IMAGES]`, in `config.image_features` order.
+        if let (Some(backbone), Some(projection)) =
+            (&self.backbone, &self.encoder_img_feat_input_proj)
+        {
+            for camera in &self.shape.cameras {
+                let image = self.camera_input(camera, batch, batch_size)?;
+                let features = backbone.forward(&image)?;
+                let (_, _, height, width) = features.dims4()?;
+                // `rearrange(cam_features, "b c h w -> (h w) b c")`, which is
+                // `[batch, h * w, dim]` in this crate's batch-first layout.
+                let tokens = projection
+                    .forward(&features)?
+                    .flatten_from(2)?
+                    .transpose(1, 2)?
+                    .contiguous()?;
+                // The embedding is a pure function of the feature map's extent and is
+                // the same for every frame in the batch, so it stays `[1, h * w, dim]`
+                // and broadcasts, exactly as upstream's does.
+                let positions =
+                    sinusoidal_position_embedding_2d(height, width, dimension / 2, &self.device)?
+                        .flatten_from(2)?
+                        .transpose(1, 2)?
+                        .contiguous()?;
+                encoder_tokens.push(tokens);
+                encoder_position_parts.push(positions);
+            }
+        }
+
         let encoder_input = Tensor::cat(&encoder_tokens, 1)?;
-        let token_count = encoder_tokens.len();
-        let encoder_positions = self
-            .encoder_1d_feature_pos_embed
-            .reshape((1, token_count, dimension))?
+        let token_count = encoder_input.dims()[1];
+        let encoder_positions = Tensor::cat(&encoder_position_parts, 1)?
             .broadcast_as((batch_size, token_count, dimension))?
             .contiguous()?;
 
@@ -681,6 +784,33 @@ impl ActModel {
                 total: l1_value,
             }),
         }
+    }
+
+    /// One camera's tensor from `batch`, checked against what the config declared.
+    ///
+    /// The batch's own contract ([`crate::data::image`]) is about the tensor in
+    /// isolation — dtype, rank, batch size, bounds. This is the other half: the
+    /// extent has to be the one `input_features` declares, because that declaration
+    /// is what the checkpoint records and what a reader of `config.json` will size
+    /// its own inputs from. A batch of a different extent would train and predict
+    /// perfectly well and disagree with the file that describes it.
+    fn camera_input(
+        &self,
+        camera: &CameraSpec,
+        batch: &Batch,
+        batch_size: usize,
+    ) -> Result<Tensor> {
+        let image = camera_view(&camera.key, batch.image(&camera.key)?, batch_size)?;
+        let (_, channels, height, width) = image.dims4()?;
+        if (channels, height, width) != (camera.channels, camera.height, camera.width) {
+            return Err(TrainError::Metadata(format!(
+                "camera {:?} carries {channels}x{height}x{width} images but the policy config \
+                 declares {}x{}x{}",
+                camera.key, camera.channels, camera.height, camera.width
+            )));
+        }
+        require_finite(&camera.key, &image)?;
+        Ok(image)
     }
 
     fn maybe_dropout(&self, input: &Tensor, pass: &mut Pass<'_>) -> Result<Tensor> {
@@ -850,20 +980,7 @@ fn resolve_shape(config: &ActConfig) -> Result<ActShape> {
     let inputs = config.input_features.clone().unwrap_or_default();
     let outputs = config.output_features.clone().unwrap_or_default();
 
-    let visual: Vec<&String> = inputs
-        .iter()
-        .filter(|(_, feature)| feature.r#type == rerobot_core::types::FeatureType::Visual)
-        .map(|(key, _)| key)
-        .collect();
-    if !visual.is_empty() {
-        let mut names: Vec<&str> = visual.iter().map(|key| key.as_str()).collect();
-        names.sort_unstable();
-        return Err(TrainError::unsupported(format!(
-            "the policy config has image features ({}); ACT needs a torchvision ResNet backbone \
-             and the 2-D camera position embedding for those, and neither is ported",
-            names.join(", ")
-        )));
-    }
+    let cameras = resolve_cameras(config, &inputs)?;
     if config.temporal_ensemble_coeff.is_some() {
         return Err(TrainError::unsupported(
             "temporal_ensemble_coeff is set; the temporal ensembler is an inference-time \
@@ -920,9 +1037,9 @@ fn resolve_shape(config: &ActConfig) -> Result<ActShape> {
                 .to_owned(),
         )
     })?;
-    if robot_state_dim.is_none() && env_state_dim.is_none() {
+    if robot_state_dim.is_none() && env_state_dim.is_none() && cameras.is_empty() {
         return Err(TrainError::Metadata(
-            "the policy config has neither observation.state nor \
+            "the policy config has no camera, no observation.state and no \
              observation.environment_state, so the transformer encoder would have only the \
              latent token"
                 .to_owned(),
@@ -934,6 +1051,16 @@ fn resolve_shape(config: &ActConfig) -> Result<ActShape> {
     if n_heads == 0 || dim_model % n_heads != 0 {
         return Err(TrainError::Metadata(format!(
             "dim_model {dim_model} must be a positive multiple of n_heads {n_heads}"
+        )));
+    }
+    // `ACTSinusoidalPositionEmbedding2d(config.dim_model // 2)` interleaves a sine and
+    // a cosine term across each half of its output, so `dim_model / 2` has to be even
+    // as well. Upstream's `torch.stack` would raise on the mismatched halves instead.
+    if !cameras.is_empty() && dim_model % 4 != 0 {
+        return Err(TrainError::Metadata(format!(
+            "dim_model {dim_model} is not a multiple of four; the 2-D camera position \
+             embedding splits it into a y half and an x half and interleaves sine and cosine \
+             terms within each, which needs dim_model / 2 to be even"
         )));
     }
 
@@ -978,7 +1105,107 @@ fn resolve_shape(config: &ActConfig) -> Result<ActShape> {
         robot_state_dim,
         env_state_dim,
         action_dim,
+        cameras,
     })
+}
+
+/// `config.image_features`, narrowed and checked against what this port can build.
+///
+/// Returns an empty vector for a state-only config, which is what leaves the backbone
+/// and the image projection unbuilt.
+fn resolve_cameras(
+    config: &ActConfig,
+    inputs: &indexmap::IndexMap<String, rerobot_core::types::PolicyFeature>,
+) -> Result<Vec<CameraSpec>> {
+    let visual: Vec<(&String, &rerobot_core::types::PolicyFeature)> = inputs
+        .iter()
+        .filter(|(_, feature)| feature.r#type == FeatureType::Visual)
+        .collect();
+    if visual.is_empty() {
+        return Ok(Vec::new());
+    }
+    crate::limits::within(
+        visual.len(),
+        "the number of camera features",
+        crate::limits::MAX_CAMERAS,
+    )?;
+
+    // The backbone the config names has to be one this port builds, and it has to be
+    // buildable from nothing. Both are checked before any shape is narrowed so that
+    // the first failure a user sees is the structural one.
+    stage_blocks(&config.vision_backbone)?;
+    if let Some(weights) = &config.pretrained_backbone_weights {
+        return Err(TrainError::unsupported(format!(
+            "pretrained_backbone_weights = {weights:?}; that names a torchvision checkpoint \
+             downloaded from download.pytorch.org, and nothing in this workspace ships or \
+             fetches one. The supported initialization is torchvision's own \
+             kaiming_normal_(mode=\"fan_out\") drawn from Rerobot's stream; ask for it by \
+             setting pretrained_backbone_weights to null rather than training a randomly \
+             initialized backbone under a config that claims ImageNet weights"
+        )));
+    }
+    let dilated = match &config.replace_final_stride_with_dilation {
+        PythonIntBool::Bool(value) => *value,
+        PythonIntBool::Int(value) => value != &num_bigint::BigInt::from(0_u8),
+    };
+    if dilated {
+        return Err(TrainError::unsupported(
+            "replace_final_stride_with_dilation is set; upstream cannot honour it either on \
+             the BasicBlock ResNets, because torchvision's BasicBlock.__init__ raises \
+             \"Dilation > 1 not supported in BasicBlock\" and _make_layer hands dilation=2 to \
+             every block of layer4 after the first"
+                .to_owned(),
+        ));
+    }
+
+    let mut cameras = Vec::with_capacity(visual.len());
+    for (key, feature) in visual {
+        if feature.shape.len() != 3 {
+            return Err(TrainError::Metadata(format!(
+                "camera feature {key:?} declares shape {:?}; a camera is \
+                 [channels, height, width]",
+                feature.shape
+            )));
+        }
+        let extent = |index: usize, name: &str, limit: usize| -> Result<usize> {
+            let value = crate::limits::bounded_usize(
+                &feature.shape[index],
+                &format!("the {name} of camera feature {key:?}"),
+                limit,
+            )?;
+            if value == 0 {
+                return Err(TrainError::Metadata(format!(
+                    "camera feature {key:?} declares a {name} of zero, so it carries no pixels"
+                )));
+            }
+            Ok(value)
+        };
+        let channels = extent(0, "channel count", crate::limits::MAX_IMAGE_EXTENT)?;
+        if channels != CAMERA_CHANNELS {
+            return Err(TrainError::unsupported(format!(
+                "camera feature {key:?} declares {channels} channels; torchvision's ResNet stem \
+                 is nn.Conv2d({CAMERA_CHANNELS}, 64, kernel_size=7), so ACT takes \
+                 {CAMERA_CHANNELS}-channel images and nothing reshapes them"
+            )));
+        }
+        let height = extent(1, "height", crate::limits::MAX_IMAGE_EXTENT)?;
+        let width = extent(2, "width", crate::limits::MAX_IMAGE_EXTENT)?;
+        crate::limits::within(
+            crate::limits::checked_product(
+                &[channels, height, width],
+                &format!("the size of one frame of camera feature {key:?}"),
+            )?,
+            &format!("the size of one frame of camera feature {key:?}"),
+            crate::limits::MAX_FEATURE_WIDTH,
+        )?;
+        cameras.push(CameraSpec {
+            key: key.clone(),
+            channels,
+            height,
+            width,
+        });
+    }
+    Ok(cameras)
 }
 
 fn linear(
@@ -992,6 +1219,27 @@ fn linear(
     Ok(Linear {
         weight: store.parameter(format!("{prefix}.weight"), weight)?,
         bias: store.parameter(format!("{prefix}.bias"), bias)?,
+    })
+}
+
+/// `nn.Conv2d(in_channels, out_channels, kernel_size=1)`, initialized the way
+/// `nn.Conv2d.reset_parameters` does: both tensors `U(-1/sqrt(fan_in), 1/sqrt(fan_in))`
+/// with `fan_in = in_channels * 1 * 1`, which is the same bound `nn.Linear` uses and
+/// the same helper can therefore produce.
+fn conv_1x1(
+    store: &mut ParameterStore,
+    init: &mut Initializer<'_>,
+    prefix: &str,
+    out_channels: usize,
+    in_channels: usize,
+) -> Result<Conv2d> {
+    let (weight, bias) = init.linear(out_channels, in_channels)?;
+    let weight = weight.reshape((out_channels, in_channels, 1, 1))?;
+    Ok(Conv2d {
+        weight: store.parameter(format!("{prefix}.weight"), weight)?,
+        bias: Some(store.parameter(format!("{prefix}.bias"), bias)?),
+        stride: 1,
+        padding: 0,
     })
 }
 

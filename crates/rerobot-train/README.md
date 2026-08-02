@@ -4,10 +4,10 @@ The pure-Rust ACT training slice of [Rerobot][repo], a behaviour-compatible port
 of [Hugging Face LeRobot][upstream].
 
 This crate is what makes `lerobot-train` run for one narrow, honest case: a
-**state-only** LeRobot v3.0 dataset on local disk, the **ACT** policy, and the
-upstream checkpoint layout on the way out. There is no PyTorch, no Python sidecar
-and no FFI: the tensor work is [candle], the parquet work is [arrow], and the
-rest is this crate.
+LeRobot v3.0 dataset on local disk with state/action columns, or an ACT policy
+fed camera tensors in memory, on **CPU** or **CUDA**, with the upstream checkpoint
+layout on the way out. There is no PyTorch, no Python sidecar and no FFI: the
+tensor work is [candle], the parquet work is [arrow], and the rest is this crate.
 
 [repo]: https://github.com/k1000dai/Rerobot
 [upstream]: https://github.com/huggingface/lerobot
@@ -19,7 +19,7 @@ rest is this crate.
 | Piece | Upstream source |
 | --- | --- |
 | `data` — `meta/info.json`, `meta/stats.json`, `meta/tasks.parquet`, `meta/episodes/`, `data/` | `lerobot/datasets/{lerobot_dataset,dataset_reader,io_utils}.py` |
-| `model` — the ACT transformer, VAE encoder, sinusoidal embeddings, L1 + KL loss | `lerobot/policies/act/modeling_act.py` |
+| `model` — the ACT transformer, VAE encoder, ResNet18/34 camera backbone, 1-D/2-D sinusoidal embeddings, L1 + KL loss | `lerobot/policies/act/modeling_act.py` |
 | `optim` — AdamW and `clip_grad_norm_` | `torch.optim.AdamW`, `torch.nn.utils.clip_grad_norm_` |
 | `checkpoint` — `checkpoints/<step>/{pretrained_model,training_state}/` | `lerobot/common/train_utils.py` |
 | `run` — the step loop | `lerobot/scripts/lerobot_train.py` |
@@ -59,10 +59,12 @@ CI on Linux, macOS and Windows, and element by element against upstream PyTorch.
 
 ## What is deliberately out of scope
 
-Images and video, the Hub, `accelerate`, distributed training, mixed precision,
-LR schedulers, PEFT, environment evaluation, `wandb`, and every policy other than
-ACT. Each of those is *refused with an error*, never silently ignored — see
-`docs/compatibility.md` for the exact boundary and
+On-disk image/video decoding, the Hub, `accelerate`, distributed training, mixed
+precision, LR schedulers, PEFT, environment evaluation, `wandb`, and every policy
+other than ACT. On-disk camera features are refused rather than silently dropped;
+ACT camera inputs supplied as `f32` Candle tensors through `Batch::with_images` and
+`TrainSession::step_on` are supported. See `docs/compatibility.md` for the exact
+boundary and
 `rerobot_core::random` for why Rerobot's random numbers are its own rather than
 PyTorch's.
 

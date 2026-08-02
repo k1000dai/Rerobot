@@ -557,15 +557,26 @@ fn refuse_visual_features(features: &IndexMap<String, FeatureSpec>) -> Result<()
         .map(|(key, _)| key.as_str())
         .collect();
     if visual.is_empty() {
-        Ok(())
-    } else {
-        Err(TrainError::unsupported(format!(
-            "dataset declares image or video features ({}); this slice is state-only, and \
-             training ACT on them needs the ResNet backbone and a video decoder, neither of \
-             which is ported",
-            visual.join(", ")
-        )))
+        return Ok(());
     }
+    // Named per feature *with its dtype*, because the two on-disk forms fail for
+    // different reasons and a user reading this needs to know which one they have.
+    let named: Vec<String> = features
+        .iter()
+        .filter(|(_, spec)| spec.dtype == "image" || spec.dtype == "video")
+        .map(|(key, spec)| format!("{key} (dtype {:?})", spec.dtype))
+        .collect();
+    Err(TrainError::unsupported(format!(
+        "dataset declares camera features ({}), and this reader is state-only: a \"video\" \
+         feature is stored as an MP4 shard under videos/, which needs an AV1 or H.264 decoder, \
+         and an \"image\" feature is stored as PNG or JPEG files under images/, which needs an \
+         image codec. Neither codec is ported, so the feature is refused rather than dropped \
+         from a dataset that has it. The ACT camera path itself *is* ported and trains on \
+         camera tensors supplied in memory: f32 of shape [batch, channels, height, width] with \
+         every element in [0, 1], attached with Batch::with_images and stepped through \
+         TrainSession::step_on",
+        named.join(", ")
+    )))
 }
 
 fn load_tasks(root: &Path) -> Result<Vec<TaskRecord>> {

@@ -1043,6 +1043,151 @@ symlink; the `cfg(windows)` code is type-checked here with
 darwin, where `rename` over a symlink already works, so they demonstrate the shared
 path is unchanged rather than that the Windows-specific one is fixed.
 
+## Cycle 13 — what a real dataset and a real GPU found
+
+The first run of the slice on something other than its own fixtures: ACT trained by
+`lerobot-train` on ten episodes of `HuggingFaceVLA/libero`, on an RTX 5080, and the
+checkpoint evaluated by upstream `lerobot` in the LIBERO simulator.
+
+**These two were not found test-first.** Both were found by running the slice, and
+the order was fix-then-test rather than the reverse. What is recorded below is the
+RED that was demonstrated afterwards, by reverting each fix on its own and running
+the new test against the unfixed code — so the tests are known to fail for the
+reason claimed, which is the property the test-first rule exists to guarantee. The
+honest summary is that the fixture suite could not have found either one: no
+fixture declares a camera the way the Hub does, and no test ran more than a handful
+of steps.
+
+### A camera's declared shape was read channel-first whatever `names` said
+
+`dataset_to_policy_features` picks the channel order from `names`, not from the
+numbers:
+
+```python
+if names[2] in ["channel", "channels"]:  # (h, w, c) -> (c, h, w)
+    shape = (shape[2], shape[0], shape[1])
+```
+
+`policy_features` was a port of that function with those four lines missing, and
+`image_shape` read `spec.shape` directly, so both took the declaration to be
+`[channel, height, width]` unconditionally. Every LIBERO conversion published on
+the Hub — `HuggingFaceVLA/libero`, `lerobot/libero_spatial_image` — declares
+`[256, 256, 3]` with `["height", "width", "channel"]`, which the reader therefore
+refused as a 256-channel image. The committed fixture is channel-first, so nothing
+in the suite disagreed.
+
+**RED** — `embedded_image.rs`, two tests, with
+`FeatureSpec::policy_shape` reverted to returning `self.shape` unchanged:
+
+```
+a_camera_declared_height_width_channel_is_read_as_the_same_frames  FAILED
+a_non_square_camera_proves_the_reorder_rather_than_the_shape_surviving  FAILED
+  assertion `left == right` failed
+    left: [24, 48, 3]
+   right: [3, 24, 48]
+```
+
+The square case alone would not have been enough: at 32×32 a reorder and a no-op
+produce the same three numbers. The non-square one is what makes the assertion
+about the reorder rather than about the shape surviving.
+
+**GREEN** — `FeatureSpec::policy_shape` ports the rule, and both `policy_features`
+and the embedded-camera reader go through it, so the shape the policy config
+records and the shape the decoder allocates against cannot disagree. Upstream
+indexes `names[2]` unconditionally and raises `TypeError` on `"names": null`; this
+treats a missing or short `names` as "already channel-first", which refuses less
+rather than more.
+
+`cargo test -p rerobot-train --test embedded_image`
+
+### AdamW's stored moments kept the graph they were computed from
+
+A gradient candle returns still carries the `BackpropOp` chain that produced it.
+`exp_avg` and `exp_avg_sq` were computed from one and stored undetached, so each
+step's moments pinned that step's whole forward pass — every ResNet and transformer
+activation — and because step N+1's moments are computed from step N's, every step
+of a run stayed reachable through the chain.
+
+Measured on the GPU before the fix: **~800 MB per step**, independent of batch
+size, `CUDA_ERROR_OUT_OF_MEMORY` after about 15 steps at batch 8, 4 and 2 alike.
+After the fix, flat at 7.8 GB across 10 000 steps. The numbers the optimizer
+produced were correct throughout; only the run's ability to finish was affected,
+which is why 16 existing optimizer tests all passed.
+
+**RED** — `optimizer.rs`, one test, with the two `detach()` calls removed:
+
+```
+the_stored_moments_do_not_keep_the_graph_they_were_computed_from  FAILED
+  a stored AdamW moment is still attached to its backward graph
+```
+
+Getting this test to fail for the right reason took two attempts, and the first one
+is the more useful record. Written against the file's existing
+`step_with_gradient`, it passed *with the fix removed*: that helper's loss is linear
+in the parameter, so its gradient is the coefficient tensor and carries no graph
+for a moment to retain. A model's gradients are computed through its activations
+and do point back at them. The test now builds `sum(p * p)`, whose gradient `2p` is
+a tensor built from the parameter, and asserts `track_op()` on that gradient before
+using it — so a future change that flattens the graph again cannot make the test
+vacuous instead of failing.
+
+**GREEN** — both moments are detached before being stored. `detach` shares the
+storage and drops only the history, which is what `torch.optim` gets for free from
+running under `no_grad`. `optim::any_moment_tracks_its_graph` exposes the property
+because the moments are private and `track_op` is on the tensor.
+
+`cargo test -p rerobot-train --test optimizer`
+
+### Two limits and one refusal that were correct and still in the way
+
+Not bugs, and recorded because a reader hitting them should know they were
+deliberate.
+
+* `MAX_DECODED_VALUES` was `1 << 28`, one gibibyte of `f32`. Ten LIBERO episodes
+  read through two 256×256 cameras is 449 million scalars, so the smallest
+  realistic two-camera dataset did not fit. Raised to `1 << 29`, which is the
+  one-line change the refusal message itself points at.
+* `fps` must be an integer, and every LIBERO dataset on the Hub writes `10.0`. Left
+  as it is — it is the typed boundary the error message names, and `10.0` and `10`
+  are the same value, so a caller can normalize it.
+* ACT's default `pretrained_backbone_weights = "ResNet18_Weights.IMAGENET1K_V1"` is
+  refused rather than silently ignored. Left as it is; the run passed `null` and
+  trained the backbone from scratch.
+
+### What the run demonstrated
+
+The CUDA path in `tests/device_smoke.rs` had never been executed on NVIDIA
+hardware. It has now:
+
+```
+cargo test -p rerobot-train --features cuda --test device_smoke
+  a_cuda_session_puts_its_parameters_on_the_gpu ... ok
+  the_cuda_path_runs_a_whole_step_on_the_gpu_and_writes_a_checkpoint_that_reloads ... ok
+```
+
+End to end, on `libero_spatial` task 2 ("pick up the black bowl from table center
+and place it on the plate"), 10 training episodes, 10 000 steps at batch 8, loss
+32.0 → 0.29:
+
+| Checkpoint | Episodes | Success |
+| --- | --- | --- |
+| 200 steps | 1 | 0 % |
+| 5 000 steps | 10 | 8 / 10 |
+| 10 000 steps | 10 | 8 / 10 |
+| 10 000 steps | 20 | 15 / 20 |
+
+The checkpoint was loaded by upstream `ACTPolicy.from_pretrained` and
+`make_pre_post_processors` without modification, and the rollouts were upstream's
+`lerobot-eval`. This is one task evaluated on the task its own demonstrations came
+from, so it is an in-distribution number and not a benchmark result; what it
+demonstrates is that the Rust slice produces a policy upstream can load and that
+drives a real MuJoCo robot to the goal. The 200-step checkpoint failing through the
+identical path is what rules out the environment doing the work.
+
+**Test count:** 851 → 854 distinct tests. The three added are the two in
+`tests/embedded_image.rs` and the one in `tests/optimizer.rs` above; the naive sum
+of cargo's `test result:` lines moves 853 → 856.
+
 ## Final GREEN totals
 
 `cargo test --workspace --all-targets --all-features`

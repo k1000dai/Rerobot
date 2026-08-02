@@ -40,6 +40,45 @@ pub struct FeatureSpec {
 }
 
 impl FeatureSpec {
+    /// The shape a *policy* sees, which for a camera is channel-first.
+    ///
+    /// `dataset_to_policy_features` reorders a visual feature declared
+    /// `[height, width, channel]` into `[channel, height, width]`, keyed on the last
+    /// entry of `names` rather than on the numbers:
+    ///
+    /// ```python
+    /// if names[2] in ["channel", "channels"]:  # (h, w, c) -> (c, h, w)
+    ///     shape = (shape[2], shape[0], shape[1])
+    /// ```
+    ///
+    /// Both spellings occur on the Hub — `lerobot/pusht` is channel-first while every
+    /// LIBERO conversion is `[256, 256, 3]` with `names` `["height", "width",
+    /// "channel"]` — so the declaration alone does not say which, and a 3-channel
+    /// frame is not distinguishable from a 3-pixel-wide one by shape.
+    ///
+    /// One deviation, and it is in the direction of refusing less: upstream indexes
+    /// `names[2]` unconditionally, so a visual feature with `"names": null` raises
+    /// `TypeError` there. Here a missing or short `names` means no reorder, because
+    /// the shape is then already what a policy consumes.
+    pub fn policy_shape(&self) -> Vec<i64> {
+        if self.dtype != "image" && self.dtype != "video" {
+            return self.shape.clone();
+        }
+        if self.shape.len() != 3 {
+            return self.shape.clone();
+        }
+        let channel_last = self
+            .names
+            .as_ref()
+            .and_then(|names| names.get(2))
+            .is_some_and(|name| name == "channel" || name == "channels");
+        if channel_last {
+            vec![self.shape[2], self.shape[0], self.shape[1]]
+        } else {
+            self.shape.clone()
+        }
+    }
+
     /// How many scalars one frame of this feature carries.
     ///
     /// Checked and bounded, not a plain `product()`. The shape comes from
@@ -161,9 +200,9 @@ fn load_stats_for_features(
     })?;
     if let JsonLike::Object(values) = &mut document {
         values.retain(|feature, _| {
-            !features
+            features
                 .get(feature)
-                .is_some_and(|spec| spec.dtype == "image")
+                .is_none_or(|spec| spec.dtype != "image")
         });
     }
     stats_from_value(&document)
@@ -434,7 +473,10 @@ impl DatasetMetadata {
             };
             out.insert(
                 key.clone(),
-                PolicyFeature::new(feature_type, spec.shape.iter().copied().map(BigInt::from)),
+                PolicyFeature::new(
+                    feature_type,
+                    spec.policy_shape().into_iter().map(BigInt::from),
+                ),
             );
         }
         out

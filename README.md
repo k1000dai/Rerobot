@@ -14,7 +14,7 @@ suite. Everything that does not work says so and exits non-zero.
 | Upstream target | `lerobot` 0.6.1 (`f37be3edbee60f3a09a5183788b91eb19f0c07d1`) |
 | Milestone | 2 of N — core utility slice, full CLI surface, and the first runnable training slice |
 | Runnable executables | 2 of 18 (`lerobot-info`, and `lerobot-train` for the local ACT slice with embedded PNG/JPEG camera columns); the other 16 exist and fail explicitly |
-| Tests | 851 integration/unit tests + 56 rustdoc tests, all passing. The ACT training slice is compared element by element against upstream running on PyTorch |
+| Tests | 854 integration/unit tests + 56 rustdoc tests, all passing. The ACT training slice is compared element by element against upstream running on PyTorch |
 | Minimum Rust | 1.85 — the floor of the locked dependency tree, built and tested on that exact toolchain by the `msrv` CI job |
 
 **Read [`docs/compatibility.md`](docs/compatibility.md) before using this.** It

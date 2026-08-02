@@ -333,6 +333,61 @@ fn an_infinite_max_norm_measures_without_clipping() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn the_stored_moments_do_not_keep_the_graph_they_were_computed_from() {
+    // A gradient candle returns still points at the graph that produced it, so a
+    // moment built from one keeps that step's whole forward pass reachable -- and
+    // because step N + 1's moment is built from step N's, undetached moments chain
+    // every step of a run together. On a GPU that is a few hundred megabytes per
+    // step and an out-of-memory failure within a couple of dozen of them; the
+    // numbers stay correct right up until the allocation fails, so nothing else in
+    // this file would notice.
+    let parameters = vec![parameter("p", &[1.0, 2.0]), parameter("q", &[3.0])];
+    let mut optimizer = AdamW::new(
+        vec![ParameterGroup {
+            params: vec![0, 1],
+            settings: settings(0.1, 0.01),
+        }],
+        2,
+    )
+    .unwrap();
+
+    // `step_with_gradient`'s loss is linear in the parameter, so its gradient is the
+    // coefficient tensor and carries no graph at all -- there is nothing for a
+    // moment to retain, and the assertion below would hold with or without the fix.
+    // A model's gradients are not like that: they are computed *through* the
+    // activations, so they point back at them. `sum(p * p * c)` is the smallest
+    // thing with that property, its gradient `2 * p * c` being a tensor built from
+    // the parameter itself.
+    let quadratic_step = |optimizer: &mut AdamW| {
+        let mut loss = Tensor::new(0f32, &Device::Cpu).unwrap();
+        for parameter in &parameters {
+            let value = parameter.value.as_tensor();
+            let term = (value * value).unwrap().sum_all().unwrap();
+            loss = (&loss + &term).unwrap();
+        }
+        let store = loss.backward().unwrap();
+        assert!(
+            store
+                .get(parameters[0].value.as_tensor())
+                .expect("the parameter has a gradient")
+                .track_op(),
+            "the test's own gradient carries no graph, so it cannot detect a retained one"
+        );
+        optimizer.step(&parameters, &store).unwrap();
+    };
+
+    for _ in 0..3 {
+        quadratic_step(&mut optimizer);
+        assert!(
+            !rerobot_train::optim::any_moment_tracks_its_graph(&optimizer),
+            "a stored AdamW moment is still attached to its backward graph"
+        );
+    }
+    // And the state really was populated, so the assertion above was not vacuous.
+    assert_eq!(rerobot_train::optim::moment_summary(&optimizer).len(), 2);
+}
+
+#[test]
 fn the_state_round_trips_through_its_safetensors_form() {
     let parameters = vec![parameter("p", &[1.0, 2.0])];
     let mut optimizer = AdamW::new(

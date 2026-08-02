@@ -99,6 +99,85 @@ fn the_camera_is_a_visual_input_feature_of_the_policy() {
 }
 
 #[test]
+fn a_camera_declared_height_width_channel_is_read_as_the_same_frames() {
+    // `dataset_to_policy_features` decides channel order from `names`, not from the
+    // numbers:
+    //
+    //     if names[2] in ["channel", "channels"]:  # (h, w, c) -> (c, h, w)
+    //
+    // The fixture is channel-first, and every LIBERO conversion published on the Hub
+    // -- `HuggingFaceVLA/libero`, `lerobot/libero_spatial_image` -- is the other
+    // spelling. Read as written, `[256, 256, 3]` is a 256-channel image, which is
+    // refused; a square frame makes the mistake invisible to a shape check alone.
+    //
+    // The claim here is that the *only* difference the spelling makes is to
+    // `info.json`: the same bytes decode to the same frames either way.
+    let dir = TempDir::new("hwc-camera");
+    let root = dir.child("ds");
+    common::copy_embedded_image_fixture(&root);
+    common::rewrite_feature_shape(&root, CAMERA, &[EXTENT as i64, EXTENT as i64, 3]);
+    common::rewrite_feature_names(&root, CAMERA, &["height", "width", "channel"]);
+
+    let metadata = DatasetMetadata::load(&root).expect("the rewritten fixture loads");
+    let (inputs, _) = metadata.policy_feature_split();
+    assert_eq!(inputs[CAMERA].r#type, FeatureType::Visual);
+    let shape: Vec<i64> = inputs[CAMERA]
+        .shape
+        .iter()
+        .map(|value| i64::try_from(value).unwrap())
+        .collect();
+    assert_eq!(
+        shape,
+        vec![3, EXTENT as i64, EXTENT as i64],
+        "the policy must see the camera channel-first however info.json spelled it"
+    );
+
+    let dataset = StateOnlyDataset::load(&root, &action_window(2), 1e-4)
+        .expect("an HWC-declared camera is readable");
+    assert_eq!(dataset.len(), 4);
+    for frame_index in 0..4 {
+        let frame = dataset.get(frame_index).expect("the frame loads");
+        let image = frame.image(CAMERA).expect("the camera is present");
+        assert_eq!(
+            (image.channels, image.height, image.width),
+            (CAMERA_CHANNELS, EXTENT, EXTENT)
+        );
+        for channel in 0..CAMERA_CHANNELS {
+            for y in 0..EXTENT {
+                for x in 0..EXTENT {
+                    let offset = (channel * EXTENT + y) * EXTENT + x;
+                    assert!(
+                        (image.pixels[offset] - expected_pixel(frame_index, channel, y, x)).abs()
+                            < 1e-6,
+                        "frame {frame_index} pixel ({channel}, {y}, {x}) moved"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_non_square_camera_proves_the_reorder_rather_than_the_shape_surviving() {
+    // 32x32 cannot tell a reorder from a no-op. This one can: read as written,
+    // `[24, 48, 3]` would reach the policy unchanged, and the assertion below is
+    // false unless the three numbers actually moved.
+    let dir = TempDir::new("hwc-nonsquare");
+    let root = dir.child("ds");
+    common::copy_embedded_image_fixture(&root);
+    common::rewrite_feature_shape(&root, CAMERA, &[24, 48, 3]);
+    common::rewrite_feature_names(&root, CAMERA, &["height", "width", "channel"]);
+
+    let metadata = DatasetMetadata::load(&root).expect("metadata reads without decoding frames");
+    let shape: Vec<i64> = metadata.policy_features()[CAMERA]
+        .shape
+        .iter()
+        .map(|value| i64::try_from(value).unwrap())
+        .collect();
+    assert_eq!(shape, vec![3, 24, 48]);
+}
+
+#[test]
 fn every_frame_decodes_to_the_pixels_the_fixture_encoded() {
     let dataset = load_fixture();
     assert_eq!(dataset.len(), 4);

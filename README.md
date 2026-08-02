@@ -1,5 +1,7 @@
 # Rerobot
 
+![Rerobot banner](docs/assets/rerobot-banner.png)
+
 A behaviour-compatible Rust port of [Hugging Face LeRobot][upstream], built one
 tested vertical slice at a time.
 

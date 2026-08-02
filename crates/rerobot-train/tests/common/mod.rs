@@ -438,6 +438,35 @@ pub fn rewrite_feature_shape(root: &Path, feature: &str, shape: &[i64]) {
     std::fs::write(&path, rewritten).expect("cannot write the rewritten info.json");
 }
 
+/// Rewrite one feature's declared `names` in a copied fixture's `meta/info.json`.
+///
+/// `names` is not decoration for a camera: it is what tells a reader whether the
+/// three numbers beside it are `[channel, height, width]` or `[height, width,
+/// channel]`, and the two are not distinguishable by the numbers alone.
+pub fn rewrite_feature_names(root: &Path, feature: &str, names: &[&str]) {
+    let path = root.join("meta/info.json");
+    let text = std::fs::read_to_string(&path).expect("the fixture has an info.json");
+    // Text, for the same reason `rewrite_feature_shape` is text.
+    let key = format!("\"{feature}\": {{");
+    let start = text.find(&key).expect("the fixture declares the feature");
+    let names_at = text[start..]
+        .find("\"names\": [")
+        .expect("the feature has a names list")
+        + start;
+    let open = names_at + "\"names\": [".len();
+    let close = text[open..].find(']').expect("the names list closes") + open;
+    let replacement = names
+        .iter()
+        .map(|name| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut rewritten = String::with_capacity(text.len());
+    rewritten.push_str(&text[..open]);
+    rewritten.push_str(&replacement);
+    rewritten.push_str(&text[close..]);
+    std::fs::write(&path, rewritten).expect("cannot write the rewritten info.json");
+}
+
 /// Rewrite the `episode_index` column of a copied fixture's data file.
 ///
 /// The other half of `rewrite_episode_rows`: the frame rows carry their own

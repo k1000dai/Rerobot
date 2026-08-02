@@ -584,8 +584,13 @@ fn image_shape(key: &str, spec: &crate::data::meta::FeatureSpec) -> Result<(usiz
             spec.shape
         )));
     }
+    // Channel-first, whichever way `info.json` spelled it: see
+    // `FeatureSpec::policy_shape`, which is where upstream's `names`-keyed reorder
+    // lives. The decoder allocates against this, so it has to agree with the shape
+    // the policy config records for the same camera.
+    let shape = spec.policy_shape();
     let mut dimensions = [0usize; 3];
-    for (index, dimension) in spec.shape.iter().enumerate() {
+    for (index, dimension) in shape.iter().enumerate() {
         dimensions[index] = usize::try_from(*dimension).map_err(|_| {
             TrainError::Metadata(format!(
                 "image feature {key:?} has a dimension {dimension} that is not a valid extent"

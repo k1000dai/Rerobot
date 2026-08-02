@@ -164,12 +164,21 @@ impl AdamW {
                 let update = ((&exp_avg / denominator)? * step_size)?;
                 parameter.value.set(&(value - update)?)?;
 
+                // Detached, and it is not an optimization: a gradient candle hands
+                // back still carries the `BackpropOp` chain it was produced from, so a
+                // moment computed from one keeps that step's entire forward graph —
+                // every activation of every ResNet and transformer layer — reachable.
+                // Storing it undetached links each step's graph to the next through
+                // `exp_avg`, and the live set then grows by one full step per step
+                // until the device runs out of memory. `detach` shares the same
+                // storage and drops only the history, which is exactly what
+                // `torch.optim` gets for free from operating under `no_grad`.
                 self.state.insert(
                     *index,
                     MomentState {
                         step,
-                        exp_avg,
-                        exp_avg_sq,
+                        exp_avg: exp_avg.detach(),
+                        exp_avg_sq: exp_avg_sq.detach(),
                     },
                 );
             }
@@ -551,4 +560,23 @@ pub fn moment_summary(optimizer: &AdamW) -> IndexMap<usize, f64> {
         .iter()
         .map(|(index, state)| (*index, state.step))
         .collect()
+}
+
+/// Whether any stored moment still carries the graph it was computed from.
+///
+/// This is the observable side of the one thing about [`AdamW::step`] that is not
+/// visible in the numbers: a moment computed from a candle gradient inherits that
+/// gradient's `BackpropOp`, and holding one across a step pins the whole forward
+/// pass it came from — activations included. The moments are the only state that
+/// outlives a step, so this is the only place it can happen, and every training run
+/// is long enough that the difference is the difference between finishing and
+/// exhausting the device.
+///
+/// Always `false` for an optimizer built by this crate. Exposed because `track_op`
+/// is on the tensor and the moments are private.
+pub fn any_moment_tracks_its_graph(optimizer: &AdamW) -> bool {
+    optimizer
+        .state
+        .values()
+        .any(|state| state.exp_avg.track_op() || state.exp_avg_sq.track_op())
 }

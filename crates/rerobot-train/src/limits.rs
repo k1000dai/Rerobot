@@ -105,8 +105,13 @@ pub const MAX_DATASET_ROWS: usize = 50_000_000;
 /// file.
 ///
 /// Rows alone do not bound the work: one row of a very wide feature costs as much as
-/// many rows of a narrow one. At `f32` this is a gibibyte.
-pub const MAX_DECODED_VALUES: usize = 1 << 28;
+/// many rows of a narrow one. At `f32` this is two gibibytes.
+///
+/// Embedded camera columns are what set the scale here, not the state and action
+/// vectors: one 256x256 RGB frame is 196 608 scalars, so ten LIBERO episodes read
+/// through two cameras is already 449 million of them. A gibibyte refused that,
+/// which made the smallest realistic two-camera dataset unreadable.
+pub const MAX_DECODED_VALUES: usize = 1 << 29;
 
 /// UTF-8 bytes one string column may hold in total.
 pub const MAX_STRING_BYTES: usize = 64 * 1024 * 1024;

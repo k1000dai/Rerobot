@@ -20,6 +20,21 @@ use indexmap::IndexMap;
 use rerobot_core::dataset::delta::{check_delta_timestamps, get_delta_indices, query_window};
 use rerobot_core::dataset::sampler::EpisodeAwareSampler;
 
+/// Check the scalar footprint of one delta window before cloning its rows.
+fn checked_window_value_count(window_length: usize, width: usize, key: &str) -> Result<usize> {
+    let values = crate::limits::checked_product(
+        &[window_length, width],
+        &format!("the decoded scalar count of {key:?}"),
+    )?;
+    if values > crate::limits::MAX_DECODED_VALUES {
+        return Err(TrainError::Metadata(format!(
+            "the decoded scalar count of {key:?} is {values}, exceeding MAX_DECODED_VALUES {}",
+            crate::limits::MAX_DECODED_VALUES
+        )));
+    }
+    Ok(values)
+}
+
 /// One item of the dataset: a frame, plus every delta window configured for it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Frame {
@@ -440,6 +455,16 @@ impl StateOnlyDataset {
         self.metadata.episodes.len()
     }
 
+    /// The episode identifier owning one dataset-relative frame index.
+    pub fn episode_index_at(&self, index: usize) -> Result<i64> {
+        self.episode_indices.get(index).copied().ok_or_else(|| {
+            TrainError::Metadata(format!(
+                "frame {index} is out of range for a dataset of {} frames",
+                self.len()
+            ))
+        })
+    }
+
     /// `__getitem__`.
     pub fn get(&self, index: usize) -> Result<Frame> {
         if index >= self.len() {
@@ -473,6 +498,8 @@ impl StateOnlyDataset {
                         episode.dataset_to_index,
                         deltas,
                     );
+                    let width = values.first().map_or(0, Vec::len);
+                    checked_window_value_count(window.indices.len(), width, key)?;
                     let mut rows = Vec::with_capacity(window.indices.len());
                     for target in &window.indices {
                         let row = usize::try_from(*target).map_err(|_| {
@@ -638,3 +665,17 @@ const SCALAR_COLUMNS: [&str; 5] = [
     "index",
     "task_index",
 ];
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn action_window_scalar_budget_is_checked_before_row_cloning() {
+        let error = super::checked_window_value_count(8_192, 100_000, "action")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("action") && error.contains("MAX_DECODED_VALUES"),
+            "{error}"
+        );
+    }
+}

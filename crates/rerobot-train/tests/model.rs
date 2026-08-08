@@ -21,7 +21,6 @@ use rerobot_core::random::SplitMix64;
 use rerobot_core::BigInt;
 use rerobot_train::data::batch::collate;
 use rerobot_train::data::dataset::StateOnlyDataset;
-use rerobot_train::error::TrainError;
 use rerobot_train::model::act::{ActModel, Pass, Randomness};
 use rerobot_train::model::ops::{sinusoidal_position_embedding, Activation};
 
@@ -527,14 +526,14 @@ fn an_image_feature_without_a_chw_shape_is_refused_with_a_reason() {
 }
 
 #[test]
-fn temporal_ensembling_is_refused_rather_than_ignored() {
+fn temporal_ensembling_is_an_inference_boundary_not_a_model_construction_error() {
     let mut policy = config();
     policy.temporal_ensemble_coeff = Some(0.01);
     policy.n_action_steps = BigInt::from(1);
     let mut rng = SplitMix64::new(0);
-    let error = ActModel::new(&policy, &Device::Cpu, &mut rng).unwrap_err();
-    assert!(matches!(error, TrainError::Unsupported(_)));
-    assert!(error.to_string().contains("temporal ensembler"));
+    let model = ActModel::new(&policy, &Device::Cpu, &mut rng)
+        .expect("the tensor model is valid when temporal ensembling is configured");
+    assert_eq!(model.shape().n_action_steps, 1);
 }
 
 #[test]

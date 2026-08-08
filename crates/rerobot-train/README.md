@@ -23,6 +23,7 @@ tensor work is [candle], the parquet work is [arrow], and the rest is this crate
 | `optim` — AdamW and `clip_grad_norm_` | `torch.optim.AdamW`, `torch.nn.utils.clip_grad_norm_` |
 | `checkpoint` — `checkpoints/<step>/{pretrained_model,training_state}/` | `lerobot/common/train_utils.py` |
 | `run` — the step loop | `lerobot/scripts/lerobot_train.py` |
+| `deploy` — local ACT checkpoint loading, feature normalization, action queue, temporal ensembling and finite dataset-backed inference | `lerobot/policies/act/modeling_act.py`, `lerobot/scripts/lerobot_rollout.py`'s local observation boundary |
 
 ## Devices
 
@@ -89,5 +90,21 @@ config.policy.n_action_steps = rerobot_core::BigInt::from(2);
 
 let outcome = rerobot_train::run::train(&config, &mut |line| println!("{line}"))?;
 assert_eq!(outcome.steps.len(), 1);
+# Ok::<(), rerobot_train::error::TrainError>(())
+```
+
+A trained local ACT checkpoint can be exercised without a robot or simulator:
+
+```no_run
+use rerobot_train::deploy::InferenceSession;
+use std::path::Path;
+
+let mut session = InferenceSession::load(
+    Path::new("outputs/train/demo/checkpoints/000001/pretrained_model"),
+    Path::new("crates/rerobot-train/tests/fixtures/state_only"),
+    Some("cpu"),
+)?;
+let action = session.select_action(0)?;
+assert_eq!(action.frame_index, 0);
 # Ok::<(), rerobot_train::error::TrainError>(())
 ```

@@ -218,10 +218,9 @@ pub static ENTRY_POINTS: &[EntryPoint] = &[
     EntryPoint {
         name: "lerobot-rollout",
         target: "lerobot.scripts.lerobot_rollout:main",
-        status: Status::Unimplemented,
+        status: Status::Partial,
         summary: "Run a trained policy on a real robot with pluggable strategies.",
-        note: "Needs policy inference and robot drivers. Its rollout ring buffer is ported and \
-               tested, but the command itself is not runnable.",
+        note: "Runnable for a hardware-independent local ACT deployment: it loads a checkpoint, reads local dataset observations, and emits the action queue or temporal-ensemble action. Robot drivers, teleoperators, environments, visualization and video shards remain explicitly refused; the physical rollout boundary is not faked.",
     },
 ];
 
@@ -325,8 +324,8 @@ pub static MODULE_FAMILIES: &[ModuleFamily] = &[
                read/write are ported, as is the ACT tensor model for state/action and embedded or \
                in-memory camera inputs: the VAE encoder, ResNet18/34 backbone, 1-D/2-D camera \
                position embeddings, transformer, action head and the L1-plus-KL objective. The \
-               temporal ensembler, ACT processor pipeline and every other policy architecture are \
-               not.",
+               ACT temporal ensembler is ported in `rerobot_train::deploy`; the ACT processor \
+               pipeline and every other policy architecture are not.",
     },
     ModuleFamily {
         name: "processor",
@@ -363,19 +362,13 @@ pub static MODULE_FAMILIES: &[ModuleFamily] = &[
         name: "rollout",
         status: Status::Partial,
         upstream_modules: 18,
-        note:
-            "`ring_buffer.RolloutRingBuffer` is ported and tested, including its byte-accounting \
-               quirks, as is the DAgger event state machine (`strategies.dagger.DAggerPhase`, its \
-               four transitions and `DAggerEvents`). The DAgger strategy itself, the input \
-               devices it listens to, the other rollout strategies and the policy loop are not.",
+        note: "`ring_buffer.RolloutRingBuffer` is ported and tested, including its byte-accounting quirks, as is the DAgger event state machine (`strategies.dagger.DAggerPhase`, its four transitions and `DAggerEvents`). The DAgger strategy itself, the input devices it listens to, the other rollout strategies and the hardware/environment policy loop are not. The local dataset-backed ACT action queue and temporal ensembler are ported in `rerobot_train::deploy`; it does not claim a robot or Gymnasium boundary.",
     },
     ModuleFamily {
         name: "scripts",
         status: Status::Partial,
         upstream_modules: 20,
-        note: "`lerobot_info` and `lerobot_train` are ported and runnable, the latter for one \
-               vertical slice. The other 16 entry points exist only as executables that fail with \
-               a stable unsupported error.",
+        note: "`lerobot_info`, `lerobot_train`, and the hardware-independent local ACT path of `lerobot_rollout` are ported and runnable. The other 15 entry points exist only as executables that fail with a stable unsupported error.",
     },
     ModuleFamily {
         name: "teleoperators",

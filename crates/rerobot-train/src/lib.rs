@@ -4,6 +4,7 @@
 pub mod checkpoint;
 pub mod config;
 pub mod data;
+pub mod deploy;
 pub mod device;
 pub mod error;
 pub mod limits;

@@ -6,6 +6,7 @@
 #![deny(unsafe_code)]
 
 pub mod info;
+pub mod rollout;
 pub mod train;
 pub mod which;
 
@@ -82,6 +83,8 @@ pub fn help_text(name: &str) -> String {
             "Usage: {name} [--help] [--version] --dataset.repo_id=ID --dataset.root=DIR \\\n\
                  \x20                   --output_dir=DIR --policy.type=act [OPTIONS...]"
         )
+    } else if name == "lerobot-rollout" {
+        format!("Usage: {name} [--help] [--version] --policy.path=DIR --dataset.root=DIR --steps=N")
     } else {
         format!("Usage: {name} [--help] [--version]")
     };
@@ -90,6 +93,8 @@ pub fn help_text(name: &str) -> String {
     // a user rather than only by a test.
     let extra = if name == "lerobot-train" {
         format!("\n\n{}", train::help_section())
+    } else if name == "lerobot-rollout" {
+        format!("\n\n{}", rollout::help_section())
     } else {
         String::new()
     };
@@ -169,9 +174,9 @@ pub fn dispatch(name: &str, args: &[String]) -> Outcome {
             ),
         },
         "lerobot-train" => run_train(name, args),
-        // Unreachable while `lerobot-info` and `lerobot-train` are the only
-        // supported commands, but failing loudly beats silently succeeding if that
-        // changes.
+        "lerobot-rollout" => run_rollout(name, args),
+        // Unreachable while the supported commands are implemented below, but failing
+        // loudly beats silently succeeding if the inventory and dispatcher diverge.
         other => Outcome::err(
             format!("{other}: marked supported but has no implementation"),
             EXIT_UNSUPPORTED,
@@ -211,6 +216,26 @@ fn run_train(name: &str, args: &[String]) -> Outcome {
             }
             Outcome::ok(stdout)
         }
+        Err(error) => Outcome::err(format!("{name}: {error}"), EXIT_UNSUPPORTED),
+    }
+}
+
+/// Parse `args` and run the local checkpoint-backed rollout.
+fn run_rollout(name: &str, args: &[String]) -> Outcome {
+    let config = match rollout::parse(args) {
+        Ok(config) => config,
+        Err(error) => {
+            let code = match error {
+                rollout::ArgumentError::Unsupported { .. } => EXIT_UNSUPPORTED,
+                _ => EXIT_USAGE,
+            };
+            return Outcome::err(format!("{name}: {error}"), code);
+        }
+    };
+
+    let result = rollout::run(&config, &mut |line| println!("{line}"));
+    match result {
+        Ok(()) => Outcome::ok(String::new()),
         Err(error) => Outcome::err(format!("{name}: {error}"), EXIT_UNSUPPORTED),
     }
 }

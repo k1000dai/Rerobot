@@ -31,6 +31,7 @@ cuda = ["candle-core/cuda", "candle-nn/cuda"]
 rerobot-core.workspace = true
 indexmap.workspace = true
 num-bigint.workspace = true
+serde_json.workspace = true
 
 # The tensor runtime. Pinned exactly: this crate reimplements PyTorch operator
 # semantics (`nn.MultiheadAttention`'s packed projection, `nn.LayerNorm`'s eps,
@@ -66,6 +67,9 @@ parquet = { version = "=56.2.0", default-features = false, features = ["arrow", 
 # JPEG cells it feeds the decoder, and `examples/make_embedded_image_fixture.rs` writes
 # the committed fixture, both at the pin the decoder itself is built against.
 image = { version = "=0.25.6", default-features = false, features = ["jpeg", "png"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [lints.rust]
 missing_docs = "warn"

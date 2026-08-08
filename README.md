@@ -14,9 +14,9 @@ suite. Everything that does not work says so and exits non-zero.
 | | |
 | --- | --- |
 | Upstream target | `lerobot` 0.6.1 (`f37be3edbee60f3a09a5183788b91eb19f0c07d1`) |
-| Milestone | 2 of N — core utility slice, full CLI surface, and the first runnable training slice |
-| Runnable executables | 2 of 18 (`lerobot-info`, and `lerobot-train` for the local ACT slice with embedded PNG/JPEG camera columns); the other 16 exist and fail explicitly |
-| Tests | 854 integration/unit tests + 56 rustdoc tests, all passing. The ACT training slice is compared element by element against upstream running on PyTorch |
+| Milestone | 3 of N — core utility slice, local ACT training, and hardware-independent checkpoint deployment |
+| Runnable executables | 3 of 18 (`lerobot-info`, local ACT `lerobot-train`, and dataset-backed local ACT `lerobot-rollout`); the other 15 exist and fail explicitly |
+| Tests | Updated counts are reported by the verification run; the ACT training and deployment slices are compared element by element against upstream running on PyTorch where the boundary is available |
 | Minimum Rust | 1.85 — the floor of the locked dependency tree, built and tested on that exact toolchain by the `msrv` CI job |
 
 **Read [`docs/compatibility.md`](docs/compatibility.md) before using this.** It
@@ -63,6 +63,8 @@ This installs all 18 executables under their upstream names.
 lerobot-info                 # runs for real
 
 lerobot-train --help         # works, and lists exactly what it accepts
+
+lerobot-rollout --help       # local checkpoint + dataset deployment boundary
 
 lerobot-eval --help          # works, and states that it is unimplemented
 lerobot-eval; echo $?        # -> 2, with a single-line error on stderr
@@ -112,6 +114,10 @@ Three details worth knowing up front:
   and the thread-safe request/consume hand-off. The DAgger strategy itself, the
   keyboard and pedal listeners, dataset recording, teleoperator handover and
   policy inference are not ported, and nothing about them is stubbed.
+* `lerobot-rollout` has one complete hardware-independent path: a local ACT
+  checkpoint can be loaded, local dataset observations can be normalized and fed
+  through ACT's action queue or temporal ensembler, and finite action traces are
+  emitted. Robot drivers, Gymnasium environments, and video shards remain refused.
 
 ## Development
 

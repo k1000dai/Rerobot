@@ -20,13 +20,16 @@ use rerobot_compat::{entry_point, module_family, Status, ENTRY_POINTS, MODULE_FA
 assert_eq!(ENTRY_POINTS.len(), 18);
 assert_eq!(ENTRY_POINTS[0].name, "lerobot-calibrate");
 
-// Two are runnable at this milestone, in upstream declaration order.
+// Three are runnable at this milestone, in upstream declaration order.
 let runnable: Vec<&str> = ENTRY_POINTS
     .iter()
     .filter(|e| !e.status.is_unsupported())
     .map(|e| e.name)
     .collect();
-assert_eq!(runnable, vec!["lerobot-train", "lerobot-info"]);
+assert_eq!(
+    runnable,
+    vec!["lerobot-train", "lerobot-info", "lerobot-rollout"]
+);
 
 // `lerobot-train` runs one vertical slice: ACT, a local dataset (including embedded
 // PNG/JPEG camera columns), CPU.

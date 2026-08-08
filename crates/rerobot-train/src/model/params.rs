@@ -27,6 +27,7 @@ use crate::error::{Result, TrainError};
 use candle_core::{DType, Device, Tensor, Var};
 use rerobot_core::random::SplitMix64;
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::Path;
 
 /// A trainable parameter and the `state_dict` key it is saved under.
@@ -173,6 +174,7 @@ impl ParameterStore {
     /// expects, and the file must carry no extra keys: a checkpoint that does not
     /// describe *this* architecture is refused rather than partially loaded.
     pub fn load(&mut self, path: &Path, device: &Device) -> Result<()> {
+        validate_safetensors_container(path)?;
         let loaded = candle_core::safetensors::load(path, device)?;
         let expected = self.state_dict()?;
         for (name, tensor) in &expected {
@@ -238,6 +240,82 @@ impl ParameterStore {
         // is loaded separately.
         Ok(())
     }
+}
+
+/// Validate the container header before Candle's loader reads and materializes it.
+fn validate_safetensors_container(path: &Path) -> Result<()> {
+    let file_size = std::fs::metadata(path)
+        .map_err(|error| TrainError::io(path, &error))?
+        .len();
+    let max_file_size = crate::limits::MAX_CHECKPOINT_FILE_BYTES;
+    if file_size > max_file_size {
+        return Err(TrainError::checkpoint(
+            path,
+            format!("exceeds the maximum safetensors file size of {max_file_size} bytes"),
+        ));
+    }
+
+    let mut file = std::fs::File::open(path).map_err(|error| TrainError::io(path, &error))?;
+    let mut prefix = [0u8; 8];
+    file.read_exact(&mut prefix).map_err(|error| {
+        TrainError::checkpoint(path, format!("has no complete safetensors header: {error}"))
+    })?;
+    let header_size = u64::from_le_bytes(prefix);
+    let max_header_size = crate::limits::MAX_CHECKPOINT_HEADER_BYTES;
+    if header_size > max_header_size {
+        return Err(TrainError::checkpoint(
+            path,
+            format!(
+                "header exceeds the maximum safetensors header size of {max_header_size} bytes"
+            ),
+        ));
+    }
+    let header_size = usize::try_from(header_size).map_err(|_| {
+        TrainError::checkpoint(path, "safetensors header size does not fit in memory")
+    })?;
+    let total_header_size = header_size.checked_add(prefix.len()).ok_or_else(|| {
+        TrainError::checkpoint(path, "safetensors header size overflows the address space")
+    })?;
+    if u64::try_from(total_header_size).unwrap_or(u64::MAX) > file_size {
+        return Err(TrainError::checkpoint(
+            path,
+            "safetensors header extends beyond the end of the file",
+        ));
+    }
+    let mut header = Vec::with_capacity(total_header_size);
+    header.extend_from_slice(&prefix);
+    header.resize(total_header_size, 0);
+    file.read_exact(&mut header[prefix.len()..])
+        .map_err(|error| {
+            TrainError::checkpoint(
+                path,
+                format!("has an unreadable safetensors header: {error}"),
+            )
+        })?;
+    // Candle's safetensors convenience loader expects the complete file, so its
+    // metadata reader cannot be used on this header-only prefix (it would reject a
+    // valid header because the tensor payload is intentionally not in memory yet).
+    // Parsing the JSON here still bounds the number of entries before Candle sees it;
+    // Candle remains responsible for validating each tensor's shape and offsets.
+    let tensor_count = serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(
+        &header[prefix.len()..],
+    )
+    .map_err(|error| {
+        TrainError::checkpoint(path, format!("has an invalid safetensors header: {error}"))
+    })?
+    .keys()
+    .filter(|name| name.as_str() != "__metadata__")
+    .count();
+    if tensor_count > crate::limits::MAX_CHECKPOINT_TENSORS {
+        return Err(TrainError::checkpoint(
+            path,
+            format!(
+                "contains {tensor_count} tensors, exceeding the maximum of {}",
+                crate::limits::MAX_CHECKPOINT_TENSORS
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// The element count of `shape`, checked and budgeted.
@@ -359,5 +437,34 @@ impl<'a> Initializer<'a> {
     /// A one tensor.
     pub fn ones(&self, shape: &[usize]) -> Result<Tensor> {
         Ok(Tensor::ones(shape, DType::F32, &self.device)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ParameterStore;
+    use candle_core::Device;
+    use std::fs::OpenOptions;
+
+    #[test]
+    fn safetensors_container_is_rejected_before_loading_when_oversized() {
+        let path = std::env::temp_dir().join(format!(
+            "rerobot-oversized-safetensors-{}",
+            std::process::id()
+        ));
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(crate::limits::MAX_CHECKPOINT_FILE_BYTES + 1)
+            .unwrap();
+        let error = ParameterStore::new()
+            .load(&path, &Device::Cpu)
+            .unwrap_err()
+            .to_string();
+        std::fs::remove_file(&path).unwrap();
+        assert!(error.contains("maximum safetensors file size"), "{error}");
     }
 }

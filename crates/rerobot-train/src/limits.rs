@@ -84,8 +84,31 @@ pub const MAX_CAMERAS: usize = 64;
 /// `batch_size`. Upstream's default is 8.
 pub const MAX_BATCH_SIZE: usize = 65_536;
 
-/// `steps`. Upstream's default is 100 000.
+/// Maximum number of action frames retained by the offline rollout trace.
+pub const MAX_ROLLOUT_TRACE_STEPS: usize = 65_536;
+
+/// `steps`. Upstream's default is 100 000; this broader bound remains for
+/// callers that do not retain a trace in memory.
 pub const MAX_STEPS: u64 = 1_000_000_000;
+
+/// Maximum bytes accepted for checkpoint JSON documents before parsing.
+pub const MAX_CHECKPOINT_JSON_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Maximum bytes accepted for a model safetensors container before Candle reads it.
+///
+/// This is deliberately below the model's aggregate tensor budget: Candle's convenience
+/// loader reads the whole file and materializes every tensor, including unexpected ones,
+/// before the model can validate names and shapes.
+pub const MAX_CHECKPOINT_FILE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Maximum bytes accepted for the safetensors JSON header.
+pub const MAX_CHECKPOINT_HEADER_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Maximum tensor entries accepted in a safetensors header.
+pub const MAX_CHECKPOINT_TENSORS: usize = 100_000;
+
+/// Maximum bytes accepted for a portable `checkpoints/last` marker.
+pub const MAX_CHECKPOINT_MARKER_BYTES: u64 = 4096;
 
 /// Bytes in one parquet file. Upstream caps a data file at
 /// `DEFAULT_DATA_FILE_SIZE_IN_MB` = 100 MB and a video file at 200 MB.
@@ -133,7 +156,9 @@ pub const MAX_EPISODES: usize = 1_000_000;
 /// could exhaust a machine unnoticed.
 pub const MAX_TENSOR_BYTES: usize = 512 * 1024 * 1024;
 
-/// Bytes every tensor of one model may occupy in total.
+/// Maximum bytes in one ACT inference output tensor before it is materialized.
+pub const MAX_INFERENCE_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
+
 ///
 /// The per-tensor budget does not bound the model: the allowed layer counts multiply
 /// the largest permitted tensor 128 times over for the encoder and again for the

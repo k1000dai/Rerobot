@@ -288,6 +288,15 @@ jobs:
           test -s "$out/checkpoints/000001/pretrained_model/model.safetensors"
           test -s "$out/checkpoints/000001/training_state/optimizer_state.safetensors"
           test -s "$out/checkpoints/000001/training_state/rng_state.safetensors"
+          ./target/release/lerobot-rollout \
+            --policy.path="$out/checkpoints/000001/pretrained_model" \
+            --dataset.root=crates/rerobot-train/tests/fixtures/state_only \
+            --steps=3 > rollout.log
+          grep -q '^frame:0 action:' rollout.log
+          grep -q '^frame:1 action:' rollout.log
+          grep -q '^frame:2 action:' rollout.log
+          grep -q 'queried:true' rollout.log
+          grep -q 'queried:false' rollout.log
 
       - name: --help and --version work for every entry point
         run: |

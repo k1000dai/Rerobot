@@ -142,20 +142,24 @@ fn unported_commands_stay_unsupported_even_with_arguments() {
 }
 
 #[test]
-fn sixteen_of_eighteen_commands_are_unsupported() {
+fn fifteen_of_eighteen_commands_are_unsupported() {
     let unsupported = ENTRY_POINTS
         .iter()
         .filter(|e| e.status.is_unsupported())
         .count();
-    assert_eq!(unsupported, 16);
-    // The two that are not: `lerobot-info` in full, and `lerobot-train` for the
-    // ACT local-dataset slice, including embedded PNG/JPEG camera columns.
+    assert_eq!(unsupported, 15);
+    // The three that are not: `lerobot-info` in full, `lerobot-train` for the
+    // ACT local-dataset slice, and `lerobot-rollout` for local checkpoint-backed
+    // action emission.
     let runnable: Vec<&str> = ENTRY_POINTS
         .iter()
         .filter(|e| !e.status.is_unsupported())
         .map(|e| e.name)
         .collect();
-    assert_eq!(runnable, vec!["lerobot-train", "lerobot-info"]);
+    assert_eq!(
+        runnable,
+        vec!["lerobot-train", "lerobot-info", "lerobot-rollout"]
+    );
 }
 
 #[test]

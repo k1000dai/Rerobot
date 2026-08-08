@@ -119,7 +119,7 @@ fn lookup_finds_entry_points_and_rejects_unknown_names() {
 }
 
 #[test]
-fn exactly_two_entry_points_are_runnable_in_this_milestone() {
+fn three_of_eighteen_entry_points_are_runnable_in_this_milestone() {
     // In upstream declaration order, which is the order `ENTRY_POINTS` is in.
     // Pinned as a list rather than a count so that promoting a command to
     // runnable is a deliberate edit here as well as in the inventory.
@@ -128,7 +128,10 @@ fn exactly_two_entry_points_are_runnable_in_this_milestone() {
         .filter(|e| !e.status.is_unsupported())
         .map(|e| e.name)
         .collect();
-    assert_eq!(runnable, vec!["lerobot-train", "lerobot-info"]);
+    assert_eq!(
+        runnable,
+        vec!["lerobot-train", "lerobot-info", "lerobot-rollout"]
+    );
 }
 
 #[test]

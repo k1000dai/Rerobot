@@ -1354,9 +1354,11 @@ dependencies = [
  "candle-nn",
  "image",
  "indexmap",
+ "libc",
  "num-bigint",
  "parquet",
  "rerobot-core",
+ "serde_json",
 ]
 
 [[package]]

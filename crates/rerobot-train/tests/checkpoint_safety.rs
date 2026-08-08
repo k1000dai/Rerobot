@@ -40,6 +40,36 @@ fn checkpoints_with_one(dir: &TempDir) -> (PathBuf, PathBuf) {
 }
 
 #[test]
+fn a_portable_marker_cannot_escape_the_checkpoint_directory() {
+    let dir = TempDir::new("marker-traversal");
+    let checkpoints = dir.child("checkpoints");
+    let outside = dir.child("outside");
+    std::fs::create_dir_all(&checkpoints).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(checkpoints.join("last"), "../outside\n").unwrap();
+
+    let error = checkpoint::read_last_checkpoint(&checkpoints).expect_err("traversal must fail");
+    assert!(error
+        .to_string()
+        .contains("outside the checkpoint directory"));
+}
+
+#[test]
+fn an_oversized_portable_marker_is_refused_before_path_resolution() {
+    let dir = TempDir::new("marker-size");
+    let checkpoints = dir.child("checkpoints");
+    std::fs::create_dir_all(&checkpoints).unwrap();
+    std::fs::write(
+        checkpoints.join("last"),
+        vec![b'x'; (rerobot_train::limits::MAX_CHECKPOINT_MARKER_BYTES + 1) as usize],
+    )
+    .unwrap();
+
+    let error = checkpoint::read_last_checkpoint(&checkpoints).expect_err("marker must be bounded");
+    assert!(error.to_string().contains("exceeds the maximum"));
+}
+
+#[test]
 fn a_real_directory_at_the_reserved_last_path_is_refused_not_deleted() {
     let dir = TempDir::new("last-is-a-dir");
     let (checkpoints, step) = checkpoints_with_one(&dir);
@@ -74,6 +104,16 @@ fn a_real_directory_at_the_reserved_last_path_is_refused_not_deleted() {
         std::fs::read_to_string(squatter.join("deep/nested/precious.txt")).unwrap(),
         "do not delete me"
     );
+}
+
+#[test]
+fn reading_a_real_directory_at_last_is_refused_instead_of_treated_as_a_checkpoint() {
+    let dir = TempDir::new("read-last-dir");
+    let checkpoints = dir.child("checkpoints");
+    std::fs::create_dir_all(checkpoints.join("last")).unwrap();
+    let error = checkpoint::read_last_checkpoint(&checkpoints)
+        .expect_err("a real directory must not be accepted as the last checkpoint");
+    assert!(error.to_string().contains("real directory"), "{error}");
 }
 
 #[test]

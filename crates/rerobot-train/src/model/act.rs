@@ -12,10 +12,9 @@
 //! exact contract and for why neither on-disk camera form of a LeRobot v3.0 dataset
 //! can be read here.
 //!
-//! **Not** ported: the temporal ensembler, which only runs at inference, and
-//! pretrained torchvision backbone weights, which are a download rather than a
-//! computation. [`crate::model::act::ActModel::new`] refuses a config needing either rather than
-//! quietly building a different model.
+//! **Not** ported: pretrained torchvision backbone weights, which are a download
+//! rather than a computation. The inference-only temporal ensembler lives in
+//! [`crate::deploy::TemporalEnsembler`] rather than inside this tensor model.
 
 use crate::data::batch::Batch;
 use crate::data::image::{camera_view, require_finite};
@@ -161,6 +160,30 @@ struct DecoderLayer {
     norm1: LayerNorm,
     norm2: LayerNorm,
     norm3: LayerNorm,
+}
+
+/// Check the joint output shape before the action head allocates it.
+fn checked_inference_output_values(
+    batch_size: usize,
+    chunk_size: usize,
+    action_dim: usize,
+) -> Result<usize> {
+    let values = crate::limits::checked_product(
+        &[batch_size, chunk_size, action_dim],
+        "the inference action output scalar count",
+    )?;
+    let bytes = crate::limits::checked_mul(
+        values,
+        std::mem::size_of::<f32>(),
+        "the inference action output size in bytes",
+    )?;
+    if bytes > crate::limits::MAX_INFERENCE_OUTPUT_BYTES {
+        return Err(TrainError::Metadata(format!(
+            "inference action output is {bytes} bytes, exceeding the limit of {} bytes",
+            crate::limits::MAX_INFERENCE_OUTPUT_BYTES
+        )));
+    }
+    Ok(values)
 }
 
 /// The Action Chunking Transformer.
@@ -518,6 +541,7 @@ impl ActModel {
     /// A forward pass.
     pub fn forward(&self, batch: &Batch, mut pass: Pass<'_>) -> Result<ActOutput> {
         let batch_size = batch.len();
+        checked_inference_output_values(batch_size, self.shape.chunk_size, self.shape.action_dim)?;
         let dimension = self.shape.dim_model;
 
         let robot_state = match self.shape.robot_state_dim {
@@ -730,10 +754,15 @@ impl ActModel {
         })
     }
 
+    /// `ACTPolicy.predict_action_chunk`: an eval pass, latent zeroed, dropout off.
+    pub fn predict_action_chunk(&self, batch: &Batch) -> Result<Tensor> {
+        Ok(self.forward(batch, Pass::Eval)?.actions)
+    }
+
     /// `ACTPolicy.predict_action_chunk` followed by the `n_action_steps` slice
-    /// `select_action` applies: an eval pass, latent zeroed, dropout off.
+    /// `select_action` applies.
     pub fn predict_action_steps(&self, batch: &Batch) -> Result<Tensor> {
-        let actions = self.forward(batch, Pass::Eval)?.actions;
+        let actions = self.predict_action_chunk(batch)?;
         Ok(actions
             .narrow(1, 0, self.shape.n_action_steps)?
             .contiguous()?)
@@ -981,13 +1010,6 @@ fn resolve_shape(config: &ActConfig) -> Result<ActShape> {
     let outputs = config.output_features.clone().unwrap_or_default();
 
     let cameras = resolve_cameras(config, &inputs)?;
-    if config.temporal_ensemble_coeff.is_some() {
-        return Err(TrainError::unsupported(
-            "temporal_ensemble_coeff is set; the temporal ensembler is an inference-time \
-             component and is not ported"
-                .to_owned(),
-        ));
-    }
 
     let width = |features: &indexmap::IndexMap<String, rerobot_core::types::PolicyFeature>,
                  key: &str|
@@ -1335,4 +1357,18 @@ fn decoder_layer(
         norm2: layer_norm(store, init, &format!("{prefix}.norm2"), shape.dim_model)?,
         norm3: layer_norm(store, init, &format!("{prefix}.norm3"), shape.dim_model)?,
     })
+}
+
+#[cfg(test)]
+mod inference_budget_tests {
+    #[test]
+    fn action_output_budget_rejects_large_joint_shape_before_forward() {
+        let error = super::checked_inference_output_values(1, 8_192, 100_000)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("inference action output") && error.contains("bytes"),
+            "{error}"
+        );
+    }
 }

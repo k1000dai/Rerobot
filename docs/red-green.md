@@ -1184,13 +1184,14 @@ demonstrates is that the Rust slice produces a policy upstream can load and that
 drives a real MuJoCo robot to the goal. The 200-step checkpoint failing through the
 identical path is what rules out the environment doing the work.
 
-**Test count:** 851 → 854 distinct tests. The three added are the two in
-`tests/embedded_image.rs` and the one in `tests/optimizer.rs` above; the naive sum
-of cargo's `test result:` lines moves 853 → 856.
+**Test count:** 851 → 862 distinct tests. The local deployment slice adds eight
+new tests (`tests/deploy.rs` and `tests/rollout_cli.rs`); the naive sum of cargo's
+`test result:` lines is 864 because `dataset_json.rs` intentionally re-executes
+two cases.
 
 ## Final GREEN totals
 
-`cargo test --workspace --all-targets --all-features`
+`cargo test --workspace --all-targets --locked`
 
 | Target | Tests |
 | --- | ---: |
@@ -1216,23 +1217,28 @@ of cargo's `test result:` lines moves 853 → 856.
 | `rerobot-core` `tests/policy_normalize.rs` | 15 |
 | `rerobot-compat` `tests/inventory.rs` | 18 |
 | `rerobot-compat` `tests/docs_consistency.rs` | 13 |
-| `rerobot-train` `run` unit tests | 3 |
+| `rerobot-train` `run` and deployment unit tests | 4 |
 | `rerobot-train` `tests/dataset.rs` | 22 |
+| `rerobot-train` `tests/deploy.rs` | 9 |
+| `rerobot-train` `tests/device.rs` | 3 |
+| `rerobot-train` `tests/device_smoke.rs` | 1 |
+| `rerobot-train` `tests/embedded_image.rs` | 28 |
 | `rerobot-train` `tests/model.rs` | 31 |
-| `rerobot-train` `tests/optimizer.rs` | 16 |
-| `rerobot-train` `tests/train.rs` | 36 |
+| `rerobot-train` `tests/optimizer.rs` | 17 |
+| `rerobot-train` `tests/train.rs` | 39 |
 | `rerobot-train` `tests/goldens.rs` | 12 |
 | `rerobot-train` `tests/processor.rs` | 8 |
 | `rerobot-train` `tests/limits.rs` | 53 |
 | `rerobot-train` `tests/parquet_budget.rs` | 21 |
-| `rerobot-train` `tests/checkpoint_safety.rs` | 43 |
+| `rerobot-train` `tests/checkpoint_safety.rs` | 45 |
 | `rerobot-cli` `tests/cli.rs` | 21 |
 | `rerobot-cli` `tests/info.rs` | 18 |
+| `rerobot-cli` `tests/rollout_cli.rs` | 4 |
 | `rerobot-cli` `tests/which.rs` | 21 |
-| `rerobot-cli` `tests/train_cli.rs` | 32 |
-| **Total** | **795** |
+| `rerobot-cli` `tests/train_cli.rs` | 35 |
+| **Total** | **870** |
 
-Summing the `test result:` lines cargo prints gives 797, not 795.
+Summing the `test result:` lines cargo prints gives 872, not 870.
 `tests/dataset_json.rs` re-executes its own harness twice to drive a case that
 needs a fresh thread stack, and each re-execution prints a `1 passed; 50 filtered
 out` line of its own. The table above counts distinct tests.
@@ -1250,37 +1256,85 @@ covered by `tests/cli.rs`, which runs the built executables as subprocesses.
 | `rerobot-core` (crate README + item docs) | 49 |
 | `rerobot-compat` (crate README) | 2 |
 | `rerobot-cli` (crate README + `which`) | 3 |
-| `rerobot-train` (crate README + `limits`) | 2 |
-| **Total** | **56** |
+| `rerobot-train` (crate README + `limits`) | 3 |
+| **Total** | **57** |
 
-The subtotals, which sum to the 795 above: 426 in `rerobot-core` (including its two
-`rollout::dagger` unit tests), 245 in `rerobot-train`, 93 in `rerobot-cli` (including
+The subtotals, which sum to the 870 above: 426 in `rerobot-core` (including its two
+`rollout::dagger` unit tests), 313 in `rerobot-train`, 100 in `rerobot-cli` (including
 its one library unit test) and 31 in `rerobot-compat`. `rerobot-core` is where the
-pure-behaviour parity claim lives; of `rerobot-train`'s 245, `tests/goldens.rs` is the
-only file whose expected values came from PyTorch rather than from upstream's source,
-and `tests/processor.rs` is the only one comparing bytes against files upstream's own
-writer produced.
+pure-behaviour parity claim lives; of `rerobot-train`'s 313, `tests/goldens.rs` is
+the only file whose expected values came from PyTorch rather than from upstream's
+source, and `tests/processor.rs` is the only one comparing bytes against files
+upstream's own writer produced.
 
 The training slice's fixtures are committed and read offline. `cargo test` never
 invokes Python: `tools/goldens/` holds the scripts that produced them, run once
 against upstream at the pinned commit.
 
+## Cycle 18 — local ACT deployment boundary
+
+**RED** — before the deployment adapter existed, the two focused acceptance
+commands were run against the last training-only tree:
+
+```
+cargo test -p rerobot-train --test deploy --locked
+cargo test -p rerobot-cli --test rollout_cli --locked
+```
+
+Both exited non-zero: the first had no `rerobot_train::deploy` API to compile
+against, and the second still reached the inventory's explicitly unsupported
+rollout path. This was the intended boundary failure, not a fixture or test
+harness error.
+
+**GREEN** — after adding the checkpoint loader, feature normalization, ACT action
+queue, temporal ensembler, finite dataset-backed rollout, CLI allow-list, and refusal
+paths:
+
+```
+cargo test -p rerobot-train --test deploy --locked
+9 passed; 0 failed
+
+cargo test -p rerobot-cli --test rollout_cli --locked
+4 passed; 0 failed
+```
+
+The tests train a reduced ACT checkpoint in the fixture dataset, load the actual
+`safetensors` artifact, select finite actions through both queue and temporal-ensemble
+paths, exercise the CLI as a subprocess, and prove that an oversized
+arbitrary-precision integer is refused rather than silently narrowed. The accepted
+boundary is intentionally local and hardware-independent; robot drivers,
+environments, and video shards remain refused.
+
 ## Whole-workspace gate
+
+The CPU/default feature gates passed locally with the locked dependency graph:
 
 ```
 cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-targets --all-features
-cargo test --workspace --doc
-cargo build --workspace --release
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
+cargo test --workspace --doc --locked
+RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --locked
+cargo build --workspace --release --locked
 python3 tools/verify_packages.py                              # exact archive-only verification
-cargo +1.85.0 build --workspace --all-features --locked      # declared MSRV
-cargo +1.85.0 test --workspace --all-targets --all-features --locked
+cargo +1.85.0 build --workspace --locked
+cargo +1.85.0 test --workspace --all-targets --locked
 ```
 
-The MSRV commands are the same ones the `msrv` CI job runs, except that CI reads
-`1.85` out of `Cargo.toml` instead of hardcoding it, so the manifest and the
-tested toolchain cannot drift. 1.85 is the floor the *locked* tree imposes:
-`indexmap` 2.14.0 declares `rust-version = "1.85"` and `hashbrown` 0.17.1
-declares `"1.85.0"`. The workspace's own code needs less than that, so the number
-is a property of the dependency set, not of this source.
+The required all-features attempt is a documented environment blocker on this
+host, not a green result:
+
+```
+cargo test --workspace --all-targets --all-features --locked
+error: failed to run custom build command for `cudarc v0.16.6`
+Failed to execute `nvcc`: No such file or directory
+```
+
+The repository's CI deliberately uses the default feature set for the same reason:
+`cuda` requires an NVIDIA toolkit at build time. The MSRV commands are the same
+ones the `msrv` CI job runs, except that CI reads `1.85` out of `Cargo.toml`
+instead of hardcoding it, so the manifest and tested toolchain cannot drift.
+1.85 is the floor the *locked* tree imposes: `indexmap` 2.14.0 declares
+`rust-version = "1.85"` and `hashbrown` 0.17.1 declares `"1.85.0"`. The
+workspace's own code needs less than that, so the number is a property of the
+dependency set, not of this source.

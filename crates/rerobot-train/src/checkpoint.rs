@@ -27,7 +27,8 @@
 use crate::error::{Result, TrainError};
 use rerobot_core::dataset::json::{dumps_pretty_ascii, loads, JsonLike, JsonObject};
 use rerobot_core::random::SplitMix64;
-use std::path::{Path, PathBuf};
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
 
 /// `CHECKPOINTS_DIR`.
 pub const CHECKPOINTS_DIR: &str = "checkpoints";
@@ -128,6 +129,76 @@ pub fn write_last_checkpoint(
     }
 }
 
+#[cfg(unix)]
+fn open_marker_read_nofollow(link: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(link)
+}
+
+#[cfg(not(unix))]
+fn open_marker_read_nofollow(link: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new().read(true).open(link)
+}
+
+fn read_portable_marker(link: &Path) -> Result<String> {
+    let file = open_marker_read_nofollow(link).map_err(|error| TrainError::io(link, &error))?;
+    let limit = crate::limits::MAX_CHECKPOINT_MARKER_BYTES;
+    let mut bytes = Vec::new();
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| TrainError::io(link, &error))?;
+    if bytes.len() as u64 > limit {
+        return Err(TrainError::checkpoint(
+            link,
+            format!("exceeds the maximum marker size of {limit} bytes"),
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| TrainError::checkpoint(link, format!("is not valid UTF-8: {error}")))
+}
+
+fn resolve_marker_target(checkpoints_dir: &Path, target: &Path) -> Result<PathBuf> {
+    if target.is_absolute()
+        || target
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+    {
+        return Err(TrainError::checkpoint(
+            checkpoints_dir.join(LAST_CHECKPOINT_LINK),
+            "names a path outside the checkpoint directory",
+        ));
+    }
+    let resolved = checkpoints_dir.join(target);
+    if !resolved.is_dir() {
+        return Err(TrainError::checkpoint(
+            checkpoints_dir.join(LAST_CHECKPOINT_LINK),
+            format!("points at {}, which is not a directory", resolved.display()),
+        ));
+    }
+
+    // A seemingly relative target can still escape through a symlinked checkpoint
+    // directory. Canonicalize only after the lexical checks above, and refuse that
+    // case instead of handing a caller-controlled directory to resume logic.
+    let root = std::fs::canonicalize(checkpoints_dir)
+        .map_err(|error| TrainError::io(checkpoints_dir, &error))?;
+    let canonical =
+        std::fs::canonicalize(&resolved).map_err(|error| TrainError::io(&resolved, &error))?;
+    if !canonical.starts_with(&root) {
+        return Err(TrainError::checkpoint(
+            checkpoints_dir.join(LAST_CHECKPOINT_LINK),
+            "names a path outside the checkpoint directory",
+        ));
+    }
+    // Return the caller's path spelling rather than the canonical spelling. This
+    // preserves the public path contract (notably on macOS, where `/var` is an
+    // alias of `/private/var`) while the canonical path above still enforces the
+    // containment check.
+    Ok(resolved)
+}
+
 /// Resolve `checkpoints/last` to the directory it names.
 pub fn read_last_checkpoint(checkpoints_dir: &Path) -> Result<PathBuf> {
     let link = checkpoints_dir.join(LAST_CHECKPOINT_LINK);
@@ -137,36 +208,20 @@ pub fn read_last_checkpoint(checkpoints_dir: &Path) -> Result<PathBuf> {
         // `symlink_metadata` describes the link, not its target, so the target has
         // to be read out and re-anchored: upstream writes a *relative* link.
         let target = std::fs::read_link(&link).map_err(|error| TrainError::io(&link, &error))?;
-        let resolved = if target.is_absolute() {
-            target
-        } else {
-            checkpoints_dir.join(target)
-        };
-        if !resolved.is_dir() {
-            return Err(TrainError::checkpoint(
-                &link,
-                format!("points at {}, which is not a directory", resolved.display()),
-            ));
-        }
-        return Ok(resolved);
+        return resolve_marker_target(checkpoints_dir, &target);
     }
     if metadata.is_dir() {
-        // Not a link at all but a real directory under the reserved name.
-        return Ok(link);
+        return Err(TrainError::checkpoint(
+            &link,
+            "is a real directory, not a checkpoint marker; refusing to treat it as last",
+        ));
     }
-    let contents = std::fs::read_to_string(&link).map_err(|error| TrainError::io(&link, &error))?;
+    let contents = read_portable_marker(&link)?;
     let name = contents.trim();
     if name.is_empty() {
         return Err(TrainError::checkpoint(&link, "names no checkpoint"));
     }
-    let resolved = checkpoints_dir.join(name);
-    if !resolved.is_dir() {
-        return Err(TrainError::checkpoint(
-            &link,
-            format!("names {name:?}, which is not a directory"),
-        ));
-    }
-    Ok(resolved)
+    resolve_marker_target(checkpoints_dir, Path::new(name))
 }
 
 /// Write the portable marker into `parent`, naming `target`, atomically.

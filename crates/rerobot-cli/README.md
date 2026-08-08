@@ -13,7 +13,7 @@ so deployment tooling and documentation that reference them keep working:
 cargo install --path crates/rerobot-cli --locked
 ```
 
-Two of them run at this milestone. The other sixteen exist and fail explicitly.
+Three of them run at this milestone. The other fifteen exist and fail explicitly.
 
 ```shell
 # `lerobot-info` is a full port of `lerobot.scripts.lerobot_info`.
@@ -31,7 +31,12 @@ lerobot-train --dataset.repo_id=ID --dataset.root=DIR --output_dir=DIR \
 lerobot-train --policy.type=diffusion; echo $?   # -> 2
 lerobot-train --wandb.project=demo;    echo $?   # -> 2
 
-# The sixteen unported commands say so and exit 2:
+# A hardware-independent local deployment path loads a checkpoint and emits
+# actions from dataset observations:
+lerobot-rollout --policy.path=outputs/train/demo/checkpoints/000001/pretrained_model \\
+                --dataset.root=path/to/dataset --steps=10
+
+# The fifteen unported commands say so and exit 2:
 lerobot-eval; echo $?        # -> 2
 ```
 

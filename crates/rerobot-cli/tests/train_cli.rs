@@ -81,10 +81,16 @@ impl Drop for TempDir {
 }
 
 fn run(args: &[String]) -> Output {
-    Command::new(bin_path("lerobot-train"))
-        .args(args)
-        .output()
-        .expect("lerobot-train can be spawned")
+    run_with_env(args, &[])
+}
+
+fn run_with_env(args: &[String], envs: &[(&str, &Path)]) -> Output {
+    let mut command = Command::new(bin_path("lerobot-train"));
+    command.args(args);
+    for (name, value) in envs {
+        command.env(name, value);
+    }
+    command.output().expect("lerobot-train can be spawned")
 }
 
 /// The documented one-step invocation, plus whatever the caller adds.
@@ -215,6 +221,46 @@ fn the_lerobot_train_command_trains_on_an_embedded_image_dataset() {
             .join("checkpoints/000001/pretrained_model/model.safetensors")
             .is_file(),
         "the image CLI run did not publish a checkpoint"
+    );
+}
+
+#[test]
+fn a_local_checkpoint_can_be_resumed_without_retyping_dataset_or_policy_flags() {
+    let dir = TempDir::new("resume-e2e");
+    let first_output = dir.child("first");
+    let first = run(&slice_args(&first_output, &[]));
+    assert!(
+        first.status.success(),
+        "first run stderr: {}",
+        stderr_of(&first)
+    );
+
+    let checkpoint_config =
+        first_output.join("checkpoints/000001/pretrained_model/train_config.json");
+    let resumed_output = dir.child("resumed");
+    let result = run(&[
+        "--resume=true".to_owned(),
+        format!("--config_path={}", checkpoint_config.display()),
+        format!("--output_dir={}", resumed_output.display()),
+        "--steps=2".to_owned(),
+    ]);
+    let stdout = stdout_of(&result);
+    assert!(
+        result.status.success(),
+        "resume exited {:?}\nstdout:\n{stdout}\nstderr:\n{}",
+        result.status.code(),
+        stderr_of(&result)
+    );
+    assert!(stdout.contains("step:2 loss:"), "stdout:\n{stdout}");
+    assert!(
+        !stdout.contains("step:1 loss:"),
+        "step one was repeated:\n{stdout}"
+    );
+    assert!(
+        resumed_output
+            .join("checkpoints/000002/pretrained_model/model.safetensors")
+            .is_file(),
+        "the resumed run did not publish step two"
     );
 }
 
@@ -361,7 +407,9 @@ fn help_states_the_partial_status_and_lists_what_is_accepted_and_refused() {
     );
     // Every refused flag is listed, so the boundary is discoverable without
     // reading the source.
-    for flag in ["--config_path", "--resume", "--wandb", "--policy.path"] {
+    assert!(stdout.contains("--config_path"), "stdout:\n{stdout}");
+    assert!(stdout.contains("--resume=true"), "stdout:\n{stdout}");
+    for flag in ["--wandb", "--policy.path"] {
         assert!(
             stdout.contains(flag),
             "help does not list {flag}:\n{stdout}"
@@ -436,7 +484,6 @@ fn each_missing_requirement_is_named_in_turn() {
     let dir = TempDir::new("missing");
     for (omit, expected) in [
         ("--dataset.repo_id", "--dataset.repo_id is required"),
-        ("--dataset.root", "--dataset.root is required"),
         ("--output_dir", "--output_dir is required"),
     ] {
         let full = slice_args(&dir.child("out"), &[]);
@@ -460,7 +507,6 @@ fn a_flag_naming_an_unported_feature_is_refused_by_the_parser() {
     // parser refuses it by name and the message says what is missing.
     let dir = TempDir::new("unsupported-parse");
     for (flag, fragment) in [
-        ("--resume=true", "resume needs the optimizer"),
         ("--wandb.project=demo", "Weights & Biases"),
         ("--policy.path=lerobot/act_aloha", "Hub client"),
         ("--env.type=aloha", "Gymnasium"),
@@ -806,27 +852,52 @@ fn a_device_with_no_backend_at_all_is_refused_at_the_command_line() {
 }
 
 #[test]
-fn an_absent_dataset_root_fails_without_reaching_the_network() {
-    let dir = TempDir::new("absent-root");
+fn an_omitted_dataset_root_uses_the_revision_safe_hf_cache() {
+    let dir = TempDir::new("cache-root");
+    let hf_home = dir.child("hf");
+    let cached = hf_home
+        .join("hub")
+        .join("datasets--rerobot--state_only_slice")
+        .join("snapshots")
+        .join("v3.0");
+    copy_dir(&fixture_dataset(), &cached);
+
     let output_dir = dir.child("out");
+    let args: Vec<String> = slice_args(&output_dir, &[])
+        .into_iter()
+        .filter(|argument| !argument.starts_with("--dataset.root="))
+        .collect();
+    let result = run_with_env(&args, &[("HF_LEROBOT_HOME", &hf_home)]);
+    assert!(result.status.success(), "stderr:\n{}", stderr_of(&result));
+    assert!(output_dir
+        .join("checkpoints/000001/pretrained_model/train_config.json")
+        .is_file());
+}
+
+#[test]
+fn an_invalid_repo_id_without_a_root_fails_before_download() {
+    let dir = TempDir::new("invalid-repo");
     let args = vec![
-        "--dataset.repo_id=lerobot/pusht".to_owned(),
-        format!("--dataset.root={}", dir.child("nope").display()),
-        format!("--output_dir={}", output_dir.display()),
+        "--dataset.repo_id=not-a-repo".to_owned(),
+        format!("--output_dir={}", dir.child("out").display()),
         "--policy.type=act".to_owned(),
         "--steps=1".to_owned(),
     ];
     let result = run(&args);
-    assert_eq!(result.status.code(), Some(2));
-    let stderr = stderr_of(&result);
-    assert!(
-        stderr.contains("never downloads from the Hub"),
-        "stderr:\n{stderr}"
-    );
-    assert!(
-        !output_dir.exists(),
-        "a failed run must not leave an output directory"
-    );
+    assert_eq!(result.status.code(), Some(64));
+}
+
+fn copy_dir(source: &Path, target: &Path) {
+    std::fs::create_dir_all(target).unwrap();
+    for entry in std::fs::read_dir(source).unwrap().flatten() {
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        if source_path.is_dir() {
+            copy_dir(&source_path, &target_path);
+        } else {
+            std::fs::copy(source_path, target_path).unwrap();
+        }
+    }
 }
 
 #[test]
@@ -836,7 +907,7 @@ fn rerunning_into_the_same_output_directory_is_refused() {
     assert!(run(&slice_args(&output_dir, &[])).status.success());
     let second = run(&slice_args(&output_dir, &[]));
     assert_eq!(second.status.code(), Some(2));
-    assert!(stderr_of(&second).contains("resume is not supported"));
+    assert!(stderr_of(&second).contains("resume is false"));
 }
 
 #[test]

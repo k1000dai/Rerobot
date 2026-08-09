@@ -154,9 +154,12 @@ pub static ENTRY_POINTS: &[EntryPoint] = &[
             state/action columns and embedded PNG/JPEG camera columns, or through the in-memory \
             camera batch API. `--policy.device` takes `cpu`, and `cuda`/`cuda:0` when built with \
             the `cuda` feature; a GPU that was asked for and cannot be provided is an error rather \
-            than a silent fallback. Video decoding, external image files, image transforms, the Hub, \
-            accelerate, mixed precision, LR schedulers, PEFT, environment evaluation and resume \
-            are refused with a reason rather than ignored.",
+            than a silent fallback. A local one-process checkpoint can be resumed with \
+            `--resume=true --config_path=...`, restoring model, AdamW state, RNG and sampler \
+            position; Python's three-generator/distributed/accelerate resume semantics remain \
+            outside the boundary. Video decoding, external image files, image transforms, the \
+            Hub, accelerate, mixed precision, LR schedulers, PEFT and environment evaluation are \
+            refused with a reason rather than ignored.",
     },
     EntryPoint {
         name: "lerobot-train-tokenizer",

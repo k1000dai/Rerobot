@@ -52,7 +52,7 @@ All 18 upstream console scripts exist as executables with byte-identical names.
 | `lerobot-setup-motors` | hardware-gated | `lerobot.scripts.lerobot_setup_motors:main` | Set motor ids and baudrate on a motor bus. | Drives physical hardware through a vendor SDK; nothing is faked, so it stays hardware-gated until a real driver layer exists. |
 | `lerobot-teleoperate` | hardware-gated | `lerobot.scripts.lerobot_teleoperate:main` | Drive a robot from a teleoperator. | Drives physical hardware through a vendor SDK; nothing is faked, so it stays hardware-gated until a real driver layer exists. |
 | `lerobot-eval` | unimplemented | `lerobot.scripts.lerobot_eval:main` | Evaluate a policy by running environment rollouts. | Needs policy inference and a Gymnasium environment; neither is ported, and fabricating metrics would be worse than failing. |
-| `lerobot-train` | partial | `lerobot.scripts.lerobot_train:main` | Train a policy. | Runnable for one vertical slice: the ACT policy on a local LeRobot v3.0 with state/action columns and embedded PNG/JPEG camera columns, or through the in-memory camera batch API. `--policy.device` takes `cpu`, and `cuda`/`cuda:0` when built with the `cuda` feature; a GPU that was asked for and cannot be provided is an error rather than a silent fallback. Video decoding, external image files, image transforms, the Hub, accelerate, mixed precision, LR schedulers, PEFT, environment evaluation and resume are refused with a reason rather than ignored. |
+| `lerobot-train` | partial | `lerobot.scripts.lerobot_train:main` | Train a policy. | Runnable for one vertical slice: the ACT policy on a local LeRobot v3.0 with state/action columns and embedded PNG/JPEG camera columns, or through the in-memory camera batch API. `--policy.device` takes `cpu`, and `cuda`/`cuda:0` when built with the `cuda` feature; a GPU that was asked for and cannot be provided is an error rather than a silent fallback. A local one-process checkpoint can be resumed with `--resume=true --config_path=...`, restoring model, AdamW state, RNG and sampler position; Python's three-generator/distributed/accelerate resume semantics remain outside the boundary. Video decoding, external image files, image transforms, the Hub, accelerate, mixed precision, LR schedulers, PEFT and environment evaluation are refused with a reason rather than ignored. |
 | `lerobot-train-tokenizer` | unimplemented | `lerobot.scripts.lerobot_train_tokenizer:main` | Train the FAST action tokenizer. | Needs LeRobotDataset loading and the tokenizer training stack. |
 | `lerobot-dataset-viz` | unimplemented | `lerobot.scripts.lerobot_dataset_viz:main` | Visualize every frame of a dataset episode. | Needs the dataset reader plus a Rerun/Foxglove viewer bridge. |
 | `lerobot-info` | partial | `lerobot.scripts.lerobot_info:main` | Print a markdown summary of the system configuration. | Ported and runnable. Keys that report Python package versions cannot apply to a Rust build and are reported as not ported rather than invented. |
@@ -527,8 +527,10 @@ Candle can move without raising the MSRV. Arrow and Parquet are pinned to 56.2.0
 
 * No Python sidecar, FFI bridge, or subprocess shim for the implemented core.
 * No video decoder, external image-file loader, image augmentation pipeline, Hub
-  dataset download, evaluation environment, or training resume. The implemented ACT
-  path reads local state/action Parquet plus embedded PNG/JPEG camera columns and can
-  additionally consume validated in-memory camera tensors through `Batch::with_images`;
-  it loads weights and runs inference when validating a checkpoint round trip.
+  dataset download, evaluation environment, or Python/accelerate-compatible full
+  training resume. The implemented ACT path reads local state/action Parquet plus
+  embedded PNG/JPEG camera columns and can additionally consume validated in-memory
+  camera tensors through `Batch::with_images`; it loads weights and runs inference
+  when validating a checkpoint round trip, and it resumes a local one-process
+  checkpoint including model, AdamW, RNG and sampler state.
 * No hardware access beyond invoking `ffmpeg -version` for `lerobot-info`.

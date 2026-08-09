@@ -241,7 +241,13 @@ impl InferenceSession {
             ));
         }
 
-        let metadata = crate::data::meta::DatasetMetadata::load(dataset_root)?;
+        let dataset_root = if crate::hub::is_complete_dataset(dataset_root) {
+            dataset_root.to_path_buf()
+        } else {
+            let train_config = crate::config::TrainConfig::from_checkpoint_dir(checkpoint_dir)?;
+            crate::hub::resolve_dataset_root(&train_config.dataset_repo_id, dataset_root, None)?
+        };
+        let metadata = crate::data::meta::DatasetMetadata::load(&dataset_root)?;
         let fps = metadata.fps()?;
         let chunk_size = checked_deployment_chunk_size(&config.chunk_size)?;
         let chunk_size = i64::try_from(chunk_size).map_err(|_| {
@@ -249,7 +255,7 @@ impl InferenceSession {
         })?;
         let mut delta_timestamps = IndexMap::new();
         delta_timestamps.insert(ACTION.to_owned(), action_delta_timestamps(chunk_size, fps));
-        let dataset = StateOnlyDataset::load(dataset_root, &delta_timestamps, 1e-4)?;
+        let dataset = StateOnlyDataset::load(&dataset_root, &delta_timestamps, 1e-4)?;
 
         let normalized_features = config
             .input_features

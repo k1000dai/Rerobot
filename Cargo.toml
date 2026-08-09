@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/rerobot-core",
     "crates/rerobot-compat",
+    "crates/rerobot-hardware",
     "crates/rerobot-train",
     "crates/rerobot-cli",
 ]
@@ -29,6 +30,7 @@ categories = ["science::robotics"]
 [workspace.dependencies]
 rerobot-core = { version = "0.1.0", path = "crates/rerobot-core" }
 rerobot-compat = { version = "0.1.0", path = "crates/rerobot-compat" }
+rerobot-hardware = { version = "0.1.0", path = "crates/rerobot-hardware" }
 rerobot-train = { version = "0.1.0", path = "crates/rerobot-train" }
 indexmap = { version = "2.7", features = ["serde"] }
 log = "0.4.27"
@@ -47,6 +49,10 @@ serde = { version = "1.0", features = ["derive"] }
 # rewrites `serde_json::Number` for every crate in the dependency graph, which a
 # library has no business imposing on its users.
 serde_json = { version = "1.0", features = ["preserve_order", "raw_value"] }
+serialport = { version = "=4.9.0", default-features = false }
+# Native Hub access for dataset snapshots. The training/runtime path remains
+# Python-free; TLS is provided by rustls rather than a subprocess or curl.
+ureq = { version = "=3.4.0", default-features = false, features = ["json", "rustls"] }
 
 [profile.release]
 lto = "thin"

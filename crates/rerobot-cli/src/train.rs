@@ -91,8 +91,6 @@ impl std::error::Error for ArgumentError {}
 /// Kept as data rather than as branches so that `--help` can list them and the
 /// compatibility document can be checked against them.
 pub static UNSUPPORTED_ARGUMENTS: &[(&str, &str)] = &[
-    ("config_path", "resuming or loading a run config needs the Draccus config loader, which is not ported"),
-    ("resume", "resume needs the optimizer and RNG state loader plus sample-exact sampler positioning; the state is written but not yet read back"),
     ("policy.path", "loading a pretrained policy needs the Hub client and the checkpoint loader"),
     ("env", "environment rollouts need Gymnasium, which is not ported"),
     ("env.type", "environment rollouts need Gymnasium, which is not ported"),
@@ -351,7 +349,10 @@ pub fn parse(args: &[String]) -> Result<TrainConfig, ArgumentError> {
     let mut repo_id: Option<String> = None;
     let mut root: Option<PathBuf> = None;
     let mut output_dir: Option<PathBuf> = None;
+    let mut config_path: Option<PathBuf> = None;
+    let mut resume: Option<bool> = None;
     let mut episodes: Option<Vec<i64>> = None;
+    let mut policy_overrides: Vec<(String, Value)> = Vec::new();
     let mut policy_type_given = false;
     let mut policy = ActConfig::default();
     policy.device = Some("cpu".to_owned());
@@ -377,6 +378,8 @@ pub fn parse(args: &[String]) -> Result<TrainConfig, ArgumentError> {
             "dataset.episodes" => episodes = Some(value.as_int_list(flag)?),
             "dataset.use_imagenet_stats" => use_imagenet_stats = Some(value.as_bool(flag)?),
             "output_dir" => output_dir = Some(PathBuf::from(value.as_string(flag)?)),
+            "config_path" => config_path = Some(PathBuf::from(value.as_string(flag)?)),
+            "resume" => resume = Some(value.as_bool(flag)?),
             "job_name" => job_name = Some(value.as_string(flag)?),
             "seed" => {
                 seed = Some(match value {
@@ -425,9 +428,89 @@ pub fn parse(args: &[String]) -> Result<TrainConfig, ArgumentError> {
                     Err(ArgumentError::Unknown { flag }) => return Err(classify(&flag)),
                     other => other?,
                 }
+                policy_overrides.push((other.to_owned(), value));
             }
             _ => return Err(classify(flag)),
         }
+    }
+
+    if resume == Some(true) {
+        let config_path = config_path.ok_or_else(|| ArgumentError::Unsupported {
+            flag: "resume".to_owned(),
+            reason: "resume needs the optimizer and RNG state loader plus sample-exact sampler positioning; pass --config_path to a local checkpoint".to_owned(),
+        })?;
+        let checkpoint_dir = resolve_checkpoint_path(&config_path)?;
+        let mut config = TrainConfig::from_checkpoint_dir(&checkpoint_dir).map_err(|error| {
+            ArgumentError::Value {
+                flag: "config_path".to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+        for (flag, value) in policy_overrides {
+            apply_policy_flag(&mut config.policy, &flag, &value)?;
+        }
+        if let Some(value) = repo_id {
+            config.dataset_repo_id = value;
+        }
+        if let Some(value) = root {
+            config.dataset_root = value;
+        }
+        if let Some(value) = output_dir {
+            config.output_dir = value;
+        }
+        if let Some(value) = episodes {
+            config.dataset_episodes = Some(value);
+        }
+        if let Some(value) = job_name {
+            config.job_name = Some(value);
+        }
+        if let Some(value) = seed {
+            config.seed = value;
+        }
+        if let Some(value) = batch_size {
+            config.batch_size = value;
+        }
+        if let Some(value) = steps {
+            config.steps = value;
+        }
+        if let Some(value) = log_freq {
+            config.log_freq = value;
+        }
+        if let Some(value) = save_freq {
+            config.save_freq = value;
+        }
+        if let Some(value) = save_checkpoint {
+            config.save_checkpoint = value;
+        }
+        if let Some(value) = tolerance_s {
+            config.tolerance_s = value;
+        }
+        if let Some(value) = num_workers {
+            config.num_workers = value;
+        }
+        if let Some(value) = use_preset {
+            if value != config.use_policy_training_preset {
+                return Err(ArgumentError::Unsupported {
+                    flag: "use_policy_training_preset".to_owned(),
+                    reason: "the checkpoint restores its AdamW parameter-group hyperparameters; changing the optimizer preset during resume is not supported".to_owned(),
+                });
+            }
+        }
+        if let Some(value) = use_imagenet_stats {
+            config.dataset_use_imagenet_stats = value;
+        }
+        config.resume = true;
+        config.checkpoint_path = Some(checkpoint_dir);
+        return Ok(config);
+    }
+    if config_path.is_some() {
+        return Err(ArgumentError::Unsupported {
+            flag: "config_path".to_owned(),
+            reason: "resuming or loading a run config needs the Draccus config loader, which is not ported".to_owned(),
+        });
+    }
+    if resume == Some(false) {
+        // `--resume=false` is a valid explicit default and otherwise has no effect.
     }
 
     if !policy_type_given {
@@ -441,12 +524,15 @@ pub fn parse(args: &[String]) -> Result<TrainConfig, ArgumentError> {
         flag: "dataset.repo_id".to_owned(),
         reason: "the dataset identifier has no default".to_owned(),
     })?;
-    let root = root.ok_or_else(|| ArgumentError::Missing {
-        flag: "dataset.root".to_owned(),
-        reason: "this slice reads local datasets only and never downloads from the Hub, so the \
-                 dataset directory has to be named explicitly"
-            .to_owned(),
-    })?;
+    let root = match root {
+        Some(root) => root,
+        None => rerobot_train::hub::default_dataset_root(&repo_id).map_err(|error| {
+            ArgumentError::Value {
+                flag: "dataset.repo_id".to_owned(),
+                reason: error.to_string(),
+            }
+        })?,
+    };
     let output_dir = output_dir.ok_or_else(|| ArgumentError::Missing {
         flag: "output_dir".to_owned(),
         reason: "upstream defaults it to a timestamped directory; a run here names its output \
@@ -491,6 +577,70 @@ pub fn parse(args: &[String]) -> Result<TrainConfig, ArgumentError> {
         config.dataset_use_imagenet_stats = value;
     }
     Ok(config)
+}
+
+fn resolve_checkpoint_path(path: &std::path::Path) -> Result<PathBuf, ArgumentError> {
+    let checkpoint = if path.is_file() {
+        let is_train_config = path.file_name().and_then(|name| name.to_str())
+            == Some(rerobot_train::checkpoint::TRAIN_CONFIG_NAME)
+            && path
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str())
+                == Some(rerobot_train::checkpoint::PRETRAINED_MODEL_DIR);
+        if !is_train_config {
+            return Err(ArgumentError::Value {
+                flag: "config_path".to_owned(),
+                reason: "expected a checkpoint directory or its pretrained_model/train_config.json"
+                    .to_owned(),
+            });
+        }
+        path.parent()
+            .and_then(|parent| parent.parent())
+            .map(PathBuf::from)
+            .ok_or_else(|| ArgumentError::Value {
+                flag: "config_path".to_owned(),
+                reason: "the checkpoint config has no parent checkpoint directory".to_owned(),
+            })?
+    } else if path.is_dir()
+        && path.file_name().and_then(|name| name.to_str())
+            == Some(rerobot_train::checkpoint::PRETRAINED_MODEL_DIR)
+        && path
+            .join(rerobot_train::checkpoint::TRAIN_CONFIG_NAME)
+            .is_file()
+    {
+        path.parent()
+            .map(PathBuf::from)
+            .ok_or_else(|| ArgumentError::Value {
+                flag: "config_path".to_owned(),
+                reason: "the pretrained_model directory has no checkpoint parent".to_owned(),
+            })?
+    } else if path.file_name().and_then(|name| name.to_str())
+        == Some(rerobot_train::checkpoint::LAST_CHECKPOINT_LINK)
+    {
+        let checkpoints_dir = path.parent().ok_or_else(|| ArgumentError::Value {
+            flag: "config_path".to_owned(),
+            reason: "the last-checkpoint marker has no parent directory".to_owned(),
+        })?;
+        rerobot_train::checkpoint::read_last_checkpoint(checkpoints_dir).map_err(|error| {
+            ArgumentError::Value {
+                flag: "config_path".to_owned(),
+                reason: error.to_string(),
+            }
+        })?
+    } else if path.is_dir()
+        && path
+            .join(rerobot_train::checkpoint::PRETRAINED_MODEL_DIR)
+            .is_dir()
+    {
+        path.to_owned()
+    } else {
+        return Err(ArgumentError::Value {
+            flag: "config_path".to_owned(),
+            reason: format!("{} is not a recognized local checkpoint", path.display()),
+        });
+    };
+    Ok(checkpoint)
 }
 
 /// Decide whether an otherwise-unrecognized flag is a real upstream one this slice
@@ -654,9 +804,16 @@ pub fn help_section() -> String {
          \n\
          Required:\n\
          \x20 --dataset.repo_id=ID        dataset identifier, recorded in the checkpoint\n\
-         \x20 --dataset.root=DIR          local dataset directory (no Hub download)\n\
-         \x20 --output_dir=DIR            run output directory, must not exist\n\
+         --dataset.root=DIR          optional local directory; absent means Hub snapshot cache\n\
+         \x20 --output_dir=DIR            fresh-run output directory, must not exist\n\
          \x20 --policy.type=act           ACT is the only ported policy\n\
+         \n\
+         Resume:\n\
+         \x20 --resume=true --config_path=DIR|FILE\n\
+         \x20                              restore a local checkpoint; FILE may be\n\
+         \x20                              pretrained_model/train_config.json, or DIR\n\
+         \x20                              may be the checkpoint directory or checkpoints/last\n\
+         \x20                              (dataset and policy flags are loaded from it)\n\
          \n\
          Run:\n\
          \x20 --steps=N --batch_size=N --seed=N|null --log_freq=N --save_freq=N\n\
@@ -698,13 +855,7 @@ pub fn help_section() -> String {
         );
         text.push('\n');
     }
-    text.push_str(
-        "\nScope: a LeRobot v3.0 dataset on local disk, ACT. State and action columns\n\
-         are read, and so is a dtype=\"image\" camera column whose PNG or JPEG frames\n\
-         are embedded in the parquet file. Video features, the Hub, distributed\n\
-         training, mixed precision, LR schedulers and environment evaluation are not\n\
-         ported.\n\n",
-    );
+    text.push_str("\nScope: a LeRobot v3.0 dataset from local disk or the Hugging Face Hub, ACT. State and action columns\nare read, and so is a dtype=\"image\" camera column whose PNG or JPEG frames are embedded in the parquet file. Video features and distributed training, mixed precision, LR schedulers and environment evaluation are not ported.\n\n");
     text.push_str(scope_note);
     text
 }

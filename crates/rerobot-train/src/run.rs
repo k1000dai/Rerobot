@@ -8,8 +8,10 @@
 //! What upstream wraps around that and this does not: `accelerate` (so no
 //! distributed training, no mixed precision, no gradient accumulation), the
 //! `DataLoader`'s worker processes, `wandb`, the LR scheduler, environment
-//! evaluation, the held-out eval split, and resume. Every one of those is refused
-//! by [`crate::config::TrainConfig::validate`] rather than ignored.
+//! evaluation, the held-out eval split, the three Python/NumPy/PyTorch RNG streams,
+//! and distributed resume. Local one-process resume is implemented by
+//! [`TrainSession::restore`], while those wider upstream boundaries remain refused
+//! by configuration validation.
 
 use crate::checkpoint;
 use crate::config::TrainConfig;
@@ -23,11 +25,12 @@ use crate::optim::{act_parameter_groups, clip_grad_norm, parameter_l2, AdamW};
 use candle_core::Device;
 use indexmap::IndexMap;
 use rerobot_core::dataset::delta::action_delta_timestamps;
+use rerobot_core::dataset::sampler::compute_sampler_state;
 use rerobot_core::dataset::sampler::EpisodeAwareSampler;
 use rerobot_core::policy::normalize::Normalizer;
 use rerobot_core::random::SplitMix64;
 use rerobot_core::BigInt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// What one optimization step produced.
 #[derive(Debug, Clone, PartialEq)]
@@ -126,7 +129,9 @@ impl TrainSession {
         let device = crate::device::resolve(config.policy.device.as_deref())?;
         let seed = config.seed.unwrap_or(0);
 
-        let metadata = crate::data::meta::DatasetMetadata::load(&config.dataset_root)?;
+        let dataset_root =
+            crate::hub::resolve_dataset_root(&config.dataset_repo_id, &config.dataset_root, None)?;
+        let metadata = crate::data::meta::DatasetMetadata::load(&dataset_root)?;
         let fps = metadata.fps()?;
 
         // `resolve_delta_timestamps`: ACT asks for an action window of
@@ -140,8 +145,7 @@ impl TrainSession {
         let mut delta_timestamps: IndexMap<String, Vec<f64>> = IndexMap::new();
         delta_timestamps.insert(ACTION.to_owned(), action_delta_timestamps(chunk_size, fps));
 
-        let dataset =
-            StateOnlyDataset::load(&config.dataset_root, &delta_timestamps, config.tolerance_s)?;
+        let dataset = StateOnlyDataset::load(&dataset_root, &delta_timestamps, config.tolerance_s)?;
 
         // `make_policy`: the dataset's features become the policy's, split by
         // whether they are actions, plus the cameras the config declares.
@@ -210,6 +214,48 @@ impl TrainSession {
             batch_size: config.batch_size,
             device,
         })
+    }
+
+    /// Restore model, optimizer, RNG and sample position from a local checkpoint.
+    ///
+    /// The checkpoint is validated as a whole before the next update: model tensors,
+    /// optimizer moments, the one-word RNG state, and the recorded training step must
+    /// all describe this session's architecture and data order.
+    pub fn restore(&mut self, checkpoint_dir: &Path) -> Result<u64> {
+        let training_state = checkpoint_dir.join(crate::checkpoint::TRAINING_STATE_DIR);
+        let recorded = crate::checkpoint::TrainingStep::read(&training_state)?;
+        if recorded.num_processes != 1 {
+            return Err(TrainError::unsupported(format!(
+                "checkpoint was written by {} processes; this native session supports one process",
+                recorded.num_processes
+            )));
+        }
+        let model_path = checkpoint_dir
+            .join(crate::checkpoint::PRETRAINED_MODEL_DIR)
+            .join(crate::checkpoint::MODEL_FILE);
+        self.model.load(&model_path)?;
+
+        let optimizer_path = training_state.join(crate::checkpoint::OPTIMIZER_STATE);
+        crate::model::params::validate_safetensors_container(&optimizer_path)?;
+        let optimizer_tensors = candle_core::safetensors::load(&optimizer_path, &self.device)?;
+        self.optimizer
+            .load_state_tensors(self.model.parameters(), &optimizer_tensors)?;
+        self.rng = crate::checkpoint::read_rng_state(&training_state)?;
+
+        let saved_batch_size = if recorded.batch_size == 0 {
+            self.batch_size
+        } else {
+            recorded.batch_size
+        };
+        let sampler_state = compute_sampler_state(
+            recorded.step,
+            self.sampler.len(),
+            saved_batch_size,
+            recorded.num_processes as usize,
+        );
+        self.sampler.load_state(sampler_state);
+        self.queue.clear();
+        Ok(recorded.step)
     }
 
     /// The policy config the model was actually built from, features resolved.
@@ -409,18 +455,26 @@ pub fn train(config: &TrainConfig, observe: &mut dyn FnMut(&str)) -> Result<Trai
     let mut config = config.clone();
     config.validate()?;
 
-    if config.output_dir.is_dir() {
-        // Upstream raises `FileExistsError` unless resuming, and resume is not
-        // ported, so the check is unconditional here.
+    if config.output_dir.is_dir() && !config.resume {
+        // Upstream raises `FileExistsError` unless resuming.
         return Err(TrainError::io_message(
             &config.output_dir,
-            "output directory already exists and resume is not supported by this slice; \
-             choose another --output_dir",
+            "output directory already exists and resume is false; choose another --output_dir",
         ));
     }
 
     observe("Creating dataset");
     let mut session = TrainSession::new(&config)?;
+    let resume_step = if config.resume {
+        session.restore(
+            config
+                .checkpoint_path
+                .as_deref()
+                .expect("validate requires checkpoint_path when resuming"),
+        )?
+    } else {
+        0
+    };
 
     observe(&format!("Output dir: {}", config.output_dir.display()));
     observe(&format!("cfg.steps={}", config.steps));
@@ -445,7 +499,7 @@ pub fn train(config: &TrainConfig, observe: &mut dyn FnMut(&str)) -> Result<Trai
     let mut steps: Vec<StepMetrics> = Vec::new();
     let mut checkpoints = Vec::new();
 
-    for step_number in 1..=config.steps {
+    for step_number in resume_step.saturating_add(1)..=config.steps {
         let metrics = session.step(step_number)?;
 
         let is_log_step = config.log_freq > 0 && step_number % config.log_freq == 0;

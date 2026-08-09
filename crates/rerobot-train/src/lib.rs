@@ -7,6 +7,7 @@ pub mod data;
 pub mod deploy;
 pub mod device;
 pub mod error;
+pub mod hub;
 pub mod limits;
 pub mod model;
 pub mod optim;

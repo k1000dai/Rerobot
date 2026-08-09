@@ -460,7 +460,26 @@ impl TrainingStep {
     /// Read `training_step.json`.
     pub fn read(training_state_dir: &Path) -> Result<Self> {
         let path = training_state_dir.join(TRAINING_STEP);
-        let text = std::fs::read_to_string(&path).map_err(|error| TrainError::io(&path, &error))?;
+        let file = std::fs::File::open(&path).map_err(|error| TrainError::io(&path, &error))?;
+        let mut bytes = Vec::new();
+        file.take(crate::limits::MAX_CHECKPOINT_JSON_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| TrainError::io(&path, &error))?;
+        if bytes.len() as u64 > crate::limits::MAX_CHECKPOINT_JSON_BYTES {
+            return Err(TrainError::checkpoint(
+                &path,
+                format!(
+                    "training_step.json exceeds the {}-byte limit",
+                    crate::limits::MAX_CHECKPOINT_JSON_BYTES
+                ),
+            ));
+        }
+        let text = String::from_utf8(bytes).map_err(|error| {
+            TrainError::checkpoint(
+                &path,
+                format!("training_step.json is not valid UTF-8: {error}"),
+            )
+        })?;
         let document = loads(&text).map_err(|error| {
             TrainError::checkpoint(&path, format!("is not valid JSON: {error}"))
         })?;
@@ -555,6 +574,7 @@ pub fn write_rng_state(training_state_dir: &Path, rng: &SplitMix64) -> Result<()
 /// Read `rng_state.safetensors`.
 pub fn read_rng_state(training_state_dir: &Path) -> Result<SplitMix64> {
     let path = training_state_dir.join(RNG_STATE);
+    crate::model::params::validate_safetensors_container(&path)?;
     let tensors = candle_core::safetensors::load(&path, &candle_core::Device::Cpu)?;
 
     // An extra tensor means this is not a file this reader understands. A checkpoint

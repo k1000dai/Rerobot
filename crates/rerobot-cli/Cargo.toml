@@ -26,6 +26,7 @@ cuda = ["rerobot-train/cuda"]
 [dependencies]
 rerobot-core.workspace = true
 rerobot-compat.workspace = true
+rerobot-hardware.workspace = true
 rerobot-train.workspace = true
 
 # `shutil.which` accepts a candidate on `os.access(name, F_OK | X_OK)`, and the

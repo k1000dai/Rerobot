@@ -7,6 +7,7 @@
 
 pub mod info;
 pub mod rollout;
+pub mod so101;
 pub mod train;
 pub mod which;
 

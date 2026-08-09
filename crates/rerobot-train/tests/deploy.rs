@@ -2,6 +2,7 @@
 
 mod common;
 
+use candle_core::{Device, Tensor};
 use common::{copy_fixture_dataset, fixture_dataset, reduced_config, TempDir};
 use rerobot_train::deploy::{InferenceSession, InferenceStep, TemporalEnsembler};
 use rerobot_train::run::train;
@@ -13,6 +14,48 @@ fn trained_checkpoint() -> (TempDir, PathBuf) {
     let config = reduced_config(fixture_dataset(), output.clone());
     train(&config, &mut |_| {}).expect("the reduced ACT run trains");
     (dir, output.join("checkpoints/000001/pretrained_model"))
+}
+
+fn copy_checkpoint(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).expect("the checkpoint copy directory creates");
+    for entry in std::fs::read_dir(from).expect("the checkpoint directory reads") {
+        let entry = entry.expect("the checkpoint entry reads");
+        assert!(entry
+            .file_type()
+            .expect("the checkpoint entry type reads")
+            .is_file());
+        std::fs::copy(entry.path(), to.join(entry.file_name()))
+            .expect("the checkpoint file copies");
+    }
+}
+
+fn replace_action_stats(checkpoint: &std::path::Path) {
+    for name in [
+        "policy_preprocessor_step_3_normalizer_processor.safetensors",
+        "policy_postprocessor_step_0_unnormalizer_processor.safetensors",
+    ] {
+        let path = checkpoint.join(name);
+        let mut tensors = candle_core::safetensors::load(&path, &Device::Cpu)
+            .expect("the copied processor state loads");
+        tensors.insert(
+            "action.mean".to_owned(),
+            Tensor::new(vec![10.0_f32, 20.0], &Device::Cpu).expect("the replacement mean builds"),
+        );
+        tensors.insert(
+            "action.std".to_owned(),
+            Tensor::new(vec![2.0_f32, 3.0], &Device::Cpu).expect("the replacement std builds"),
+        );
+        let tensors = tensors
+            .into_iter()
+            .map(|(key, tensor)| {
+                (
+                    key,
+                    tensor.contiguous().expect("the state tensor is contiguous"),
+                )
+            })
+            .collect();
+        candle_core::safetensors::save(&tensors, &path).expect("the replacement state saves");
+    }
 }
 
 #[test]
@@ -140,6 +183,58 @@ fn deployment_uses_checkpoint_processor_statistics_not_observation_dataset_stati
         actual, expected,
         "deployment must use the checkpoint's saved processor state for both input normalization and action unnormalization"
     );
+}
+
+#[test]
+fn deployment_applies_checkpoint_action_unnormalization() {
+    let (_dir, checkpoint) = trained_checkpoint();
+    let copied = TempDir::new("deploy-action-stats");
+    let copied_checkpoint = copied.child("pretrained_model");
+    copy_checkpoint(&checkpoint, &copied_checkpoint);
+    let original_state = candle_core::safetensors::load(
+        checkpoint.join("policy_preprocessor_step_3_normalizer_processor.safetensors"),
+        &Device::Cpu,
+    )
+    .expect("the original processor state loads");
+    let original_mean = original_state["action.mean"]
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let original_std = original_state["action.std"]
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    replace_action_stats(&copied_checkpoint);
+
+    let mut reference = InferenceSession::load(&checkpoint, &fixture_dataset(), None)
+        .expect("the original checkpoint loads");
+    let normalized_action = reference
+        .select_action(0)
+        .expect("the original checkpoint selects an action")
+        .action;
+    let mut changed = InferenceSession::load(&copied_checkpoint, &fixture_dataset(), None)
+        .expect("the checkpoint with changed postprocessor state loads");
+    let actual = changed
+        .select_action(0)
+        .expect("the changed checkpoint selects an action")
+        .action;
+    let expected = normalized_action
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let raw = (*value - original_mean[index]) / original_std[index];
+            raw * [2.0_f32, 3.0][index] + [10.0_f32, 20.0][index]
+        })
+        .collect::<Vec<_>>();
+
+    for (actual, expected) in actual.iter().zip(expected) {
+        assert!(
+            (actual - expected).abs() < 1e-5,
+            "actual={actual}, expected={expected}"
+        );
+    }
 }
 
 #[test]

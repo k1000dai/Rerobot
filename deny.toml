@@ -34,6 +34,12 @@ allow = [
     "ISC",
     "Unicode-3.0",
     "Zlib",
+    # `serialport` is MPL-2.0; its file-level copyleft is limited to modified
+    # files and is required for the cross-platform hardware transport.
+    "MPL-2.0",
+    # `ureq`'s rustls trust-root bundle is distributed under this permissive
+    # data license; it is not a copyleft source license.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 

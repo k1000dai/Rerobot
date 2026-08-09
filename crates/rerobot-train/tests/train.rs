@@ -466,6 +466,45 @@ fn a_two_step_run_takes_two_steps_and_keeps_training() {
 }
 
 #[test]
+fn a_saved_checkpoint_resumes_at_the_next_step_with_optimizer_rng_and_sampler_state() {
+    let dir = TempDir::new("resume");
+    let first_output = dir.child("first");
+    let mut first_config = reduced_config(fixture_dataset(), first_output.clone());
+    first_config.steps = 1;
+    let first = train(&first_config, &mut |_| {}).expect("the first run completes");
+    let checkpoint = first.checkpoints[0].clone();
+
+    let mut resumed_config = reduced_config(fixture_dataset(), dir.child("resumed"));
+    resumed_config.resume = true;
+    resumed_config.checkpoint_path = Some(checkpoint);
+    resumed_config.steps = 2;
+    let resumed = train(&resumed_config, &mut |_| {}).expect("the checkpoint resumes");
+
+    assert_eq!(resumed.steps.len(), 1, "step one must not be repeated");
+    assert_eq!(resumed.steps[0].step, 2);
+    assert_eq!(
+        resumed.steps[0].frame_indices.len(),
+        resumed_config.batch_size
+    );
+    assert_eq!(
+        resumed.checkpoints,
+        vec![dir.child("resumed/checkpoints/000002")]
+    );
+    let state = TrainingStep::read(&resumed.checkpoints[0].join("training_state")).unwrap();
+    assert_eq!(state.step, 2);
+
+    let tensors = candle_core::safetensors::load(
+        resumed.checkpoints[0].join("training_state/optimizer_state.safetensors"),
+        &candle_core::Device::Cpu,
+    )
+    .unwrap();
+    let step = tensors["state/0/step"]
+        .to_scalar::<f32>()
+        .expect("the restored optimizer took a second step");
+    assert_eq!(step, 2.0);
+}
+
+#[test]
 fn the_batch_cycles_through_epochs_when_the_dataset_is_smaller_than_the_run() {
     // Four frames, batch size three: the third step has to have wrapped into a
     // second epoch, and `cycle` must not stall or repeat a frame within a batch.
@@ -937,14 +976,14 @@ fn the_checkpoints_own_weights_reload_and_predict_identically() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn an_existing_output_directory_is_refused_because_resume_is_not_ported() {
+fn an_existing_output_directory_is_refused_without_resume() {
     let dir = TempDir::new("existing-output");
     let output = dir.child("out");
     std::fs::create_dir_all(&output).unwrap();
     let config = reduced_config(fixture_dataset(), output);
     let error = train(&config, &mut |_| {}).unwrap_err();
     assert!(
-        error.to_string().contains("resume is not supported"),
+        error.to_string().contains("resume is false"),
         "unexpected error: {error}"
     );
 }

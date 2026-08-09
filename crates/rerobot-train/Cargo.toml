@@ -32,6 +32,7 @@ rerobot-core.workspace = true
 indexmap.workspace = true
 num-bigint.workspace = true
 serde_json.workspace = true
+ureq.workspace = true
 
 # The tensor runtime. Pinned exactly: this crate reimplements PyTorch operator
 # semantics (`nn.MultiheadAttention`'s packed projection, `nn.LayerNorm`'s eps,

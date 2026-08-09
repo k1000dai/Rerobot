@@ -243,7 +243,7 @@ impl ParameterStore {
 }
 
 /// Validate the container header before Candle's loader reads and materializes it.
-fn validate_safetensors_container(path: &Path) -> Result<()> {
+pub(crate) fn validate_safetensors_container(path: &Path) -> Result<()> {
     let file_size = std::fs::metadata(path)
         .map_err(|error| TrainError::io(path, &error))?
         .len();

@@ -16,6 +16,7 @@ use crate::error::{Result, TrainError};
 use rerobot_core::dataset::json::{dumps_pretty_ascii, JsonLike, JsonObject};
 use rerobot_core::policy::act::{ActConfig, AdamWConfig};
 use rerobot_core::BigInt;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// The default `TrainPipelineConfig.seed`.
@@ -50,6 +51,10 @@ pub struct TrainConfig {
     pub policy: ActConfig,
     /// `output_dir`.
     pub output_dir: PathBuf,
+    /// Whether this run restores a previously saved local checkpoint.
+    pub resume: bool,
+    /// The checkpoint directory to restore when [`Self::resume`] is true.
+    pub checkpoint_path: Option<PathBuf>,
     /// `job_name`.
     pub job_name: Option<String>,
     /// `seed`.
@@ -91,6 +96,8 @@ impl TrainConfig {
             dataset_use_imagenet_stats: DEFAULT_USE_IMAGENET_STATS,
             policy,
             output_dir,
+            resume: false,
+            checkpoint_path: None,
             job_name: None,
             seed: Some(DEFAULT_SEED),
             batch_size: 8,
@@ -117,6 +124,20 @@ impl TrainConfig {
         // now would reject every fresh run, because a config that has not met a
         // dataset yet has no features at all.
         self.policy.validate()?;
+
+        match (self.resume, &self.checkpoint_path) {
+            (true, None) => {
+                return Err(TrainError::Metadata(
+                    "resume requires a local checkpoint path".to_owned(),
+                ))
+            }
+            (false, Some(_)) => {
+                return Err(TrainError::Metadata(
+                    "a checkpoint path requires resume=true".to_owned(),
+                ))
+            }
+            _ => {}
+        }
 
         self.validate_numeric_fields()?;
 
@@ -434,7 +455,7 @@ impl TrainConfig {
                 None => JsonLike::Null,
             },
         );
-        root.insert("resume".into(), JsonLike::Bool(false));
+        root.insert("resume".into(), JsonLike::Bool(self.resume));
         root.insert(
             "seed".into(),
             match self.seed {
@@ -481,6 +502,97 @@ impl TrainConfig {
     /// `train_config.json` as text: `draccus.dump(self, f, indent=4)`.
     pub fn to_json_text(&self) -> String {
         dumps_pretty_ascii(&self.to_json())
+    }
+
+    /// Reconstruct the local ACT training configuration stored in a checkpoint.
+    ///
+    /// This intentionally reads only the fields this native training boundary
+    /// consumes. Missing or wrongly typed fields are reported as checkpoint
+    /// corruption rather than replaced with a fresh-run default.
+    pub fn from_checkpoint_dir(checkpoint_dir: &Path) -> Result<Self> {
+        let path = checkpoint_dir
+            .join(crate::checkpoint::PRETRAINED_MODEL_DIR)
+            .join(crate::checkpoint::TRAIN_CONFIG_NAME);
+        let file = std::fs::File::open(&path).map_err(|error| TrainError::io(&path, &error))?;
+        let mut bytes = Vec::new();
+        file.take(crate::limits::MAX_CHECKPOINT_JSON_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| TrainError::io(&path, &error))?;
+        if bytes.len() as u64 > crate::limits::MAX_CHECKPOINT_JSON_BYTES {
+            return Err(TrainError::checkpoint(
+                &path,
+                format!(
+                    "train_config.json exceeds the {}-byte limit",
+                    crate::limits::MAX_CHECKPOINT_JSON_BYTES
+                ),
+            ));
+        }
+        let text = String::from_utf8(bytes).map_err(|error| {
+            TrainError::checkpoint(
+                &path,
+                format!("train_config.json is not valid UTF-8: {error}"),
+            )
+        })?;
+        let document = rerobot_core::dataset::json::loads(&text).map_err(|error| {
+            TrainError::checkpoint(
+                &path,
+                format!("train_config.json is not valid JSON: {error}"),
+            )
+        })?;
+        let JsonLike::Object(root) = &document else {
+            return Err(TrainError::checkpoint(
+                &path,
+                "train_config.json is not a JSON object",
+            ));
+        };
+        let dataset = object_field(root, "dataset", &path)?;
+        let dataset_repo_id = string_field(dataset, "repo_id", &path)?;
+        let dataset_root = PathBuf::from(string_field(dataset, "root", &path)?);
+        let dataset_episodes = match dataset.get("episodes") {
+            None | Some(JsonLike::Null) => None,
+            Some(JsonLike::Array(values)) => Some(
+                values
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        i64_field(value, &format!("dataset.episodes[{index}]"), &path)
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            ),
+            Some(other) => {
+                return Err(TrainError::checkpoint(
+                    &path,
+                    format!("dataset.episodes is {}, not an array", other.type_name()),
+                ))
+            }
+        };
+        let dataset_use_imagenet_stats = bool_field(
+            dataset,
+            "use_imagenet_stats",
+            &path,
+            DEFAULT_USE_IMAGENET_STATS,
+        )?;
+        let policy = ActConfig::from_checkpoint_value(value_field(root, "policy", &path)?)
+            .map_err(|error| TrainError::checkpoint(&path, error.to_string()))?;
+        let output_dir = PathBuf::from(string_field(root, "output_dir", &path)?);
+        let mut config = Self::new(dataset_repo_id, dataset_root, output_dir);
+        config.dataset_episodes = dataset_episodes;
+        config.dataset_use_imagenet_stats = dataset_use_imagenet_stats;
+        config.policy = policy;
+        config.resume = true;
+        config.checkpoint_path = Some(checkpoint_dir.to_owned());
+        config.job_name = optional_string_field(root, "job_name", &path)?;
+        config.seed = optional_u64_field(root, "seed", &path)?;
+        config.num_workers = u32_field(root, "num_workers", &path, 0)?;
+        config.batch_size = usize_field(root, "batch_size", &path)?;
+        config.steps = u64_field(root, "steps", &path)?;
+        config.log_freq = u64_field(root, "log_freq", &path)?;
+        config.tolerance_s = f64_field(root, "tolerance_s", &path)?;
+        config.save_checkpoint = bool_field(root, "save_checkpoint", &path, true)?;
+        config.save_freq = bigint_field(root, "save_freq", &path)?;
+        config.use_policy_training_preset =
+            bool_field(root, "use_policy_training_preset", &path, true)?;
+        Ok(config)
     }
 
     fn dataset_json(&self) -> JsonLike {
@@ -576,6 +688,117 @@ fn int(value: u64) -> JsonLike {
 /// A path in the POSIX spelling `pathlib.PurePosixPath` would produce, so that a
 /// `train_config.json` written on Windows names the same path as one written on
 /// Linux.
+fn object_field<'a>(root: &'a JsonObject, name: &str, path: &Path) -> Result<&'a JsonObject> {
+    match root.get(name) {
+        Some(JsonLike::Object(value)) => Ok(value),
+        Some(other) => Err(TrainError::checkpoint(
+            path,
+            format!("{name} is {}, not an object", other.type_name()),
+        )),
+        None => Err(TrainError::checkpoint(path, format!("is missing {name}"))),
+    }
+}
+
+fn value_field<'a>(root: &'a JsonObject, name: &str, path: &Path) -> Result<&'a JsonLike> {
+    root.get(name)
+        .ok_or_else(|| TrainError::checkpoint(path, format!("is missing {name}")))
+}
+
+fn string_field(root: &JsonObject, name: &str, path: &Path) -> Result<String> {
+    match value_field(root, name, path)? {
+        JsonLike::Str(value) => Ok(value.clone()),
+        other => Err(TrainError::checkpoint(
+            path,
+            format!("{name} is {}, not a string", other.type_name()),
+        )),
+    }
+}
+
+fn optional_string_field(root: &JsonObject, name: &str, path: &Path) -> Result<Option<String>> {
+    match root.get(name) {
+        None | Some(JsonLike::Null) => Ok(None),
+        Some(JsonLike::Str(value)) => Ok(Some(value.clone())),
+        Some(other) => Err(TrainError::checkpoint(
+            path,
+            format!("{name} is {}, not a string or null", other.type_name()),
+        )),
+    }
+}
+
+fn bigint_value(value: &JsonLike, name: &str, path: &Path) -> Result<BigInt> {
+    match value {
+        JsonLike::Int(value) => Ok(value.clone()),
+        other => Err(TrainError::checkpoint(
+            path,
+            format!("{name} is {}, not an integer", other.type_name()),
+        )),
+    }
+}
+
+fn bigint_field(root: &JsonObject, name: &str, path: &Path) -> Result<BigInt> {
+    bigint_value(value_field(root, name, path)?, name, path)
+}
+
+fn i64_field(value: &JsonLike, name: &str, path: &Path) -> Result<i64> {
+    i64::try_from(bigint_value(value, name, path)?).map_err(|_| {
+        TrainError::checkpoint(
+            path,
+            format!("{name} does not fit in a signed 64-bit integer"),
+        )
+    })
+}
+
+fn u64_field(root: &JsonObject, name: &str, path: &Path) -> Result<u64> {
+    u64::try_from(bigint_field(root, name, path)?).map_err(|_| {
+        TrainError::checkpoint(path, format!("{name} is not a non-negative 64-bit integer"))
+    })
+}
+
+fn optional_u64_field(root: &JsonObject, name: &str, path: &Path) -> Result<Option<u64>> {
+    match root.get(name) {
+        None | Some(JsonLike::Null) => Ok(None),
+        Some(value) => Ok(Some(
+            u64::try_from(bigint_value(value, name, path)?).map_err(|_| {
+                TrainError::checkpoint(path, format!("{name} is not a non-negative 64-bit integer"))
+            })?,
+        )),
+    }
+}
+
+fn usize_field(root: &JsonObject, name: &str, path: &Path) -> Result<usize> {
+    usize::try_from(u64_field(root, name, path)?)
+        .map_err(|_| TrainError::checkpoint(path, format!("{name} does not fit in usize")))
+}
+
+fn u32_field(root: &JsonObject, name: &str, path: &Path, default: u32) -> Result<u32> {
+    match root.get(name) {
+        None => Ok(default),
+        Some(value) => u32::try_from(bigint_value(value, name, path)?)
+            .map_err(|_| TrainError::checkpoint(path, format!("{name} does not fit in u32"))),
+    }
+}
+
+fn bool_field(root: &JsonObject, name: &str, path: &Path, default: bool) -> Result<bool> {
+    match root.get(name) {
+        None => Ok(default),
+        Some(JsonLike::Bool(value)) => Ok(*value),
+        Some(other) => Err(TrainError::checkpoint(
+            path,
+            format!("{name} is {}, not a boolean", other.type_name()),
+        )),
+    }
+}
+
+fn f64_field(root: &JsonObject, name: &str, path: &Path) -> Result<f64> {
+    match value_field(root, name, path)? {
+        JsonLike::Float(value) => Ok(*value),
+        other => Err(TrainError::checkpoint(
+            path,
+            format!("{name} is {}, not a float", other.type_name()),
+        )),
+    }
+}
+
 fn posix(path: &Path) -> String {
     path.components()
         .map(|component| component.as_os_str().to_string_lossy().into_owned())

@@ -1,0 +1,16 @@
+[package]
+name = "rerobot-hardware"
+description = "Pure-Rust Feetech servo transport and SO-101 follower hardware control."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[dependencies]
+serialport.workspace = true

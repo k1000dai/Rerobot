@@ -19,24 +19,254 @@
 //! # What is and is not ported here
 //!
 //! The *artifacts* are ported: their names, their JSON structure byte for byte, and
-//! their safetensors contents. The processor *runtime* is not — Rerobot normalizes
-//! with [`rerobot_core::policy::normalize::Normalizer`] rather than by running a
-//! pipeline of registry-named steps. So the step list this module writes is a
-//! faithful description of what upstream would have built for this configuration,
-//! and three of the four preprocessor steps
-//! (`rename_observations_processor`, `to_batch_processor`, `device_processor`) name
-//! behaviour Rerobot performs structurally rather than as a step. That is recorded
-//! in `docs/compatibility.md`; the alternative — omitting them — would produce a
-//! file upstream cannot load.
+//! their safetensors contents. The native ACT deployment boundary also validates
+//! and consumes the saved numeric normalizer state for scalar observations and
+//! action unnormalization. It does not yet execute an arbitrary registry-named
+//! pipeline: the rename, batch, device and full multi-step processor lifecycles
+//! remain represented structurally rather than exposed as a general runtime. That
+//! boundary is recorded in `docs/compatibility.md`; the alternative — omitting
+//! the steps — would produce a file upstream cannot load.
 
 use crate::error::{Result, TrainError};
+use indexmap::IndexMap;
 use rerobot_core::dataset::json::{dumps_indent_ascii, JsonLike, JsonObject};
-use rerobot_core::dataset::stats::DatasetStats;
+use rerobot_core::dataset::stats::{DatasetStats, FeatureStats};
 use rerobot_core::policy::act::ActConfig;
-use rerobot_core::policy::normalize::NORMALIZATION_EPS;
+use rerobot_core::policy::normalize::{Normalizer, NORMALIZATION_EPS};
 use rerobot_core::types::PolicyFeature;
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+
+/// The loaded processor state used by hardware-independent policy inference.
+///
+/// The checkpoint's processor artifacts are not documentation: upstream loads
+/// them and applies the saved statistics to observations before inference and to
+/// actions after inference. This type is the native ACT subset of that runtime.
+#[derive(Debug, Clone)]
+pub struct LoadedPolicyProcessors {
+    normalizer: Normalizer,
+}
+
+impl LoadedPolicyProcessors {
+    /// Load and validate the pre/postprocessor artifacts from one checkpoint.
+    ///
+    /// The state is taken from the checkpoint, not from the observation dataset.
+    /// This matters when a policy is deployed against another dataset whose
+    /// statistics describe a different collection run.
+    pub fn load(checkpoint_dir: &Path, policy: &ActConfig) -> Result<Self> {
+        let preprocessor_path = checkpoint_dir.join(POLICY_PREPROCESSOR_NAME.to_owned() + ".json");
+        let postprocessor_path =
+            checkpoint_dir.join(POLICY_POSTPROCESSOR_NAME.to_owned() + ".json");
+        let preprocessor = load_json(&preprocessor_path, "policy_preprocessor.json")?;
+        let postprocessor = load_json(&postprocessor_path, "policy_postprocessor.json")?;
+        validate_pipeline(
+            &preprocessor,
+            POLICY_PREPROCESSOR_NAME,
+            &[
+                "rename_observations_processor",
+                "to_batch_processor",
+                "device_processor",
+                "normalizer_processor",
+            ],
+            Some("policy_preprocessor_step_3_normalizer_processor.safetensors"),
+        )?;
+        validate_pipeline(
+            &postprocessor,
+            POLICY_POSTPROCESSOR_NAME,
+            &["unnormalizer_processor", "device_processor"],
+            Some("policy_postprocessor_step_0_unnormalizer_processor.safetensors"),
+        )?;
+
+        let preprocessor_state_path =
+            checkpoint_dir.join("policy_preprocessor_step_3_normalizer_processor.safetensors");
+        let postprocessor_state_path =
+            checkpoint_dir.join("policy_postprocessor_step_0_unnormalizer_processor.safetensors");
+        let (stats, preprocessor_state) = load_state(&preprocessor_state_path)?;
+        let (_, postprocessor_state) = load_state(&postprocessor_state_path)?;
+        if preprocessor_state
+            .keys()
+            .collect::<std::collections::BTreeSet<_>>()
+            != postprocessor_state
+                .keys()
+                .collect::<std::collections::BTreeSet<_>>()
+        {
+            return Err(TrainError::checkpoint(
+                &postprocessor_state_path,
+                "the postprocessor state keys differ from the preprocessor state",
+            ));
+        }
+
+        let mut features = policy.input_features.clone().unwrap_or_default();
+        features.extend(policy.output_features.clone().unwrap_or_default());
+        let normalizer = Normalizer::new(&features, &policy.normalization_mapping, &stats)
+            .map_err(|error| TrainError::Metadata(error.to_string()))?;
+        Ok(Self { normalizer })
+    }
+
+    /// The normalizer used by the preprocessor and postprocessor.
+    pub fn normalizer(&self) -> &Normalizer {
+        &self.normalizer
+    }
+}
+
+const MAX_PROCESSOR_JSON_BYTES: u64 = 16 * 1024 * 1024;
+/// Processor statistics are small in every supported LeRobot dataset. Keep the
+/// whole-file bound below the general model checkpoint bound because Candle's
+/// convenience loader materializes every tensor before this module can inspect
+/// the feature names.
+const MAX_PROCESSOR_STATE_BYTES: u64 = 64 * 1024 * 1024;
+
+fn load_json(path: &Path, label: &str) -> Result<JsonLike> {
+    let file = std::fs::File::open(path).map_err(|error| TrainError::io(path, &error))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_PROCESSOR_JSON_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| TrainError::io(path, &error))?;
+    if bytes.len() as u64 > MAX_PROCESSOR_JSON_BYTES {
+        return Err(TrainError::checkpoint(
+            path,
+            format!("{label} exceeds the {MAX_PROCESSOR_JSON_BYTES}-byte limit"),
+        ));
+    }
+    let text = String::from_utf8(bytes)
+        .map_err(|error| TrainError::checkpoint(path, format!("{label} is not UTF-8: {error}")))?;
+    rerobot_core::dataset::json::loads(&text).map_err(|error| {
+        TrainError::checkpoint(path, format!("{label} is not valid JSON: {error}"))
+    })
+}
+
+fn validate_pipeline(
+    document: &JsonLike,
+    expected_name: &str,
+    expected_steps: &[&str],
+    expected_state_file: Option<&str>,
+) -> Result<()> {
+    let JsonLike::Object(root) = document else {
+        return Err(TrainError::Metadata(format!(
+            "{expected_name}.json root must be an object"
+        )));
+    };
+    if root.get("name") != Some(&JsonLike::Str(expected_name.to_owned())) {
+        return Err(TrainError::Metadata(format!(
+            "{expected_name}.json has the wrong pipeline name"
+        )));
+    }
+    let Some(JsonLike::Array(steps)) = root.get("steps") else {
+        return Err(TrainError::Metadata(format!(
+            "{expected_name}.json steps must be an array"
+        )));
+    };
+    if steps.len() != expected_steps.len() {
+        return Err(TrainError::Metadata(format!(
+            "{expected_name}.json has {} steps, expected {}",
+            steps.len(),
+            expected_steps.len()
+        )));
+    }
+    for (index, (step, expected)) in steps.iter().zip(expected_steps).enumerate() {
+        let JsonLike::Object(step) = step else {
+            return Err(TrainError::Metadata(format!(
+                "{expected_name}.json step {index} must be an object"
+            )));
+        };
+        if step.get("registry_name") != Some(&JsonLike::Str((*expected).to_owned())) {
+            return Err(TrainError::Metadata(format!(
+                "{expected_name}.json step {index} is not {expected}"
+            )));
+        }
+        let state_file = step.get("state_file").and_then(|value| match value {
+            JsonLike::Str(value) => Some(value.as_str()),
+            _ => None,
+        });
+        if index == expected_steps.len() - 1 && expected_name == POLICY_PREPROCESSOR_NAME {
+            if state_file != expected_state_file {
+                return Err(TrainError::Metadata(
+                    "the normalizer processor state file is missing or has the wrong name"
+                        .to_owned(),
+                ));
+            }
+        } else if expected_name == POLICY_POSTPROCESSOR_NAME && index == 0 {
+            if state_file != expected_state_file {
+                return Err(TrainError::Metadata(
+                    "the unnormalizer processor state file is missing or has the wrong name"
+                        .to_owned(),
+                ));
+            }
+        } else if state_file.is_some() {
+            return Err(TrainError::Metadata(format!(
+                "{expected_name}.json stateless step {index} unexpectedly has state"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn load_state(path: &Path) -> Result<(DatasetStats, HashMap<String, Vec<f32>>)> {
+    crate::model::params::validate_safetensors_container(path)?;
+    let file_size = std::fs::metadata(path)
+        .map_err(|error| TrainError::io(path, &error))?
+        .len();
+    if file_size > MAX_PROCESSOR_STATE_BYTES {
+        return Err(TrainError::checkpoint(
+            path,
+            format!("processor state exceeds the maximum of {MAX_PROCESSOR_STATE_BYTES} bytes"),
+        ));
+    }
+    let tensors =
+        candle_core::safetensors::load(path, &candle_core::Device::Cpu).map_err(|error| {
+            TrainError::checkpoint(path, format!("cannot load processor state: {error}"))
+        })?;
+    if tensors.is_empty() {
+        return Err(TrainError::checkpoint(
+            path,
+            "processor state has no tensors",
+        ));
+    }
+    let mut grouped: IndexMap<String, IndexMap<String, Vec<f64>>> = IndexMap::new();
+    let mut flat = HashMap::with_capacity(tensors.len());
+    for (key, tensor) in tensors {
+        let Some((feature, statistic)) = key.rsplit_once('.') else {
+            return Err(TrainError::checkpoint(
+                path,
+                format!("processor state tensor {key:?} has no feature.statistic name"),
+            ));
+        };
+        if feature.is_empty() || statistic.is_empty() || tensor.dtype() != candle_core::DType::F32 {
+            return Err(TrainError::checkpoint(
+                path,
+                format!("processor state tensor {key:?} has an invalid name or dtype"),
+            ));
+        }
+        let values = tensor
+            .flatten_all()
+            .and_then(|tensor| tensor.to_vec1::<f32>())
+            .map_err(|error| {
+                TrainError::checkpoint(
+                    path,
+                    format!("cannot read processor state tensor {key:?}: {error}"),
+                )
+            })?;
+        if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
+            return Err(TrainError::checkpoint(
+                path,
+                format!("processor state tensor {key:?} is empty or non-finite"),
+            ));
+        }
+        flat.insert(key.to_owned(), values.clone());
+        grouped.entry(feature.to_owned()).or_default().insert(
+            statistic.to_owned(),
+            values.into_iter().map(f64::from).collect(),
+        );
+    }
+    let stats = DatasetStats::from_entries(
+        grouped
+            .into_iter()
+            .map(|(feature, values)| (feature, FeatureStats::from_entries(values)))
+            .collect(),
+    );
+    Ok((stats, flat))
+}
 
 /// `POLICY_PREPROCESSOR_DEFAULT_NAME`.
 pub const POLICY_PREPROCESSOR_NAME: &str = "policy_preprocessor";

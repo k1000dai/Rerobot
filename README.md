@@ -115,9 +115,11 @@ Three details worth knowing up front:
   keyboard and pedal listeners, dataset recording, teleoperator handover and
   policy inference are not ported, and nothing about them is stubbed.
 * `lerobot-rollout` has one complete hardware-independent path: a local ACT
-  checkpoint can be loaded, local dataset observations can be normalized and fed
-  through ACT's action queue or temporal ensembler, and finite action traces are
-  emitted. Robot drivers, Gymnasium environments, and video shards remain refused.
+  checkpoint can be loaded, its saved pre/postprocessor statistics are applied
+  to observations and returned actions, and the result is fed through ACT's
+  action queue or temporal ensembler. Finite action traces are emitted in the
+  checkpoint's action units. Robot drivers, Gymnasium environments, and video
+  shards remain refused.
 
 ## Development
 

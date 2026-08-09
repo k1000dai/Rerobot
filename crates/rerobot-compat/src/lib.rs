@@ -223,7 +223,7 @@ pub static ENTRY_POINTS: &[EntryPoint] = &[
         target: "lerobot.scripts.lerobot_rollout:main",
         status: Status::Partial,
         summary: "Run a trained policy on a real robot with pluggable strategies.",
-        note: "Runnable for a hardware-independent local ACT deployment: it loads a checkpoint, reads local dataset observations, and emits the action queue or temporal-ensemble action. Robot drivers, teleoperators, environments, visualization and video shards remain explicitly refused; the physical rollout boundary is not faked.",
+        note: "Runnable for a hardware-independent local ACT deployment: it loads a checkpoint, consumes the saved normalizer/unnormalizer processor state, reads local dataset observations, and emits action-unit outputs from the action queue or temporal ensembler. Robot drivers, teleoperators, environments, visualization and video shards remain explicitly refused; the physical rollout boundary is not faked.",
     },
 ];
 
@@ -327,8 +327,8 @@ pub static MODULE_FAMILIES: &[ModuleFamily] = &[
                read/write are ported, as is the ACT tensor model for state/action and embedded or \
                in-memory camera inputs: the VAE encoder, ResNet18/34 backbone, 1-D/2-D camera \
                position embeddings, transformer, action head and the L1-plus-KL objective. The \
-               ACT temporal ensembler is ported in `rerobot_train::deploy`; the ACT processor \
-               pipeline and every other policy architecture are not.",
+               ACT temporal ensembler and the checkpoint normalizer/unnormalizer boundary are \
+               ported in `rerobot_train::deploy`; every other policy architecture is not.",
     },
     ModuleFamily {
         name: "processor",
@@ -337,11 +337,12 @@ pub static MODULE_FAMILIES: &[ModuleFamily] = &[
         note: "`rename_processor` (step + `rename_stats`) and the value transform/stateless \
                lifecycle of `newline_task_processor.NewLineTaskProcessorStep` are ported and \
                tested, as is `normalize_processor`'s numeric transform for all four of its \
-               modes. The pre/postprocessor *artifacts* a checkpoint carries are written \
-               byte-identically to upstream's, including both normalizer state files. The \
-               pipeline runtime that would execute those steps, Python aliasing, \
-               registry/config reconstruction, and the tokenizer and device steps are not \
-               ported.",
+               modes. The four pre/postprocessor artifacts a checkpoint carries are written \
+               byte-identically to upstream's, and the native ACT deployment path now validates \
+               and consumes their saved numeric state for observation normalization and action \
+               unnormalization. Python aliasing, general registry/config reconstruction, and the \
+               tokenizer, device, batch and full multi-step pipeline runtime remain outside this \
+               boundary.",
     },
     ModuleFamily {
         name: "rewards",

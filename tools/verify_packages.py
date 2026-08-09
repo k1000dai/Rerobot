@@ -27,7 +27,13 @@ import tarfile
 import tempfile
 from pathlib import Path
 
-CRATES = ("rerobot-core", "rerobot-compat", "rerobot-train", "rerobot-cli")
+CRATES = (
+    "rerobot-core",
+    "rerobot-compat",
+    "rerobot-hardware",
+    "rerobot-train",
+    "rerobot-cli",
+)
 
 # Files every published archive must carry, whatever else it holds.
 #
@@ -40,8 +46,14 @@ REQUIRED_DOCUMENTS = ("LICENSE", "NOTICE")
 LOCAL_DEPENDENCIES = {
     "rerobot-core": (),
     "rerobot-compat": (),
+    "rerobot-hardware": (),
     "rerobot-train": ("rerobot-core",),
-    "rerobot-cli": ("rerobot-core", "rerobot-compat", "rerobot-train"),
+    "rerobot-cli": (
+        "rerobot-core",
+        "rerobot-compat",
+        "rerobot-hardware",
+        "rerobot-train",
+    ),
 }
 ROOT = Path(__file__).resolve().parents[1]
 

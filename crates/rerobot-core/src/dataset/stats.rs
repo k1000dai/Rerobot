@@ -98,6 +98,14 @@ impl std::error::Error for StatsError {}
 pub struct FeatureStats(IndexMap<String, Vec<f64>>);
 
 impl FeatureStats {
+    /// Construct statistics from their ordered names and values.
+    ///
+    /// This is primarily for a checkpoint processor state, whose safetensors
+    /// representation is already flattened into `feature.statistic` entries.
+    pub fn from_entries(entries: IndexMap<String, Vec<f64>>) -> Self {
+        Self(entries)
+    }
+
     /// A named statistic, or `None` when the feature does not carry it.
     pub fn get(&self, statistic: &str) -> Option<&[f64]> {
         self.0.get(statistic).map(Vec::as_slice)
@@ -134,6 +142,15 @@ impl FeatureStats {
 pub struct DatasetStats(IndexMap<String, FeatureStats>);
 
 impl DatasetStats {
+    /// Construct a typed statistics document from ordered per-feature entries.
+    ///
+    /// The JSON loader remains the normal input boundary. This constructor exists
+    /// for equivalent on-disk representations such as LeRobot processor
+    /// safetensors, where the document has already been validated and flattened.
+    pub fn from_entries(entries: IndexMap<String, FeatureStats>) -> Self {
+        Self(entries)
+    }
+
     /// The statistics of one feature, or `None` when it is absent.
     pub fn get(&self, feature: &str) -> Option<&FeatureStats> {
         self.0.get(feature)

@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{fixture_dataset, reduced_config, TempDir};
+use common::{copy_fixture_dataset, fixture_dataset, reduced_config, TempDir};
 use rerobot_train::deploy::{InferenceSession, InferenceStep, TemporalEnsembler};
 use rerobot_train::run::train;
 use std::path::PathBuf;
@@ -101,6 +101,45 @@ fn temporal_checkpoint_queries_the_policy_on_each_dataset_frame() {
 
     assert!(first.queried_policy);
     assert!(second.queried_policy);
+}
+
+#[test]
+fn deployment_uses_checkpoint_processor_statistics_not_observation_dataset_statistics() {
+    let (_dir, checkpoint) = trained_checkpoint();
+    let mut reference = InferenceSession::load(&checkpoint, &fixture_dataset(), None)
+        .expect("the original checkpoint and dataset load");
+    let expected = reference
+        .select_action(0)
+        .expect("the reference observation produces an action")
+        .action;
+
+    let shifted = TempDir::new("deploy-shifted-stats");
+    let shifted_dataset = shifted.child("dataset");
+    copy_fixture_dataset(&shifted_dataset);
+    let stats_path = shifted_dataset.join("meta/stats.json");
+    let stats = std::fs::read_to_string(&stats_path).expect("the copied stats file reads");
+    let shifted_stats = stats
+        .replace("0.4375", "100.0")
+        .replace("0.5625", "200.0")
+        .replace("11.5", "300.0")
+        .replace("-2.5", "400.0")
+        .replace("0.0625", "50.0")
+        .replace("-0.0625", "-50.0")
+        .replace("0.36975499987602234", "1.0")
+        .replace("1.1180340051651", "1.0");
+    std::fs::write(stats_path, shifted_stats).expect("the shifted stats file writes");
+
+    let mut deployed = InferenceSession::load(&checkpoint, &shifted_dataset, None)
+        .expect("the checkpoint remains deployable with different observation statistics");
+    let actual = deployed
+        .select_action(0)
+        .expect("the shifted-stat observation produces an action")
+        .action;
+
+    assert_eq!(
+        actual, expected,
+        "deployment must use the checkpoint's saved processor state for both input normalization and action unnormalization"
+    );
 }
 
 #[test]

@@ -257,19 +257,8 @@ impl InferenceSession {
         delta_timestamps.insert(ACTION.to_owned(), action_delta_timestamps(chunk_size, fps));
         let dataset = StateOnlyDataset::load(&dataset_root, &delta_timestamps, 1e-4)?;
 
-        let normalized_features = config
-            .input_features
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .chain(config.output_features.clone().unwrap_or_default())
-            .filter(|(_, feature)| feature.r#type != rerobot_core::types::FeatureType::Visual)
-            .collect::<IndexMap<_, _>>();
-        let normalizer = Normalizer::new(
-            &normalized_features,
-            &config.normalization_mapping,
-            &metadata.stats,
-        )?;
+        let processors = crate::processor::LoadedPolicyProcessors::load(checkpoint_dir, &config)?;
+        let normalizer = processors.normalizer().clone();
 
         let device_name = device_override.or(config.device.as_deref());
         let device = device::resolve(device_name)?;
@@ -331,6 +320,10 @@ impl InferenceSession {
                 TrainError::Metadata("ACT returned an empty action chunk".to_owned())
             })?
         };
+        let action = self
+            .normalizer
+            .unnormalize(ACTION, &action)
+            .map_err(|error| TrainError::Metadata(error.to_string()))?;
         let frame_index = i64::try_from(index).map_err(|_| {
             TrainError::Metadata(format!("dataset frame index {index} does not fit in i64"))
         })?;

@@ -364,6 +364,9 @@ impl InferenceSession {
             )));
         }
         let mut trace = Vec::with_capacity(steps.min(crate::limits::MAX_BATCH_SIZE));
+        // Upstream's rollout() calls policy.reset() before every new trace. Do not
+        // let an earlier call's queued chunk or temporal ensemble bleed into this one.
+        self.reset();
         let mut previous_episode = None;
         for index in start_index..end {
             let episode = self.dataset.episode_index_at(index)?;

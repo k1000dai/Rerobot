@@ -3,7 +3,10 @@
 mod common;
 
 use candle_core::{Device, Tensor};
-use common::{copy_fixture_dataset, fixture_dataset, reduced_config, TempDir};
+use common::{
+    copy_fixture_dataset, fixture_dataset, reduced_config, rewrite_episode_rows,
+    rewrite_frame_episode_indices, TempDir,
+};
 use rerobot_train::deploy::{InferenceSession, InferenceStep, TemporalEnsembler};
 use rerobot_train::run::train;
 use std::path::PathBuf;
@@ -120,6 +123,79 @@ fn offline_rollout_reports_each_requested_frame_in_order() {
         vec![0, 1, 2]
     );
     assert_eq!(trace.iter().filter(|step| step.queried_policy).count(), 2);
+}
+
+#[test]
+fn each_offline_rollout_starts_with_fresh_policy_state() {
+    let (_dir, checkpoint) = trained_checkpoint();
+    let dataset = fixture_dataset();
+
+    let mut fresh =
+        InferenceSession::load(&checkpoint, &dataset, None).expect("the fresh session loads");
+    let expected = fresh
+        .rollout(1, 1)
+        .expect("the fresh rollout emits one action")
+        .pop()
+        .expect("the fresh rollout action exists");
+
+    let mut reused =
+        InferenceSession::load(&checkpoint, &dataset, None).expect("the reused session loads");
+    reused
+        .rollout(0, 1)
+        .expect("the first rollout emits one action");
+    let actual = reused
+        .rollout(1, 1)
+        .expect("the second rollout emits one action")
+        .pop()
+        .expect("the second rollout action exists");
+
+    assert!(
+        actual.queried_policy,
+        "each rollout must reset ACT state first"
+    );
+    assert_eq!(actual.action, expected.action);
+}
+
+#[test]
+fn a_rollout_started_in_a_new_episode_resets_actions_left_by_a_previous_call() {
+    let (_dir, checkpoint) = trained_checkpoint();
+    let dataset_dir = TempDir::new("deploy-two-episodes");
+    let dataset = dataset_dir.child("dataset");
+    copy_fixture_dataset(&dataset);
+
+    let info_path = dataset.join("meta/info.json");
+    let info = std::fs::read_to_string(&info_path).expect("the copied info file reads");
+    assert!(info.contains("\"total_episodes\": 1"));
+    std::fs::write(
+        info_path,
+        info.replace("\"total_episodes\": 1", "\"total_episodes\": 2"),
+    )
+    .expect("the copied info file writes");
+    rewrite_episode_rows(&dataset, &[(0, 0, 2, 2), (1, 2, 4, 2)]);
+    rewrite_frame_episode_indices(&dataset, &[0, 0, 1, 1]);
+
+    let mut fresh = InferenceSession::load(&checkpoint, &dataset, None)
+        .expect("the two-episode dataset loads for the fresh session");
+    let expected = fresh
+        .rollout(2, 1)
+        .expect("the fresh session runs the second episode")
+        .pop()
+        .expect("the fresh rollout emits one action");
+
+    let mut reused =
+        InferenceSession::load(&checkpoint, &dataset, None).expect("the reused session loads");
+    reused
+        .rollout(0, 1)
+        .expect("the first rollout emits one action");
+    let actual = reused
+        .rollout(2, 1)
+        .expect("the second rollout emits one action")
+        .pop()
+        .expect("the second rollout emits an action");
+
+    assert_eq!(actual.frame_index, 2);
+    assert!(actual.queried_policy, "a new episode must query the policy");
+    assert_eq!(actual.action, expected.action);
 }
 
 #[test]

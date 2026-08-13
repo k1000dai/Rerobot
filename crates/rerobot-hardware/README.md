@@ -9,6 +9,11 @@ The transport is generic over `Read + Write`, so packet validation and control
 logic can be tested without a connected servo bus. The serial-port adapter is
 provided for real hardware use.
 
-This is an independent Rust implementation compatible with the public
-Feetech/LeRobot control surface; it is not an official Feetech or Hugging Face
-product.
+The SO-101 conversion path uses calibrated `min_ticks`/`max_ticks` ranges,
+the upstream `(min + max) / 2` midpoint and `4095` denominator for body-joint
+degrees, and the distinct `0..=100` gripper convention. Calibration writes
+encode `Homing_Offset` as Feetech sign-magnitude. The transport and mock tests
+are hardware-independent; no physical servo was connected for this release.
+
+This is an independent Rust implementation; it is not an official Feetech or
+Hugging Face product.

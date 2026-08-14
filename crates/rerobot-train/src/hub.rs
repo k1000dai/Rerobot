@@ -186,19 +186,28 @@ impl HubDownloader {
     pub fn download(&self, repo_id: &str, destination: &Path, revision: &str) -> Result<PathBuf> {
         validate_repo_id(repo_id)?;
         let target = destination.to_path_buf();
+        if let Ok(metadata) = fs::symlink_metadata(&target) {
+            if metadata.file_type().is_symlink() {
+                return Err(TrainError::io_message(
+                    &target,
+                    "dataset destination already exists as a symlink; refusing to overwrite it",
+                ));
+            }
+        }
         if target.exists() {
             if is_complete_dataset(&target) {
                 return Ok(target);
             }
-            let mut entries =
-                fs::read_dir(&target).map_err(|error| TrainError::io(&target, &error))?;
-            if entries.next().is_some() {
-                return Err(TrainError::io_message(
-                    &target,
-                    "dataset root exists but is incomplete; refusing to overwrite it",
-                ));
-            }
-            fs::remove_dir(&target).map_err(|error| TrainError::io(&target, &error))?;
+            return Err(TrainError::io_message(
+                &target,
+                "dataset root already exists and is incomplete; refusing to overwrite it",
+            ));
+        }
+        if fs::symlink_metadata(&target).is_ok() {
+            return Err(TrainError::io_message(
+                &target,
+                "dataset destination already exists; refusing to overwrite it",
+            ));
         }
 
         let tree = self.list_files(repo_id, revision)?;

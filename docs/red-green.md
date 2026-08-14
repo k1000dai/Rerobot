@@ -1305,6 +1305,37 @@ arbitrary-precision integer is refused rather than silently narrowed. The accept
 boundary is intentionally local and hardware-independent; robot drivers,
 environments, and video shards remain refused.
 
+## Cycle 19 — Hub destination safety
+
+**RED** — before tightening the Hub snapshot writer's destination boundary, the
+new tests were run one at a time:
+
+```
+cargo test -p rerobot-train --test hub an_existing_empty_destination_is_rejected_without_being_removed -- --exact
+exit 101
+
+cargo test -p rerobot-train --test hub a_symlink_destination_is_rejected_even_when_its_target_is_complete -- --exact
+exit 101
+```
+
+Both failures were the intended missing behaviour: the old implementation
+removed an existing empty directory before downloading, and treated a symlink
+to a complete snapshot as a cache hit. No production change was made before
+these RED runs.
+
+**GREEN** — `HubDownloader::download` now checks the destination with
+`symlink_metadata`, preserves complete regular-directory cache hits, and
+rejects existing incomplete directories, files, broken links, and symlink
+aliases before making a request or creating a staging directory:
+
+```
+cargo test -p rerobot-train --test hub -- --nocapture
+9 passed; 0 failed
+```
+
+The existing staging/rename and mid-download failure tests remain in the same
+suite, so a failed transfer still leaves no final dataset or staging sibling.
+
 ## Whole-workspace gate
 
 The CPU/default feature gates passed locally with the locked dependency graph:

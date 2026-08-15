@@ -214,7 +214,7 @@ pub static ENTRY_POINTS: &[EntryPoint] = &[
         target: "lerobot.scripts.lerobot_rollout:main",
         status: Status::Partial,
         summary: "Run a trained policy on a real robot with pluggable strategies.",
-        note: "Runnable for a hardware-independent local ACT deployment: it loads a checkpoint, consumes the saved normalizer/unnormalizer processor state, reads local dataset observations, and emits action-unit outputs from the action queue or temporal ensembler. Robot drivers, teleoperators, environments, visualization and video shards remain explicitly refused; the physical rollout boundary is not faked.",
+        note: "Runnable for a hardware-independent local ACT deployment: it loads a checkpoint, consumes the saved normalizer/unnormalizer processor state, reads local dataset observations, and emits action-unit outputs from the action queue or temporal ensembler. The library also loads a checkpoint without a dataset and accepts a caller-owned single-observation `Batch`, matching the policy's simulator/camera adapter boundary. Robot drivers, teleoperators, environments, visualization and video shards remain explicitly refused; the physical rollout boundary is not faked.",
     },
 ];
 
@@ -309,8 +309,9 @@ pub static MODULE_FAMILIES: &[ModuleFamily] = &[
                read/write are ported, as is the ACT tensor model for state/action and embedded or \
                in-memory camera inputs: the VAE encoder, ResNet18/34 backbone, 1-D/2-D camera \
                position embeddings, transformer, action head and the L1-plus-KL objective. The \
-               ACT temporal ensembler and the checkpoint normalizer/unnormalizer boundary are \
-               ported in `rerobot_train::deploy`; every other policy architecture is not.",
+               ACT temporal ensembler, checkpoint normalizer/unnormalizer boundary, and \
+               checkpoint-only caller-batch inference boundary are ported in \
+               `rerobot_train::deploy`; every other policy architecture is not.",
     },
     ModuleFamily {
         name: "processor",
@@ -348,7 +349,7 @@ pub static MODULE_FAMILIES: &[ModuleFamily] = &[
         name: "rollout",
         status: Status::Partial,
         upstream_modules: 18,
-        note: "`ring_buffer.RolloutRingBuffer` is ported and tested, including its byte-accounting quirks, as is the DAgger event state machine (`strategies.dagger.DAggerPhase`, its four transitions and `DAggerEvents`). The DAgger strategy itself, the input devices it listens to, the other rollout strategies and the hardware/environment policy loop are not. The local dataset-backed ACT action queue and temporal ensembler are ported in `rerobot_train::deploy`; it does not claim a robot or Gymnasium boundary.",
+        note: "`ring_buffer.RolloutRingBuffer` is ported and tested, including its byte-accounting quirks, as is the DAgger event state machine (`strategies.dagger.DAggerPhase`, its four transitions and `DAggerEvents`). The DAgger strategy itself, the input devices it listens to, the other rollout strategies and the hardware/environment policy loop are not. The local dataset-backed ACT action queue, temporal ensembler, and checkpoint-only caller-batch inference boundary are ported in `rerobot_train::deploy`; it does not claim a robot or Gymnasium boundary.",
     },
     ModuleFamily {
         name: "scripts",

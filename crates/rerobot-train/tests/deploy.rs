@@ -7,6 +7,11 @@ use common::{
     copy_fixture_dataset, fixture_dataset, reduced_config, rewrite_episode_rows,
     rewrite_frame_episode_indices, TempDir,
 };
+use indexmap::IndexMap;
+use rerobot_core::dataset::delta::action_delta_timestamps;
+use rerobot_train::data::batch::{collate, collate_images};
+use rerobot_train::data::dataset::StateOnlyDataset;
+use rerobot_train::data::meta::ACTION;
 use rerobot_train::deploy::{InferenceSession, InferenceStep, TemporalEnsembler};
 use rerobot_train::run::train;
 use std::path::PathBuf;
@@ -30,6 +35,44 @@ fn copy_checkpoint(from: &std::path::Path, to: &std::path::Path) {
         std::fs::copy(entry.path(), to.join(entry.file_name()))
             .expect("the checkpoint file copies");
     }
+}
+
+#[test]
+fn a_checkpoint_can_infer_from_a_caller_batch_without_opening_a_dataset() {
+    let (_dir, checkpoint) = trained_checkpoint();
+    let mut from_batch = InferenceSession::load_checkpoint(&checkpoint, None)
+        .expect("a checkpoint-only inference session loads");
+
+    let metadata = rerobot_train::data::meta::DatasetMetadata::load(&fixture_dataset())
+        .expect("the fixture metadata loads");
+    let mut delta_timestamps = IndexMap::new();
+    delta_timestamps.insert(
+        ACTION.to_owned(),
+        action_delta_timestamps(2, metadata.fps().expect("the fixture fps is valid")),
+    );
+    let dataset = StateOnlyDataset::load(&fixture_dataset(), &delta_timestamps, 1e-4)
+        .expect("the fixture frame loads");
+    let frame = dataset.get(0).expect("the first frame loads");
+    let raw =
+        collate(std::slice::from_ref(&frame), from_batch.device()).expect("the batch collates");
+    let images = collate_images(std::slice::from_ref(&frame), from_batch.device())
+        .expect("the camera batch collates");
+    let raw = raw
+        .with_images(&images, &from_batch.camera_normalization().clone())
+        .expect("the caller batch accepts its cameras");
+
+    let mut dataset_backed = InferenceSession::load(&checkpoint, &fixture_dataset(), None)
+        .expect("the dataset-backed session loads");
+    let expected = dataset_backed
+        .select_action(0)
+        .expect("the reference observation produces an action");
+    let actual = from_batch
+        .select_action_on_batch(&raw)
+        .expect("the checkpoint-only session consumes the caller batch");
+
+    assert_eq!(actual.frame_index, expected.frame_index);
+    assert_eq!(actual.action, expected.action);
+    assert!(actual.queried_policy);
 }
 
 fn replace_action_stats(checkpoint: &std::path::Path) {

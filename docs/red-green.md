@@ -1336,7 +1336,40 @@ cargo test -p rerobot-train --test hub -- --nocapture
 The existing staging/rename and mid-download failure tests remain in the same
 suite, so a failed transfer still leaves no final dataset or staging sibling.
 
-## Whole-workspace gate
+## Cycle 20 — checkpoint-only ACT inference boundary
+
+**RED** — before the checkpoint-only adapter existed, the new focused test was
+run against the dataset-bound `InferenceSession` API:
+
+```
+cargo test -p rerobot-train --test deploy a_checkpoint_can_infer_from_a_caller_batch_without_opening_a_dataset --locked
+exit 101 (compile failure: `InferenceSession::load_checkpoint` was not yet defined)
+```
+
+This was the intended API failure: the test could not compile because the
+runtime-owned observation boundary did not exist. No production implementation
+was present before the RED run.
+
+**GREEN** — `InferenceSession::load_checkpoint` now loads the ACT config,
+saved processor state, model weights, camera normalization choice, action queue,
+and optional temporal ensembler without opening or resolving a dataset.
+`select_action_on_batch` accepts one caller-owned raw `Batch`, applies the
+checkpoint normalizer, preserves the checkpoint's frame index, and returns the
+same finite action as the dataset-backed path for the identical fixture frame.
+A checkpoint-only session reports no dataset and refuses dataset-indexed
+rollouts rather than silently using a hidden fixture.
+
+```
+cargo test -p rerobot-train --test deploy a_checkpoint_can_infer_from_a_caller_batch_without_opening_a_dataset --locked
+1 passed; 0 failed
+
+cargo test -p rerobot-train --test deploy --locked
+14 passed; 0 failed
+```
+
+The remaining boundary is deliberate: this API accepts already-acquired
+Candle tensors, but it does not invent a simulator, camera driver, robot
+transport, or Gymnasium environment.
 
 The CPU/default feature gates passed locally with the locked dependency graph:
 

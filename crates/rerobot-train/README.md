@@ -24,7 +24,7 @@ work is [arrow], and the rest is this crate.
 | `optim` — AdamW and `clip_grad_norm_` | `torch.optim.AdamW`, `torch.nn.utils.clip_grad_norm_` |
 | `checkpoint` — `checkpoints/<step>/{pretrained_model,training_state}/` | `lerobot/common/train_utils.py` |
 | `run` — the step loop | `lerobot/scripts/lerobot_train.py` |
-| `deploy` — local ACT checkpoint loading, feature normalization, action queue, temporal ensembling and finite dataset-backed inference | `lerobot/policies/act/modeling_act.py`, `lerobot/scripts/lerobot_rollout.py`'s local observation boundary |
+| `deploy` — local ACT checkpoint loading, feature normalization, action queue, temporal ensembling, finite dataset-backed inference, and checkpoint-only caller-batch inference | `lerobot/policies/act/modeling_act.py`, `lerobot/scripts/lerobot_rollout.py`'s local observation boundary |
 
 ## Devices
 
@@ -108,5 +108,26 @@ let mut session = InferenceSession::load(
 )?;
 let action = session.select_action(0)?;
 assert_eq!(action.frame_index, 0);
+# Ok::<(), rerobot_train::error::TrainError>(())
+```
+
+When observations come from a simulator, camera adapter, or another runtime,
+the checkpoint can be loaded without opening a dataset and consumed through the
+same single-observation `Batch` boundary as upstream `ACTPolicy.select_action`.
+Use `session.device()` for Candle tensor placement and
+`session.camera_normalization()` when attaching camera tensors:
+
+```no_run
+use rerobot_train::data::batch::Batch;
+use rerobot_train::deploy::InferenceSession;
+use std::path::Path;
+
+let mut session = InferenceSession::load_checkpoint(
+    Path::new("outputs/train/demo/checkpoints/000001/pretrained_model"),
+    Some("cpu"),
+)?;
+let raw_batch: Batch = todo!("assemble one raw observation and attach camera tensors");
+let action = session.select_action_on_batch(&raw_batch)?;
+assert!(action.action.iter().all(|value| value.is_finite()));
 # Ok::<(), rerobot_train::error::TrainError>(())
 ```

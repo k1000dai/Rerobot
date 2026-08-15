@@ -210,7 +210,8 @@ fn checked_deployment_chunk_size(value: &BigInt) -> Result<usize> {
 /// an environment/episode boundary, matching `ACTPolicy.reset`.
 pub struct InferenceSession {
     checkpoint_dir: PathBuf,
-    dataset: StateOnlyDataset,
+    policy_config: ActConfig,
+    dataset: Option<StateOnlyDataset>,
     model: ActModel,
     normalizer: Normalizer,
     camera_normalization: CameraNormalization,
@@ -230,6 +231,38 @@ impl InferenceSession {
         dataset_root: &Path,
         device_override: Option<&str>,
     ) -> Result<Self> {
+        let mut session = Self::load_checkpoint(checkpoint_dir, device_override)?;
+        let dataset_root = if crate::hub::is_complete_dataset(dataset_root) {
+            dataset_root.to_path_buf()
+        } else {
+            let train_config = crate::config::TrainConfig::from_checkpoint_dir(checkpoint_dir)?;
+            crate::hub::resolve_dataset_root(&train_config.dataset_repo_id, dataset_root, None)?
+        };
+        let metadata = crate::data::meta::DatasetMetadata::load(&dataset_root)?;
+        let fps = metadata.fps()?;
+        let chunk_size = checked_deployment_chunk_size(&session.policy_config.chunk_size)?;
+        let chunk_size = i64::try_from(chunk_size).map_err(|_| {
+            TrainError::unsupported(format!("chunk_size = {chunk_size} does not fit in i64"))
+        })?;
+        let mut delta_timestamps = IndexMap::new();
+        delta_timestamps.insert(ACTION.to_owned(), action_delta_timestamps(chunk_size, fps));
+        session.dataset = Some(StateOnlyDataset::load(
+            &dataset_root,
+            &delta_timestamps,
+            1e-4,
+        )?);
+        Ok(session)
+    }
+
+    /// Load a deployable ACT checkpoint without opening or resolving a dataset.
+    ///
+    /// This is the native counterpart of upstream `ACTPolicy.select_action(batch)`:
+    /// the caller supplies already-collated observations through
+    /// [`Self::select_action_on_batch`]. It is the boundary for a simulator,
+    /// hardware adapter, or another runtime that owns observation acquisition.
+    /// `device_override` uses the same spelling as `--policy.device`, and no
+    /// fallback is performed.
+    pub fn load_checkpoint(checkpoint_dir: &Path, device_override: Option<&str>) -> Result<Self> {
         let config_path = checkpoint_dir.join("config.json");
         let weights_path = checkpoint_dir.join("model.safetensors");
         let config_text = read_checkpoint_json(&config_path, "config.json")?;
@@ -241,25 +274,8 @@ impl InferenceSession {
             ));
         }
 
-        let dataset_root = if crate::hub::is_complete_dataset(dataset_root) {
-            dataset_root.to_path_buf()
-        } else {
-            let train_config = crate::config::TrainConfig::from_checkpoint_dir(checkpoint_dir)?;
-            crate::hub::resolve_dataset_root(&train_config.dataset_repo_id, dataset_root, None)?
-        };
-        let metadata = crate::data::meta::DatasetMetadata::load(&dataset_root)?;
-        let fps = metadata.fps()?;
-        let chunk_size = checked_deployment_chunk_size(&config.chunk_size)?;
-        let chunk_size = i64::try_from(chunk_size).map_err(|_| {
-            TrainError::unsupported(format!("chunk_size = {chunk_size} does not fit in i64"))
-        })?;
-        let mut delta_timestamps = IndexMap::new();
-        delta_timestamps.insert(ACTION.to_owned(), action_delta_timestamps(chunk_size, fps));
-        let dataset = StateOnlyDataset::load(&dataset_root, &delta_timestamps, 1e-4)?;
-
         let processors = crate::processor::LoadedPolicyProcessors::load(checkpoint_dir, &config)?;
         let normalizer = processors.normalizer().clone();
-
         let device_name = device_override.or(config.device.as_deref());
         let device = device::resolve(device_name)?;
         // The initial values are discarded by `load`; construction is still needed
@@ -271,11 +287,11 @@ impl InferenceSession {
             .temporal_ensemble_coeff
             .map(|coefficient| TemporalEnsembler::new(coefficient, model.shape().chunk_size))
             .transpose()?;
-
         let camera_normalization = load_camera_normalization(checkpoint_dir)?;
         Ok(Self {
             checkpoint_dir: checkpoint_dir.to_path_buf(),
-            dataset,
+            policy_config: config,
+            dataset: None,
             model,
             normalizer,
             camera_normalization,
@@ -290,8 +306,23 @@ impl InferenceSession {
     }
 
     /// Number of observations available from the connected dataset.
+    ///
+    /// A checkpoint-only session has no observation source and reports zero.
     pub fn dataset_len(&self) -> usize {
-        self.dataset.len()
+        self.dataset.as_ref().map_or(0, StateOnlyDataset::len)
+    }
+
+    /// The Candle device used by this session, for callers constructing batches.
+    pub fn device(&self) -> &candle_core::Device {
+        self.model.device()
+    }
+
+    /// The camera normalization selected by the checkpoint's training config.
+    ///
+    /// A caller attaching camera tensors to a raw [`Batch`] must use this same
+    /// choice before calling [`Self::select_action_on_batch`].
+    pub fn camera_normalization(&self) -> &CameraNormalization {
+        &self.camera_normalization
     }
 
     /// Clear the queued chunk at an episode/environment reset.
@@ -304,17 +335,49 @@ impl InferenceSession {
 
     /// Select one action for a dataset observation, matching ACT's queue behavior.
     pub fn select_action(&mut self, index: usize) -> Result<InferenceStep> {
+        let batch = self.batch(index)?;
+        let frame_index = i64::try_from(index).map_err(|_| {
+            TrainError::Metadata(format!("dataset frame index {index} does not fit in i64"))
+        })?;
+        self.select_action_normalized(&batch, frame_index)
+    }
+
+    /// Select one action from a caller-owned, single-observation batch.
+    ///
+    /// The batch must contain exactly one observation. Camera tensors must already
+    /// have been attached with [`Batch::with_images`] and the checkpoint's camera
+    /// normalization choice. The batch is otherwise raw, just as a LeRobot rollout
+    /// strategy hands the policy an unprocessed observation before its preprocessor.
+    pub fn select_action_on_batch(&mut self, batch: &Batch) -> Result<InferenceStep> {
+        if batch.len() != 1 {
+            return Err(TrainError::Metadata(format!(
+                "ACT deployment expects one observation, got {}",
+                batch.len()
+            )));
+        }
+        let frame_index = *batch.indices.first().ok_or_else(|| {
+            TrainError::Metadata("the single-observation batch has no frame index".to_owned())
+        })?;
+        let normalized = batch.normalized(&self.normalizer)?;
+        self.select_action_normalized(&normalized, frame_index)
+    }
+
+    fn select_action_normalized(
+        &mut self,
+        batch: &Batch,
+        frame_index: i64,
+    ) -> Result<InferenceStep> {
         let temporal = self.temporal_ensembler.is_some();
         let queried_policy = temporal || self.queued_actions.is_empty();
         let action = if temporal {
-            let chunk = self.predict_chunk(index)?;
+            let actions = self.predict_chunk_from_batch(batch)?;
             self.temporal_ensembler
                 .as_mut()
                 .expect("temporal flag was checked above")
-                .update(chunk)?
+                .update(actions)?
         } else {
             if queried_policy {
-                self.refill(index)?;
+                self.refill_from_batch(batch)?;
             }
             self.queued_actions.pop_front().ok_or_else(|| {
                 TrainError::Metadata("ACT returned an empty action chunk".to_owned())
@@ -324,9 +387,6 @@ impl InferenceSession {
             .normalizer
             .unnormalize(ACTION, &action)
             .map_err(|error| TrainError::Metadata(error.to_string()))?;
-        let frame_index = i64::try_from(index).map_err(|_| {
-            TrainError::Metadata(format!("dataset frame index {index} does not fit in i64"))
-        })?;
         if !action.iter().all(|value| value.is_finite()) {
             return Err(TrainError::NonFinite {
                 step: frame_index.max(0) as u64 + 1,
@@ -357,10 +417,15 @@ impl InferenceSession {
         let end = start_index.checked_add(steps).ok_or_else(|| {
             TrainError::Metadata("offline rollout index range overflowed".to_owned())
         })?;
-        if end > self.dataset.len() {
+        let dataset = self.dataset.as_ref().ok_or_else(|| {
+            TrainError::unsupported(
+                "a checkpoint-only inference session has no dataset; use select_action_on_batch",
+            )
+        })?;
+        let dataset_len = dataset.len();
+        if end > dataset_len {
             return Err(TrainError::Metadata(format!(
-                "offline rollout ends at frame {end}, but the dataset has {} frames",
-                self.dataset.len()
+                "offline rollout ends at frame {end}, but the dataset has {dataset_len} frames"
             )));
         }
         let mut trace = Vec::with_capacity(steps.min(crate::limits::MAX_BATCH_SIZE));
@@ -369,7 +434,11 @@ impl InferenceSession {
         self.reset();
         let mut previous_episode = None;
         for index in start_index..end {
-            let episode = self.dataset.episode_index_at(index)?;
+            let episode = self
+                .dataset
+                .as_ref()
+                .expect("the dataset was checked above")
+                .episode_index_at(index)?;
             if should_reset_for_episode_change(previous_episode, episode) {
                 self.reset();
             }
@@ -379,9 +448,8 @@ impl InferenceSession {
         Ok(trace)
     }
 
-    fn refill(&mut self, index: usize) -> Result<()> {
-        let batch = self.batch(index)?;
-        let actions = self.model.predict_action_steps(&batch)?;
+    fn refill_from_batch(&mut self, batch: &Batch) -> Result<()> {
+        let actions = self.model.predict_action_steps(batch)?;
         self.queued_actions = actions
             .to_vec3::<f32>()?
             .into_iter()
@@ -394,16 +462,20 @@ impl InferenceSession {
         Ok(())
     }
 
-    fn predict_chunk(&self, index: usize) -> Result<Vec<Vec<f32>>> {
-        let batch = self.batch(index)?;
-        let actions = self.model.predict_action_chunk(&batch)?;
+    fn predict_chunk_from_batch(&self, batch: &Batch) -> Result<Vec<Vec<f32>>> {
+        let actions = self.model.predict_action_chunk(batch)?;
         actions.to_vec3::<f32>()?.into_iter().next().ok_or_else(|| {
             TrainError::Metadata("ACT returned no action for a non-empty batch".to_owned())
         })
     }
 
     fn batch(&self, index: usize) -> Result<Batch> {
-        let frame = self.dataset.get(index)?;
+        let dataset = self.dataset.as_ref().ok_or_else(|| {
+            TrainError::unsupported(
+                "a checkpoint-only inference session has no dataset; use select_action_on_batch",
+            )
+        })?;
+        let frame = dataset.get(index)?;
         let raw = collate(std::slice::from_ref(&frame), self.model.device())?;
         let images = collate_images(std::slice::from_ref(&frame), self.model.device())?;
         let raw = if images.is_empty() {

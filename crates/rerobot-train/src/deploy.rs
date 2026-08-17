@@ -215,6 +215,7 @@ pub struct InferenceSession {
     model: ActModel,
     normalizer: Normalizer,
     camera_normalization: CameraNormalization,
+    camera_normalizations: IndexMap<String, CameraNormalization>,
     queued_actions: VecDeque<Vec<f32>>,
     temporal_ensembler: Option<TemporalEnsembler>,
 }
@@ -288,6 +289,13 @@ impl InferenceSession {
             .map(|coefficient| TemporalEnsembler::new(coefficient, model.shape().chunk_size))
             .transpose()?;
         let camera_normalization = load_camera_normalization(checkpoint_dir)?;
+        let mut camera_normalizations = IndexMap::new();
+        for (key, feature) in config.input_features.clone().unwrap_or_default() {
+            if feature.r#type == rerobot_core::types::FeatureType::Visual {
+                camera_normalizations.insert(key, camera_normalization.clone());
+            }
+        }
+        camera_normalizations.extend(processors.camera_normalizations().clone());
         Ok(Self {
             checkpoint_dir: checkpoint_dir.to_path_buf(),
             policy_config: config,
@@ -295,6 +303,7 @@ impl InferenceSession {
             model,
             normalizer,
             camera_normalization,
+            camera_normalizations,
             queued_actions: VecDeque::new(),
             temporal_ensembler,
         })
@@ -325,7 +334,12 @@ impl InferenceSession {
         &self.camera_normalization
     }
 
-    /// Clear the queued chunk at an episode/environment reset.
+    /// The checkpoint's per-camera normalization, keyed by image feature name.
+    pub fn camera_normalizations(&self) -> &IndexMap<String, CameraNormalization> {
+        &self.camera_normalizations
+    }
+
+    /// Clear the queued chunk at an environment/episode reset.
     pub fn reset(&mut self) {
         self.queued_actions.clear();
         if let Some(ensembler) = &mut self.temporal_ensembler {
@@ -481,7 +495,7 @@ impl InferenceSession {
         let raw = if images.is_empty() {
             raw
         } else {
-            raw.with_images(&images, &self.camera_normalization)?
+            raw.with_image_normalizations(&images, &self.camera_normalizations)?
         };
         raw.normalized(&self.normalizer)
     }

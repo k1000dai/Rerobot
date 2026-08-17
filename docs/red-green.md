@@ -1402,3 +1402,36 @@ instead of hardcoding it, so the manifest and tested toolchain cannot drift.
 `rust-version = "1.85"` and `hashbrown` 0.17.1 declares `"1.85.0"`. The
 workspace's own code needs less than that, so the number is a property of the
 dependency set, not of this source.
+
+## Cycle 21 — per-camera normalization state is fail-closed
+
+The pinned upstream writes visual statistics into the normalizer state with
+`mean` and `std` together. `NormalizerProcessorStep._apply_transform` then
+requires both for `MEAN_STD`; silently treating one missing entry as identity
+would deploy a camera with a different input scale from the one used in training.
+
+**RED** — the regression test was added before the loader change and run alone:
+
+```
+cargo test -p rerobot-train --test processor visual_processor_state_rejects_partial_camera_statistics --locked
+
+FAILED: a visual feature with only one statistic must be refused: LoadedPolicyProcessors { ... camera_normalizations: {} }
+```
+
+The damaged preprocessor and postprocessor state each retained only
+`observation.images.top.mean`. The loader accepted the checkpoint and returned
+an empty camera-normalization map, which was the intended missing-behaviour
+failure rather than a fixture or compilation error.
+
+**GREEN** — `camera_normalizations_from_state` now distinguishes absent camera
+statistics from a partial pair: absent `mean`/`std` remains the upstream
+identity/no-statistics case, while exactly one is present returns a named
+metadata error. Both complete pairs continue to round-trip through safetensors.
+
+```
+cargo test -p rerobot-train --test processor visual_processor_state_rejects_partial_camera_statistics --locked
+1 passed; 0 failed
+
+cargo test -p rerobot-train --test processor --locked
+10 passed; 0 failed
+```

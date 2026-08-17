@@ -21,10 +21,13 @@
 
 mod common;
 
-use common::{fixture_dataset, reduced_config, TempDir};
+use common::{embedded_image_fixture, fixture_dataset, reduced_config, TempDir};
+use indexmap::IndexMap;
 use rerobot_core::dataset::json::{loads, JsonLike};
+use rerobot_train::data::image::CameraNormalization;
 use rerobot_train::processor::{
-    write_processor_artifacts, POLICY_POSTPROCESSOR_NAME, POLICY_PREPROCESSOR_NAME,
+    write_processor_artifacts, write_processor_artifacts_with_cameras, LoadedPolicyProcessors,
+    POLICY_POSTPROCESSOR_NAME, POLICY_PREPROCESSOR_NAME,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -99,6 +102,75 @@ fn all_four_upstream_artifacts_are_written_under_their_upstream_names() {
     assert_eq!(found, expected);
     assert_eq!(POLICY_PREPROCESSOR_NAME, "policy_preprocessor");
     assert_eq!(POLICY_POSTPROCESSOR_NAME, "policy_postprocessor");
+}
+
+#[test]
+fn visual_processor_state_round_trips_per_camera_statistics() {
+    let dir = TempDir::new("processor-camera-stats");
+    let target = dir.child("pretrained_model");
+    std::fs::create_dir_all(&target).unwrap();
+    let metadata = rerobot_train::data::meta::DatasetMetadata::load(&embedded_image_fixture())
+        .expect("embedded image fixture");
+    let mut config = reduced_config(embedded_image_fixture(), dir.child("out"));
+    let (inputs, outputs) = metadata.policy_feature_split();
+    config.policy.input_features = Some(inputs);
+    config.policy.output_features = Some(outputs);
+    let mut cameras = IndexMap::new();
+    cameras.insert(
+        "observation.images.top".to_owned(),
+        CameraNormalization::new(vec![0.25, 0.5, 0.75], vec![0.1, 0.2, 0.3]).unwrap(),
+    );
+
+    write_processor_artifacts_with_cameras(&target, &config.policy, &metadata.stats, &cameras)
+        .expect("processor artifacts are written");
+    let loaded =
+        LoadedPolicyProcessors::load(&target, &config.policy).expect("processor artifacts reload");
+    let restored = loaded
+        .camera_normalizations()
+        .get("observation.images.top")
+        .expect("camera statistics are restored");
+    assert_eq!(restored.mean(), &[0.25, 0.5, 0.75]);
+    assert_eq!(restored.std(), &[0.1, 0.2, 0.3]);
+}
+
+#[test]
+fn visual_processor_state_rejects_partial_camera_statistics() {
+    let dir = TempDir::new("processor-partial-camera-stats");
+    let target = dir.child("pretrained_model");
+    std::fs::create_dir_all(&target).unwrap();
+    let metadata = rerobot_train::data::meta::DatasetMetadata::load(&embedded_image_fixture())
+        .expect("embedded image fixture");
+    let mut config = reduced_config(embedded_image_fixture(), dir.child("out"));
+    let (inputs, outputs) = metadata.policy_feature_split();
+    config.policy.input_features = Some(inputs);
+    config.policy.output_features = Some(outputs);
+    let mut cameras = IndexMap::new();
+    cameras.insert(
+        "observation.images.top".to_owned(),
+        CameraNormalization::new(vec![0.25, 0.5, 0.75], vec![0.1, 0.2, 0.3]).unwrap(),
+    );
+    write_processor_artifacts_with_cameras(&target, &config.policy, &metadata.stats, &cameras)
+        .expect("processor artifacts are written");
+
+    for filename in [
+        "policy_preprocessor_step_3_normalizer_processor.safetensors",
+        "policy_postprocessor_step_0_unnormalizer_processor.safetensors",
+    ] {
+        let path = target.join(filename);
+        let mut tensors = candle_core::safetensors::load(&path, &candle_core::Device::Cpu)
+            .expect("the state loads");
+        tensors.remove("observation.images.top.std");
+        candle_core::safetensors::save(&tensors, &path).expect("the damaged state is writable");
+    }
+
+    let error = LoadedPolicyProcessors::load(&target, &config.policy)
+        .expect_err("a visual feature with only one statistic must be refused");
+    assert!(
+        error
+            .to_string()
+            .contains("requires both mean and std statistics"),
+        "partial camera state was not named: {error}"
+    );
 }
 
 // ---------------------------------------------------------------------------

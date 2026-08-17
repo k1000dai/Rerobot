@@ -16,7 +16,8 @@ pub struct Config {
     pub port: PathBuf,
     /// One finite operation to perform.
     pub action: Action,
-    /// Optional six-joint degree vector for [`Action::Set`].
+    /// Optional six-joint vector for [`Action::Set`]: five body-joint degrees
+    /// followed by the gripper's `0..=100` command.
     pub positions_degrees: Option<[f32; 6]>,
     /// How long a position command holds torque before releasing it.
     pub hold_ms: u64,
@@ -33,7 +34,7 @@ pub enum Action {
     Read,
     /// Move all joints to their configured centers.
     Center,
-    /// Move all joints to the supplied degree vector.
+    /// Move all joints to five degree values plus a gripper percentage.
     Set,
     /// Disable torque on all joints.
     Release,
@@ -113,7 +114,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         ));
     }
     if action == Action::Set && positions.is_none() {
-        return Err("--robot.positions=DEG,DEG,DEG,DEG,DEG,DEG is required for set".to_owned());
+        return Err("--robot.positions=DEG,DEG,DEG,DEG,DEG,PERCENT is required for set".to_owned());
     }
     Ok(Config {
         port,
@@ -207,14 +208,14 @@ fn parse_positions(value: &str) -> Result<[f32; 6], String> {
         .split(',')
         .map(|item| {
             item.parse::<f32>()
-                .map_err(|_| format!("position {item:?} is not a finite decimal degree value"))
+                .map_err(|_| format!("position {item:?} is not a finite decimal value"))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let positions: [f32; 6] = values
-        .try_into()
-        .map_err(|_| "--robot.positions needs exactly six comma-separated degrees".to_owned())?;
+    let positions: [f32; 6] = values.try_into().map_err(|_| {
+        "--robot.positions needs five degrees and one gripper percentage".to_owned()
+    })?;
     if positions.iter().any(|position| !position.is_finite()) {
-        return Err("--robot.positions must contain only finite degrees".to_owned());
+        return Err("--robot.positions must contain only finite values".to_owned());
     }
     Ok(positions)
 }
@@ -225,7 +226,7 @@ pub fn help() -> &'static str {
      Usage:\n\
      lerobot-teleoperate --robot.type=so101_follower --robot.port=PORT --robot.action=read|ping\n\
      lerobot-teleoperate --robot.type=so101_follower --robot.port=PORT --robot.action=center --robot.confirm=true\n\
-     lerobot-teleoperate --robot.type=so101_follower --robot.port=PORT --robot.action=set --robot.positions=DEG,DEG,DEG,DEG,DEG,DEG --robot.confirm=true\n\
+     lerobot-teleoperate --robot.type=so101_follower --robot.port=PORT --robot.action=set --robot.positions=DEG,DEG,DEG,DEG,DEG,PERCENT --robot.confirm=true\n\
      lerobot-teleoperate --robot.type=so101_follower --robot.port=PORT --robot.action=release --robot.confirm=true\n\
      Position actions hold torque for --robot.hold_ms=1000 (default), then release it.\n\
      This is a deterministic actuator smoke/position path, not the full upstream leader-follower teleoperation strategy."
@@ -257,10 +258,22 @@ mod tests {
     }
 
     #[test]
-    fn set_requires_exactly_six_finite_degrees() {
+    fn set_requires_exactly_six_values() {
         let mut args = base("set");
         args.push("--robot.confirm=true".to_owned());
         args.push("--robot.positions=0,1,2".to_owned());
-        assert!(parse(&args).unwrap_err().contains("exactly six"));
+        assert!(parse(&args).unwrap_err().contains("five degrees"));
+    }
+
+    #[test]
+    fn set_accepts_body_degrees_followed_by_gripper_percentage() {
+        let mut args = base("set");
+        args.push("--robot.confirm=true".to_owned());
+        args.push("--robot.positions=0,1,2,3,4,25.5".to_owned());
+        let config = parse(&args).unwrap();
+        assert_eq!(
+            config.positions_degrees,
+            Some([0.0, 1.0, 2.0, 3.0, 4.0, 25.5])
+        );
     }
 }

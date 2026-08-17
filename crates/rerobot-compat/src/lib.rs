@@ -150,16 +150,7 @@ pub static ENTRY_POINTS: &[EntryPoint] = &[
         target: "lerobot.scripts.lerobot_train:main",
         status: Status::Partial,
         summary: "Train a policy.",
-        note: "Runnable for one vertical slice: the ACT policy on a local LeRobot v3.0 with \
-            state/action columns and embedded PNG/JPEG camera columns, or through the in-memory \
-            camera batch API. `--policy.device` takes `cpu`, and `cuda`/`cuda:0` when built with \
-            the `cuda` feature; a GPU that was asked for and cannot be provided is an error rather \
-            than a silent fallback. A local one-process checkpoint can be resumed with \
-            `--resume=true --config_path=...`, restoring model, AdamW state, RNG and sampler \
-            position; Python's three-generator/distributed/accelerate resume semantics remain \
-            outside the boundary. Video decoding, external image files, image transforms, the \
-            Hub, accelerate, mixed precision, LR schedulers, PEFT and environment evaluation are \
-            refused with a reason rather than ignored.",
+        note: "Runnable for one vertical slice: the ACT policy on a local or native Hub-downloaded LeRobot v3.0 snapshot with state/action columns and embedded PNG/JPEG camera columns, or through the in-memory camera batch API. `--policy.device` takes `cpu`, and `cuda`/`cuda:0` when built with the `cuda` feature; a GPU that was asked for and cannot be provided is an error rather than a silent fallback. A local one-process checkpoint can be resumed with `--resume=true --config_path=...`, restoring model, AdamW state, RNG and sampler position; Python's three-generator/distributed/accelerate resume semantics remain outside the boundary. Video decoding, external image files, image transforms, Hub streaming/revision flags, accelerate, mixed precision, LR schedulers, PEFT and environment evaluation are refused with a reason rather than ignored.",
     },
     EntryPoint {
         name: "lerobot-train-tokenizer",
@@ -223,7 +214,7 @@ pub static ENTRY_POINTS: &[EntryPoint] = &[
         target: "lerobot.scripts.lerobot_rollout:main",
         status: Status::Partial,
         summary: "Run a trained policy on a real robot with pluggable strategies.",
-        note: "Runnable for a hardware-independent local ACT deployment: it loads a checkpoint, consumes the saved normalizer/unnormalizer processor state, reads local dataset observations, and emits action-unit outputs from the action queue or temporal ensembler. Robot drivers, teleoperators, environments, visualization and video shards remain explicitly refused; the physical rollout boundary is not faked.",
+        note: "Runnable for a hardware-independent local ACT deployment: it loads a checkpoint, consumes the saved normalizer/unnormalizer processor state, reads local dataset observations, and emits action-unit outputs from the action queue or temporal ensembler. The library also loads a checkpoint without a dataset and accepts a caller-owned single-observation `Batch`, matching the policy's simulator/camera adapter boundary. Robot drivers, teleoperators, environments, visualization and video shards remain explicitly refused; the physical rollout boundary is not faked.",
     },
 ];
 
@@ -275,16 +266,7 @@ pub static MODULE_FAMILIES: &[ModuleFamily] = &[
         name: "datasets",
         status: Status::Partial,
         upstream_modules: 22,
-        note: "State/action columns and embedded PNG/JPEG `dtype: \"image\"` columns of a \
-               LeRobot v3.0 dataset on local disk are ported and tested end to end: `utils`' path \
-               constants, `DatasetInfo`, `io_utils`' four loaders including `load_stats`, the tasks \
-               and episodes parquet tables, the frame data files, `feature_utils`' delta indices and \
-               tolerance check, `dataset_reader`'s episode-clamped windows and `<key>_is_pad` flags, \
-               and `sampler`'s `EpisodeAwareSampler` structure. Video shards, external image files, \
-               image transforms, the streaming dataset, episode-filtered index remapping, dataset \
-               editing and Hub sync are not, and the sampler's per-epoch order is Rerobot's own rather \
-               than `torch.randperm`'s. ACT's separate in-memory camera batch contract is implemented \
-               by `rerobot-train` rather than this dataset reader.",
+        note: "State/action columns and embedded PNG/JPEG `dtype: \"image\"` columns of a LeRobot v3.0 dataset on local disk are ported and tested end to end: `utils`' path constants, `DatasetInfo`, `io_utils`' four loaders including `load_stats`, the tasks and episodes parquet tables, the frame data files, `feature_utils`' delta indices and tolerance check, `dataset_reader`'s episode-clamped windows and `<key>_is_pad` flags, and `sampler`'s `EpisodeAwareSampler` structure. A native Hub snapshot downloader also lists paginated trees, rejects unsafe paths, stages files atomically, and refuses video shards; Hub streaming/sync, video shards, external image files, image transforms, episode-filtered index remapping and dataset editing are not, and the sampler's per-epoch order is Rerobot's own rather than `torch.randperm`'s. ACT's separate in-memory camera batch contract is implemented by `rerobot-train` rather than this dataset reader.",
     },
     ModuleFamily {
         name: "envs",
@@ -327,8 +309,9 @@ pub static MODULE_FAMILIES: &[ModuleFamily] = &[
                read/write are ported, as is the ACT tensor model for state/action and embedded or \
                in-memory camera inputs: the VAE encoder, ResNet18/34 backbone, 1-D/2-D camera \
                position embeddings, transformer, action head and the L1-plus-KL objective. The \
-               ACT temporal ensembler and the checkpoint normalizer/unnormalizer boundary are \
-               ported in `rerobot_train::deploy`; every other policy architecture is not.",
+               ACT temporal ensembler, checkpoint normalizer/unnormalizer boundary, and \
+               checkpoint-only caller-batch inference boundary are ported in \
+               `rerobot_train::deploy`; every other policy architecture is not.",
     },
     ModuleFamily {
         name: "processor",
@@ -366,7 +349,7 @@ pub static MODULE_FAMILIES: &[ModuleFamily] = &[
         name: "rollout",
         status: Status::Partial,
         upstream_modules: 18,
-        note: "`ring_buffer.RolloutRingBuffer` is ported and tested, including its byte-accounting quirks, as is the DAgger event state machine (`strategies.dagger.DAggerPhase`, its four transitions and `DAggerEvents`). The DAgger strategy itself, the input devices it listens to, the other rollout strategies and the hardware/environment policy loop are not. The local dataset-backed ACT action queue and temporal ensembler are ported in `rerobot_train::deploy`; it does not claim a robot or Gymnasium boundary.",
+        note: "`ring_buffer.RolloutRingBuffer` is ported and tested, including its byte-accounting quirks, as is the DAgger event state machine (`strategies.dagger.DAggerPhase`, its four transitions and `DAggerEvents`). The DAgger strategy itself, the input devices it listens to, the other rollout strategies and the hardware/environment policy loop are not. The local dataset-backed ACT action queue, temporal ensembler, and checkpoint-only caller-batch inference boundary are ported in `rerobot_train::deploy`; it does not claim a robot or Gymnasium boundary.",
     },
     ModuleFamily {
         name: "scripts",

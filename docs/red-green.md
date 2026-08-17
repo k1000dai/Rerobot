@@ -1305,7 +1305,71 @@ arbitrary-precision integer is refused rather than silently narrowed. The accept
 boundary is intentionally local and hardware-independent; robot drivers,
 environments, and video shards remain refused.
 
-## Whole-workspace gate
+## Cycle 19 — Hub destination safety
+
+**RED** — before tightening the Hub snapshot writer's destination boundary, the
+new tests were run one at a time:
+
+```
+cargo test -p rerobot-train --test hub an_existing_empty_destination_is_rejected_without_being_removed -- --exact
+exit 101
+
+cargo test -p rerobot-train --test hub a_symlink_destination_is_rejected_even_when_its_target_is_complete -- --exact
+exit 101
+```
+
+Both failures were the intended missing behaviour: the old implementation
+removed an existing empty directory before downloading, and treated a symlink
+to a complete snapshot as a cache hit. No production change was made before
+these RED runs.
+
+**GREEN** — `HubDownloader::download` now checks the destination with
+`symlink_metadata`, preserves complete regular-directory cache hits, and
+rejects existing incomplete directories, files, broken links, and symlink
+aliases before making a request or creating a staging directory:
+
+```
+cargo test -p rerobot-train --test hub -- --nocapture
+9 passed; 0 failed
+```
+
+The existing staging/rename and mid-download failure tests remain in the same
+suite, so a failed transfer still leaves no final dataset or staging sibling.
+
+## Cycle 20 — checkpoint-only ACT inference boundary
+
+**RED** — before the checkpoint-only adapter existed, the new focused test was
+run against the dataset-bound `InferenceSession` API:
+
+```
+cargo test -p rerobot-train --test deploy a_checkpoint_can_infer_from_a_caller_batch_without_opening_a_dataset --locked
+exit 101 (compile failure: `InferenceSession::load_checkpoint` was not yet defined)
+```
+
+This was the intended API failure: the test could not compile because the
+runtime-owned observation boundary did not exist. No production implementation
+was present before the RED run.
+
+**GREEN** — `InferenceSession::load_checkpoint` now loads the ACT config,
+saved processor state, model weights, camera normalization choice, action queue,
+and optional temporal ensembler without opening or resolving a dataset.
+`select_action_on_batch` accepts one caller-owned raw `Batch`, applies the
+checkpoint normalizer, preserves the checkpoint's frame index, and returns the
+same finite action as the dataset-backed path for the identical fixture frame.
+A checkpoint-only session reports no dataset and refuses dataset-indexed
+rollouts rather than silently using a hidden fixture.
+
+```
+cargo test -p rerobot-train --test deploy a_checkpoint_can_infer_from_a_caller_batch_without_opening_a_dataset --locked
+1 passed; 0 failed
+
+cargo test -p rerobot-train --test deploy --locked
+14 passed; 0 failed
+```
+
+The remaining boundary is deliberate: this API accepts already-acquired
+Candle tensors, but it does not invent a simulator, camera driver, robot
+transport, or Gymnasium environment.
 
 The CPU/default feature gates passed locally with the locked dependency graph:
 

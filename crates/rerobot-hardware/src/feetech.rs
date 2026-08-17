@@ -86,6 +86,43 @@ pub const DEFAULT_BAUDRATE: u32 = 1_000_000;
 /// Feetech's protocol-0 packet header.
 pub const HEADER: [u8; 2] = [0xff, 0xff];
 
+/// Encode an integer using the sign-magnitude fields used by Feetech registers.
+///
+/// The sign bit is separate from the magnitude; this is not two's-complement
+/// encoding. Feetech uses bit 11 for `Homing_Offset` and bit 15 for several
+/// signed position/velocity fields.
+pub fn encode_sign_magnitude(value: i32, sign_bit: u8) -> Result<u16, FeetechError> {
+    if sign_bit >= 16 {
+        return Err(FeetechError::Invalid(format!(
+            "sign bit {sign_bit} does not fit in a 16-bit register"
+        )));
+    }
+    let max_magnitude = (1_i64 << sign_bit) - 1;
+    let magnitude = i64::from(value).abs();
+    if magnitude > max_magnitude {
+        return Err(FeetechError::Invalid(format!(
+            "magnitude {magnitude} exceeds {max_magnitude} for sign bit {sign_bit}"
+        )));
+    }
+    let sign = if value < 0 { 1_i64 << sign_bit } else { 0 };
+    Ok((sign | magnitude) as u16)
+}
+
+/// Decode a Feetech sign-magnitude register value.
+pub fn decode_sign_magnitude(encoded: u16, sign_bit: u8) -> Result<i32, FeetechError> {
+    if sign_bit >= 16 {
+        return Err(FeetechError::Invalid(format!(
+            "sign bit {sign_bit} does not fit in a 16-bit register"
+        )));
+    }
+    let magnitude = i32::from(encoded & ((1_u16 << sign_bit) - 1));
+    if encoded & (1_u16 << sign_bit) != 0 {
+        Ok(-magnitude)
+    } else {
+        Ok(magnitude)
+    }
+}
+
 /// Build a protocol-0 instruction packet.
 pub fn instruction_packet(id: u8, instruction: Instruction, parameters: &[u8]) -> Vec<u8> {
     let length = u8::try_from(parameters.len() + 2).expect("Feetech packet length exceeds u8");
@@ -345,6 +382,17 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn sign_magnitude_codec_matches_feetech_calibration_encoding() {
+        assert_eq!(encode_sign_magnitude(-709, 11).unwrap(), 0x0ac5);
+        assert_eq!(decode_sign_magnitude(0x0ac5, 11).unwrap(), -709);
+        assert_eq!(encode_sign_magnitude(2047, 11).unwrap(), 2047);
+        assert_eq!(
+            encode_sign_magnitude(-2048, 11).unwrap_err().to_string(),
+            "invalid Feetech request: magnitude 2048 exceeds 2047 for sign bit 11"
+        );
     }
 
     #[test]

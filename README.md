@@ -118,8 +118,10 @@ Three details worth knowing up front:
   checkpoint can be loaded, its saved pre/postprocessor statistics are applied
   to observations and returned actions, and the result is fed through ACT's
   action queue or temporal ensembler. Finite action traces are emitted in the
-  checkpoint's action units. Robot drivers, Gymnasium environments, and video
-  shards remain refused.
+  checkpoint's action units. The library also loads a checkpoint without a
+  dataset and accepts a caller-owned single-observation `Batch`, which is the
+  boundary for simulator or camera adapters. Robot drivers, Gymnasium
+  environments, and video shards remain refused.
 
 ## Development
 

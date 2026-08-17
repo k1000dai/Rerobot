@@ -4,10 +4,11 @@ The pure-Rust ACT training slice of [Rerobot][repo], a behaviour-compatible port
 of [Hugging Face LeRobot][upstream].
 
 This crate is what makes `lerobot-train` run for one narrow, honest case: a
-LeRobot v3.0 dataset on local disk with state/action columns and embedded PNG/JPEG
-camera columns, or an ACT policy fed camera tensors in memory, on **CPU** or **CUDA**, with the upstream checkpoint
-layout on the way out. There is no PyTorch, no Python sidecar and no FFI: the
-tensor work is [candle], the parquet work is [arrow], and the rest is this crate.
+LeRobot v3.0 dataset on local disk or a native Hub snapshot with state/action columns
+and embedded PNG/JPEG camera columns, or an ACT policy fed camera tensors in memory,
+on **CPU** or **CUDA**, with the upstream checkpoint layout on the way out. There is
+no PyTorch, no Python sidecar and no FFI: the tensor work is [candle], the parquet
+work is [arrow], and the rest is this crate.
 
 [repo]: https://github.com/k1000dai/Rerobot
 [upstream]: https://github.com/huggingface/lerobot
@@ -18,12 +19,12 @@ tensor work is [candle], the parquet work is [arrow], and the rest is this crate
 
 | Piece | Upstream source |
 | --- | --- |
-| `data` — `meta/info.json`, `meta/stats.json`, `meta/tasks.parquet`, `meta/episodes/`, `data/` | `lerobot/datasets/{lerobot_dataset,dataset_reader,io_utils}.py` |
+| `data` — `meta/info.json`, `meta/stats.json`, `meta/tasks.parquet`, `meta/episodes/`, `data/`, and a staged native Hub snapshot | `lerobot/datasets/{lerobot_dataset,dataset_reader,io_utils}.py` |
 | `model` — the ACT transformer, VAE encoder, ResNet18/34 camera backbone, 1-D/2-D sinusoidal embeddings, L1 + KL loss | `lerobot/policies/act/modeling_act.py` |
 | `optim` — AdamW and `clip_grad_norm_` | `torch.optim.AdamW`, `torch.nn.utils.clip_grad_norm_` |
 | `checkpoint` — `checkpoints/<step>/{pretrained_model,training_state}/` | `lerobot/common/train_utils.py` |
 | `run` — the step loop | `lerobot/scripts/lerobot_train.py` |
-| `deploy` — local ACT checkpoint loading, feature normalization, action queue, temporal ensembling and finite dataset-backed inference | `lerobot/policies/act/modeling_act.py`, `lerobot/scripts/lerobot_rollout.py`'s local observation boundary |
+| `deploy` — local ACT checkpoint loading, feature normalization, action queue, temporal ensembling, finite dataset-backed inference, and checkpoint-only caller-batch inference | `lerobot/policies/act/modeling_act.py`, `lerobot/scripts/lerobot_rollout.py`'s local observation boundary |
 
 ## Devices
 
@@ -63,7 +64,8 @@ Windows, and element by element against upstream PyTorch.
 
 ## What is deliberately out of scope
 
-Video decoding, external image files, image transforms, the Hub, `accelerate`,
+Video decoding, external image files, image transforms, Hub streaming/sync,
+`accelerate`,
 distributed training, mixed precision, LR schedulers, PEFT, environment evaluation,
 `wandb`, and every policy other than ACT. Embedded PNG/JPEG camera columns are
 decoded into ACT inputs; camera inputs supplied as `f32` Candle tensors through
@@ -106,5 +108,26 @@ let mut session = InferenceSession::load(
 )?;
 let action = session.select_action(0)?;
 assert_eq!(action.frame_index, 0);
+# Ok::<(), rerobot_train::error::TrainError>(())
+```
+
+When observations come from a simulator, camera adapter, or another runtime,
+the checkpoint can be loaded without opening a dataset and consumed through the
+same single-observation `Batch` boundary as upstream `ACTPolicy.select_action`.
+Use `session.device()` for Candle tensor placement and
+`session.camera_normalization()` when attaching camera tensors:
+
+```no_run
+use rerobot_train::data::batch::Batch;
+use rerobot_train::deploy::InferenceSession;
+use std::path::Path;
+
+let mut session = InferenceSession::load_checkpoint(
+    Path::new("outputs/train/demo/checkpoints/000001/pretrained_model"),
+    Some("cpu"),
+)?;
+let raw_batch: Batch = todo!("assemble one raw observation and attach camera tensors");
+let action = session.select_action_on_batch(&raw_batch)?;
+assert!(action.action.iter().all(|value| value.is_finite()));
 # Ok::<(), rerobot_train::error::TrainError>(())
 ```

@@ -109,6 +109,51 @@ fn failed_file_download_does_not_publish_or_leave_staging() {
 }
 
 #[test]
+fn an_existing_empty_destination_is_rejected_without_being_removed() {
+    let parent = tempfile_dir("hub-existing-empty");
+    let root = parent.join("snapshot");
+    std::fs::create_dir(&root).unwrap();
+
+    let error = HubDownloader::new("http://127.0.0.1:1")
+        .download("org/dataset", &root, "v3.0")
+        .expect_err("an existing destination must not be overwritten");
+
+    assert!(error.to_string().contains("already exists"));
+    assert!(root.is_dir(), "the existing destination was removed");
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_destination_is_rejected_even_when_its_target_is_complete() {
+    let tree = [
+        "meta/info.json",
+        "meta/tasks.parquet",
+        "meta/episodes/chunk-000/file-000.parquet",
+        "data/chunk-000/file-000.parquet",
+    ];
+    let (base_url, server) = mock_hub(&tree, false);
+    let parent = tempfile_dir("hub-symlink-destination");
+    let source = parent.join("source");
+    HubDownloader::new(&base_url)
+        .download("org/dataset", &source, "v3.0")
+        .expect("the complete source snapshot downloads");
+    server.join().unwrap();
+
+    let alias = parent.join("alias");
+    std::os::unix::fs::symlink(&source, &alias).unwrap();
+    let error = HubDownloader::new("http://127.0.0.1:1")
+        .download("org/dataset", &alias, "v3.0")
+        .expect_err("a symlink must not be accepted as a destination alias");
+
+    assert!(error.to_string().contains("destination"));
+    assert!(std::fs::symlink_metadata(&alias)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[test]
 fn malicious_tree_entry_is_rejected_before_any_file_is_written() {
     let (base_url, server) = mock_hub(&["../outside"], false);
     let parent = tempfile_dir("hub-path");

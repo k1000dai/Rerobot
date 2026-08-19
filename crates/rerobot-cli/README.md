@@ -31,6 +31,12 @@ lerobot-train --dataset.repo_id=ID --dataset.root=DIR --output_dir=DIR \
 lerobot-train --policy.type=diffusion; echo $?   # -> 2
 lerobot-train --wandb.project=demo;    echo $?   # -> 2
 
+# A local ACT checkpoint can warm-start another run. The directory is the
+# `pretrained_model` directory written by a prior run; Hub model IDs are refused:
+lerobot-train --dataset.repo_id=ID --dataset.root=DIR --output_dir=DIR \
+              --policy.path=outputs/train/demo/checkpoints/000001/pretrained_model \
+              --steps=1
+
 # A hardware-independent local deployment path loads a checkpoint and emits
 # actions from dataset observations:
 lerobot-rollout --policy.path=outputs/train/demo/checkpoints/000001/pretrained_model \\

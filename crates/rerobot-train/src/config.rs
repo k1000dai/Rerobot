@@ -569,8 +569,14 @@ impl TrainConfig {
             &path,
             DEFAULT_USE_IMAGENET_STATS,
         )?;
-        let policy = ActConfig::from_checkpoint_value(value_field(root, "policy", &path)?)
+        let mut policy = ActConfig::from_checkpoint_value(value_field(root, "policy", &path)?)
             .map_err(|error| TrainError::checkpoint(&path, error.to_string()))?;
+        policy.pretrained_path = Some(
+            checkpoint_dir
+                .join(crate::checkpoint::PRETRAINED_MODEL_DIR)
+                .to_string_lossy()
+                .into_owned(),
+        );
         let output_dir = PathBuf::from(string_field(root, "output_dir", &path)?);
         let mut config = Self::new(dataset_repo_id, dataset_root, output_dir);
         config.dataset_episodes = dataset_episodes;

@@ -26,7 +26,7 @@ ImageNet statistics.
 | `model` — the ACT transformer, VAE encoder, ResNet18/34 camera backbone, 1-D/2-D sinusoidal embeddings, L1 + KL loss | `lerobot/policies/act/modeling_act.py` |
 | `optim` — AdamW and `clip_grad_norm_` | `torch.optim.AdamW`, `torch.nn.utils.clip_grad_norm_` |
 | `checkpoint` — `checkpoints/<step>/{pretrained_model,training_state}/` | `lerobot/common/train_utils.py` |
-| `run` — the step loop | `lerobot/scripts/lerobot_train.py` |
+| `run` — the step loop, including local ACT warm-start from a `pretrained_model` directory | `lerobot/scripts/lerobot_train.py` |
 | `deploy` — local ACT checkpoint loading, feature normalization, action queue, temporal ensembling, finite dataset-backed inference, and checkpoint-only caller-batch inference | `lerobot/policies/act/modeling_act.py`, `lerobot/scripts/lerobot_rollout.py`'s local observation boundary |
 
 ## Devices

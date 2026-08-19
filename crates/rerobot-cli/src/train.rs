@@ -22,6 +22,7 @@ use rerobot_core::policy::act::ActConfig;
 use rerobot_core::types::NormalizationMode;
 use rerobot_core::BigInt;
 use rerobot_train::config::TrainConfig;
+use std::io::Read;
 use std::path::PathBuf;
 
 /// Why a `lerobot-train` command line could not be turned into a run.
@@ -91,7 +92,6 @@ impl std::error::Error for ArgumentError {}
 /// Kept as data rather than as branches so that `--help` can list them and the
 /// compatibility document can be checked against them.
 pub static UNSUPPORTED_ARGUMENTS: &[(&str, &str)] = &[
-    ("policy.path", "loading a pretrained policy needs the Hub client and the checkpoint loader"),
     ("env", "environment rollouts need Gymnasium, which is not ported"),
     ("env.type", "environment rollouts need Gymnasium, which is not ported"),
     ("eval", "environment evaluation needs Gymnasium, which is not ported"),
@@ -354,6 +354,7 @@ pub fn parse(args: &[String]) -> Result<TrainConfig, ArgumentError> {
     let mut episodes: Option<Vec<i64>> = None;
     let mut policy_overrides: Vec<(String, Value)> = Vec::new();
     let mut policy_type_given = false;
+    let mut policy_path: Option<PathBuf> = None;
     let mut policy = ActConfig::default();
     policy.device = Some("cpu".to_owned());
     policy.push_to_hub = false;
@@ -420,6 +421,9 @@ pub fn parse(args: &[String]) -> Result<TrainConfig, ArgumentError> {
                 }
                 policy_type_given = true;
             }
+            "policy.path" => {
+                policy_path = Some(PathBuf::from(value.as_string(flag)?));
+            }
             other if other.starts_with("policy.") => {
                 // `apply_policy_flag` reports an unrecognized field as unknown; a
                 // field that is a real upstream one this slice cannot honour is
@@ -432,6 +436,60 @@ pub fn parse(args: &[String]) -> Result<TrainConfig, ArgumentError> {
             }
             _ => return Err(classify(flag)),
         }
+    }
+
+    if let Some(path) = &policy_path {
+        if !path.is_dir() {
+            return Err(ArgumentError::Value {
+                flag: "policy.path".to_owned(),
+                reason: format!(
+                    "local pretrained policy directory {} does not exist; Hub model IDs are not \
+                     supported by this native training path",
+                    path.display()
+                ),
+            });
+        }
+        let config_path = path.join(rerobot_train::checkpoint::CONFIG_FILE);
+        let mut bytes = Vec::new();
+        std::fs::File::open(&config_path)
+            .map_err(|error| ArgumentError::Value {
+                flag: "policy.path".to_owned(),
+                reason: format!("cannot read {}: {error}", config_path.display()),
+            })?
+            .take(rerobot_train::limits::MAX_CHECKPOINT_JSON_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| ArgumentError::Value {
+                flag: "policy.path".to_owned(),
+                reason: format!("cannot read {}: {error}", config_path.display()),
+            })?;
+        if bytes.len() as u64 > rerobot_train::limits::MAX_CHECKPOINT_JSON_BYTES {
+            return Err(ArgumentError::Value {
+                flag: "policy.path".to_owned(),
+                reason: format!(
+                    "{} exceeds the {}-byte checkpoint config limit",
+                    config_path.display(),
+                    rerobot_train::limits::MAX_CHECKPOINT_JSON_BYTES
+                ),
+            });
+        }
+        let text = String::from_utf8(bytes).map_err(|error| ArgumentError::Value {
+            flag: "policy.path".to_owned(),
+            reason: format!("{} is not valid UTF-8: {error}", config_path.display()),
+        })?;
+        let mut loaded =
+            ActConfig::from_checkpoint_json(&text).map_err(|error| ArgumentError::Value {
+                flag: "policy.path".to_owned(),
+                reason: format!(
+                    "{} is not a valid ACT policy checkpoint: {error}",
+                    config_path.display()
+                ),
+            })?;
+        loaded.pretrained_path = Some(path.to_string_lossy().into_owned());
+        for (flag, value) in &policy_overrides {
+            apply_policy_flag(&mut loaded, flag, value)?;
+        }
+        policy = loaded;
+        policy_type_given = true;
     }
 
     if resume == Some(true) {
@@ -807,6 +865,11 @@ pub fn help_section() -> String {
          --dataset.root=DIR          optional local directory; absent means Hub snapshot cache\n\
          \x20 --output_dir=DIR            fresh-run output directory, must not exist\n\
          \x20 --policy.type=act           ACT is the only ported policy\n\
+         \n\
+         Pretrained policy:\n\
+         \x20 --policy.path=DIR           local ACT checkpoint's pretrained_model directory;\n\
+         \x20                              its config and weights seed this run (Hub model IDs\n\
+         \x20                              are refused because native model download is not ported)\n\
          \n\
          Resume:\n\
          \x20 --resume=true --config_path=DIR|FILE\n\

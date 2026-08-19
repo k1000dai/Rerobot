@@ -17,6 +17,7 @@ mod common;
 use common::{fixture_dataset, reduced_config, TempDir};
 use rerobot_core::dataset::json::{loads, JsonLike};
 use rerobot_train::checkpoint::{self, LastCheckpointKind, TrainingStep};
+use rerobot_train::config::TrainConfig;
 use rerobot_train::error::TrainError;
 use rerobot_train::model::act::ActModel;
 use rerobot_train::optim::state_dict_distance;
@@ -68,6 +69,126 @@ fn one_step_produces_a_finite_loss_from_real_data() {
             .all(|index| (0..4).contains(index)),
         "the sampler produced a frame outside the fixture: {:?}",
         step.frame_indices
+    );
+}
+
+#[test]
+fn a_pretrained_act_path_loads_checkpoint_weights_before_training() {
+    let (source_dir, source_outcome, _) = train_once("pretrained-source");
+    let source_checkpoint = source_outcome
+        .checkpoints
+        .first()
+        .expect("the source run writes its final checkpoint")
+        .join("pretrained_model");
+
+    let target_dir = TempDir::new("pretrained-target");
+    let mut config = reduced_config(fixture_dataset(), target_dir.child("out"));
+    config.policy.pretrained_path = Some(source_checkpoint.to_string_lossy().into_owned());
+    config
+        .validate()
+        .expect("the pretrained path is a valid ACT config");
+
+    let session = TrainSession::new(&config).expect("the pretrained session builds");
+    let expected = candle_core::safetensors::load(
+        source_checkpoint.join("model.safetensors"),
+        session.device(),
+    )
+    .expect("the source weights load");
+    let actual = session.model.state_dict().expect("the target weights load");
+
+    assert_eq!(actual.len(), expected.len());
+    for (name, tensor) in actual {
+        let source = expected
+            .get(&name)
+            .unwrap_or_else(|| panic!("source checkpoint is missing {name}"));
+        assert_eq!(
+            tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            source.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            "{name}"
+        );
+    }
+
+    drop(source_dir);
+}
+
+#[test]
+fn a_pretrained_policy_uses_checkpoint_processor_statistics_not_dataset_statistics() {
+    let (source_dir, source_outcome, _) = train_once("processor-source");
+    let source_checkpoint = source_outcome
+        .checkpoints
+        .first()
+        .expect("the source run writes its final checkpoint")
+        .join("pretrained_model");
+
+    let target_dir = TempDir::new("processor-target");
+    let target_dataset = target_dir.child("dataset");
+    common::copy_fixture_dataset(&target_dataset);
+    let stats_path = target_dataset.join("meta/stats.json");
+    let stats = std::fs::read_to_string(&stats_path).expect("the copied stats load");
+    let changed_stats = stats
+        .replace(
+            "\"mean\": [\n            0.4375,\n            0.5625",
+            "\"mean\": [\n            100.0,\n            100.0",
+        )
+        .replace(
+            "\"std\": [\n            0.36975499987602234,\n            0.36975499987602234",
+            "\"std\": [\n            1.0,\n            1.0",
+        );
+    std::fs::write(&stats_path, changed_stats).expect("the changed stats write");
+
+    let policy_text = std::fs::read_to_string(source_checkpoint.join("config.json"))
+        .expect("the source policy config loads");
+    let mut policy = rerobot_core::policy::act::ActConfig::from_checkpoint_json(&policy_text)
+        .expect("the source policy config parses");
+    policy.pretrained_path = Some(source_checkpoint.to_string_lossy().into_owned());
+    let mut config = reduced_config(target_dataset, target_dir.child("out"));
+    config.policy = policy;
+    let target_session = TrainSession::new(&config).expect("the target session builds");
+
+    let source_config = reduced_config(fixture_dataset(), source_dir.child("unused"));
+    let source_session = TrainSession::new(&source_config).expect("the source session builds");
+    assert_eq!(
+        target_session.normalizer, source_session.normalizer,
+        "pretrained training must use the checkpoint normalizer"
+    );
+}
+
+#[test]
+fn resuming_uses_checkpoint_processor_statistics_not_dataset_statistics() {
+    let (source_dir, source_outcome, _) = train_once("resume-processor-source");
+    let checkpoint = source_outcome
+        .checkpoints
+        .first()
+        .expect("the source run writes its final checkpoint")
+        .clone();
+
+    let target_dir = TempDir::new("resume-processor-target");
+    let target_dataset = target_dir.child("dataset");
+    common::copy_fixture_dataset(&target_dataset);
+    let stats_path = target_dataset.join("meta/stats.json");
+    let stats = std::fs::read_to_string(&stats_path).expect("the copied stats load");
+    let changed_stats = stats
+        .replace(
+            "\"mean\": [\n            0.4375,\n            0.5625",
+            "\"mean\": [\n            100.0,\n            100.0",
+        )
+        .replace(
+            "\"std\": [\n            0.36975499987602234,\n            0.36975499987602234",
+            "\"std\": [\n            1.0,\n            1.0",
+        );
+    std::fs::write(&stats_path, changed_stats).expect("the changed stats write");
+
+    let mut config =
+        TrainConfig::from_checkpoint_dir(&checkpoint).expect("the checkpoint config reconstructs");
+    config.dataset_root = target_dataset;
+    config.output_dir = target_dir.child("out");
+    let resumed = TrainSession::new(&config).expect("the resumed session builds");
+
+    let source_config = reduced_config(fixture_dataset(), source_dir.child("unused"));
+    let source_session = TrainSession::new(&source_config).expect("the source session builds");
+    assert_eq!(
+        resumed.normalizer, source_session.normalizer,
+        "resume must keep the checkpoint normalizer"
     );
 }
 

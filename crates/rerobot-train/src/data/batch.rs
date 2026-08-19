@@ -107,9 +107,26 @@ impl Batch {
     /// [`TrainError::Metadata`] naming the camera and what was wrong with it, or
     /// when a key is attached twice.
     pub fn with_images(
-        mut self,
+        self,
         images: &IndexMap<String, Tensor>,
         normalization: &CameraNormalization,
+    ) -> Result<Self> {
+        let mut normalizations = IndexMap::new();
+        for key in images.keys() {
+            normalizations.insert(key.clone(), normalization.clone());
+        }
+        self.with_image_normalizations(images, &normalizations)
+    }
+
+    /// Attach raw camera tensors using one normalization entry per camera key.
+    ///
+    /// A camera without an entry is left unchanged, matching upstream when its
+    /// feature has no `mean`/`std` statistics. The lookup is by the dataset feature
+    /// name, not by insertion order, so multiple cameras may carry different stats.
+    pub fn with_image_normalizations(
+        mut self,
+        images: &IndexMap<String, Tensor>,
+        normalizations: &IndexMap<String, CameraNormalization>,
     ) -> Result<Self> {
         crate::limits::within(
             images.len(),
@@ -124,6 +141,10 @@ impl Batch {
                 )));
             }
             let checked = camera_tensor(key, tensor, batch_size)?;
+            let normalization = normalizations
+                .get(key)
+                .cloned()
+                .unwrap_or_else(CameraNormalization::identity);
             self.images
                 .insert(key.clone(), normalization.apply(key, &checked)?);
         }

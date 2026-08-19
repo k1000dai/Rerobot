@@ -337,6 +337,16 @@ impl CameraNormalization {
         }
     }
 
+    /// Mean values in channel order, or an empty slice for identity.
+    pub fn mean(&self) -> &[f32] {
+        &self.mean
+    }
+
+    /// Standard deviations in channel order, or an empty slice for identity.
+    pub fn std(&self) -> &[f32] {
+        &self.std
+    }
+
     /// Apply to a `[batch, channels, height, width]` tensor.
     ///
     /// # Errors

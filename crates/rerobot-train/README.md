@@ -8,7 +8,10 @@ LeRobot v3.0 dataset on local disk or a native Hub snapshot with state/action co
 and embedded PNG/JPEG camera columns, or an ACT policy fed camera tensors in memory,
 on **CPU** or **CUDA**, with the upstream checkpoint layout on the way out. There is
 no PyTorch, no Python sidecar and no FFI: the tensor work is [candle], the parquet
-work is [arrow], and the rest is this crate.
+work is [arrow], and the rest is this crate. `meta/stats.json` camera mean/std entries
+are retained per feature, so `dataset_use_imagenet_stats=false` trains and deploys
+with the dataset's own per-camera normalization; the default `true` path writes
+ImageNet statistics.
 
 [repo]: https://github.com/k1000dai/Rerobot
 [upstream]: https://github.com/huggingface/lerobot
@@ -115,7 +118,9 @@ When observations come from a simulator, camera adapter, or another runtime,
 the checkpoint can be loaded without opening a dataset and consumed through the
 same single-observation `Batch` boundary as upstream `ACTPolicy.select_action`.
 Use `session.device()` for Candle tensor placement and
-`session.camera_normalization()` when attaching camera tensors:
+`session.camera_normalizations()` when attaching camera tensors with
+`Batch::with_image_normalizations` (the singular `camera_normalization()` helper
+remains for a one-camera legacy caller):
 
 ```no_run
 use rerobot_train::data::batch::Batch;

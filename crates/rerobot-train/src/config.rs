@@ -392,13 +392,10 @@ impl TrainConfig {
             .unwrap_or_else(|| self.policy.optimizer_preset())
     }
 
-    /// The per-channel statistics this run applies to every camera frame it decodes.
-    ///
-    /// The whole of what [`Self::dataset_use_imagenet_stats`] does:
-    /// `LeRobotDataset.__init__` overwrites each camera's statistics with
-    /// `IMAGENET_STATS` when the flag is set, and leaves them alone when it is not —
-    /// and a camera with no statistics is returned unchanged by upstream's normalizer,
-    /// which is [`crate::data::image::CameraNormalization::identity`].
+    /// Return the legacy single-camera choice for callers that do not have dataset
+    /// metadata. Training and deployment resolve the full per-camera map from
+    /// `DatasetMetadata::camera_stats`; this method is retained for the public
+    /// one-camera compatibility API.
     pub fn camera_normalization(&self) -> crate::data::image::CameraNormalization {
         if self.dataset_use_imagenet_stats {
             crate::data::image::CameraNormalization::imagenet()

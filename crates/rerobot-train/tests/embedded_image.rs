@@ -27,8 +27,9 @@ use rerobot_train::data::batch::collate_images;
 use rerobot_train::data::dataset::{DatasetBudget, StateOnlyDataset};
 use rerobot_train::data::image::{CameraNormalization, DecodedImage, CAMERA_CHANNELS};
 use rerobot_train::data::meta::DatasetMetadata;
+use rerobot_train::deploy::InferenceSession;
 use rerobot_train::error::TrainError;
-use rerobot_train::run::TrainSession;
+use rerobot_train::run::{train, TrainSession};
 use std::path::Path;
 
 /// The camera the fixture carries.
@@ -242,6 +243,92 @@ fn the_frames_stack_into_a_batch_camera_tensor_in_frame_order() {
     assert_eq!(values[per_frame + 2 * plane], expected_pixel(3, 2, 0, 0));
 }
 
+#[test]
+fn per_camera_statistics_are_applied_after_decoding() {
+    let dataset = load_fixture();
+    let frames = vec![dataset.get(0).unwrap(), dataset.get(3).unwrap()];
+    let mut normalizations = IndexMap::new();
+    normalizations.insert(
+        CAMERA.to_owned(),
+        CameraNormalization::new(vec![0.25, 0.5, 0.75], vec![0.1, 0.2, 0.3]).unwrap(),
+    );
+    let images = collate_images(&frames, &rerobot_train::candle_core::Device::Cpu).unwrap();
+    let batch =
+        rerobot_train::data::batch::collate(&frames, &rerobot_train::candle_core::Device::Cpu)
+            .unwrap()
+            .with_image_normalizations(&images, &normalizations)
+            .unwrap();
+    let values = batch
+        .image(CAMERA)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    assert!((values[0] - (-2.5)).abs() < 1e-5);
+    assert!((values[EXTENT * EXTENT] - (-2.5)).abs() < 1e-5);
+}
+
+#[test]
+fn a_non_imagenet_training_session_uses_dataset_camera_statistics() {
+    let dir = TempDir::new("embedded-custom-camera-train");
+    let root = dir.child("dataset");
+    common::copy_embedded_image_fixture(&root);
+    std::fs::write(
+        root.join("meta/stats.json"),
+        r#"{
+            "observation.images.top": {
+                "mean": [[[0.25]], [[0.5]], [[0.75]]],
+                "std": [[[0.1]], [[0.2]], [[0.3]]]
+            }
+        }"#,
+    )
+    .unwrap();
+    let mut config = reduced_config(root, dir.child("out"));
+    config.dataset_use_imagenet_stats = false;
+    let mut session = TrainSession::new(&config).expect("the session builds");
+    let batch = session.next_batch().expect("the batch loads");
+    let values = batch
+        .image(CAMERA)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    assert!((values[0] - (-2.5)).abs() < 1e-5);
+}
+
+#[test]
+fn a_custom_camera_normalization_survives_checkpoint_load_and_rollout() {
+    let dir = TempDir::new("embedded-custom-camera-deploy");
+    let root = dir.child("dataset");
+    common::copy_embedded_image_fixture(&root);
+    std::fs::write(
+        root.join("meta/stats.json"),
+        r#"{
+            "observation.images.top": {
+                "mean": [[[0.25]], [[0.5]], [[0.75]]],
+                "std": [[[0.1]], [[0.2]], [[0.3]]]
+            }
+        }"#,
+    )
+    .unwrap();
+    let output = dir.child("out");
+    let mut config = reduced_config(root.clone(), output.clone());
+    config.dataset_use_imagenet_stats = false;
+    train(&config, &mut |_| {}).expect("the image policy trains");
+    let checkpoint = output.join("checkpoints/000001/pretrained_model");
+    let mut session =
+        InferenceSession::load(&checkpoint, &root, None).expect("the image checkpoint deploys");
+    let normalization = session
+        .camera_normalizations()
+        .get(CAMERA)
+        .expect("the deployment session restores camera statistics");
+    assert_eq!(normalization.mean(), &[0.25, 0.5, 0.75]);
+    assert_eq!(normalization.std(), &[0.1, 0.2, 0.3]);
+    assert_eq!(session.rollout(0, 1).unwrap().len(), 1);
+}
+
 // ---------------------------------------------------------------------------
 // Training on it
 // ---------------------------------------------------------------------------
@@ -378,6 +465,31 @@ fn nested_image_statistics_emitted_by_lerobot_are_ignored_for_scalar_normalizati
     let metadata = DatasetMetadata::load(&root)
         .expect("a LeRobot image dataset's nested camera stats must not make metadata unreadable");
     assert!(metadata.stats.get(CAMERA).is_none());
+}
+
+#[test]
+fn nested_camera_statistics_are_retained_for_non_imagenet_normalization() {
+    let dir = TempDir::new("embedded-camera-stats");
+    let root = dir.child("dataset");
+    common::copy_embedded_image_fixture(&root);
+    std::fs::write(
+        root.join("meta/stats.json"),
+        r#"{
+            "observation.images.top": {
+                "mean": [[[0.25]], [[0.5]], [[0.75]]],
+                "std": [[[0.1]], [[0.2]], [[0.3]]]
+            }
+        }"#,
+    )
+    .expect("nested image stats are writable");
+
+    let metadata = DatasetMetadata::load(&root).expect("camera stats are valid metadata");
+    let stats = metadata
+        .camera_stats()
+        .get(CAMERA)
+        .expect("the camera statistics are retained");
+    assert_eq!(stats.mean(), &[0.25, 0.5, 0.75]);
+    assert_eq!(stats.std(), &[0.1, 0.2, 0.3]);
 }
 
 // ---------------------------------------------------------------------------

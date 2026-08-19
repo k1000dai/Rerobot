@@ -182,22 +182,29 @@ impl Default for MetadataBudget {
     }
 }
 
-/// Load scalar statistics while ignoring the nested image statistics emitted by
-/// LeRobot v3.0. Image normalization is selected explicitly by
-/// `dataset.use_imagenet_stats`; the nested `[channels, 1, 1]` image statistics are
-/// not valid inputs to the scalar normalizer and must not make an otherwise valid
-/// image dataset unreadable.
+/// Load scalar statistics while keeping the nested image statistics emitted by
+/// LeRobot v3.0 available to the camera path. The scalar normalizer still ignores
+/// those entries because camera statistics have shape `(channels, 1, 1)` and are
+/// broadcast separately by `Batch::with_image_normalizations`.
+fn load_stats_document(root: &Path) -> Result<Option<JsonLike>> {
+    let path = root.join(STATS_PATH);
+    if !path.exists() {
+        return Ok(None);
+    }
+    load_json(&path)
+        .map(Some)
+        .map_err(|error| TrainError::Metadata(format!("cannot read {}: {error}", path.display())))
+}
+
 fn load_stats_for_features(
     root: &Path,
     features: &IndexMap<String, FeatureSpec>,
+    document: Option<&JsonLike>,
 ) -> Result<DatasetStats> {
-    let path = root.join(STATS_PATH);
-    if !path.exists() {
+    let Some(document) = document else {
         return Ok(DatasetStats::default());
-    }
-    let mut document = load_json(&path).map_err(|error| {
-        TrainError::Metadata(format!("cannot read {}: {error}", path.display()))
-    })?;
+    };
+    let mut document = document.clone();
     if let JsonLike::Object(values) = &mut document {
         values.retain(|feature, _| {
             features
@@ -205,9 +212,117 @@ fn load_stats_for_features(
                 .is_none_or(|spec| spec.dtype != "image")
         });
     }
-    stats_from_value(&document)
-        .map_err(|error| TrainError::Metadata(format!("cannot read {}: {error}", path.display())))
+    stats_from_value(&document).map_err(|error| {
+        TrainError::Metadata(format!(
+            "cannot read {}: {error}",
+            root.join(STATS_PATH).display()
+        ))
+    })
 }
+
+/// Per-channel statistics for one camera feature.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CameraStats {
+    mean: Vec<f64>,
+    std: Vec<f64>,
+}
+
+impl CameraStats {
+    /// Mean values in channel order.
+    pub fn mean(&self) -> &[f64] {
+        &self.mean
+    }
+
+    /// Standard deviations in channel order.
+    pub fn std(&self) -> &[f64] {
+        &self.std
+    }
+}
+
+fn camera_stat_vector(
+    root: &Path,
+    feature: &str,
+    statistic: &str,
+    value: &JsonLike,
+    output: &mut Vec<f64>,
+) -> Result<()> {
+    match value {
+        JsonLike::Array(values) | JsonLike::Tuple(values) => {
+            for value in values {
+                camera_stat_vector(root, feature, statistic, value, output)?;
+            }
+        }
+        JsonLike::Float(value) => output.push(*value),
+        JsonLike::Int(value) => {
+            output.push(value.to_string().parse::<f64>().unwrap_or_else(|_| {
+                if value.sign() == num_bigint::Sign::Minus {
+                    f64::NEG_INFINITY
+                } else {
+                    f64::INFINITY
+                }
+            }))
+        }
+        other => {
+            return Err(TrainError::Metadata(format!(
+                "cannot read {}: camera feature {feature:?} statistic {statistic:?} contains {}, expected numbers",
+                root.join(STATS_PATH).display(),
+                other.type_name()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Load the nested `(channels, 1, 1)` camera statistics emitted by LeRobot.
+fn load_camera_stats(
+    root: &Path,
+    features: &IndexMap<String, FeatureSpec>,
+    document: Option<&JsonLike>,
+) -> Result<IndexMap<String, CameraStats>> {
+    let Some(JsonLike::Object(values)) = document else {
+        return Ok(IndexMap::new());
+    };
+    let mut cameras = IndexMap::new();
+    for (feature, spec) in features {
+        if spec.dtype != "image" {
+            continue;
+        }
+        let Some(value) = values.get(feature) else {
+            continue;
+        };
+        let JsonLike::Object(statistics) = value else {
+            return Err(TrainError::Metadata(format!(
+                "cannot read {}: camera feature {feature:?} statistics must be an object",
+                root.join(STATS_PATH).display()
+            )));
+        };
+        let (Some(mean), Some(std)) = (statistics.get("mean"), statistics.get("std")) else {
+            return Err(TrainError::Metadata(format!(
+                "cannot read {}: camera feature {feature:?} must contain mean and std statistics",
+                root.join(STATS_PATH).display()
+            )));
+        };
+        let mut mean_values = Vec::new();
+        let mut std_values = Vec::new();
+        camera_stat_vector(root, feature, "mean", mean, &mut mean_values)?;
+        camera_stat_vector(root, feature, "std", std, &mut std_values)?;
+        if mean_values.is_empty() || mean_values.len() != std_values.len() {
+            return Err(TrainError::Metadata(format!(
+                "cannot read {}: camera feature {feature:?} must have equally sized, non-empty mean and std statistics",
+                root.join(STATS_PATH).display()
+            )));
+        }
+        cameras.insert(
+            feature.clone(),
+            CameraStats {
+                mean: mean_values,
+                std: std_values,
+            },
+        );
+    }
+    Ok(cameras)
+}
+
 /// Everything under `meta/`, typed.
 #[derive(Debug, Clone)]
 pub struct DatasetMetadata {
@@ -216,11 +331,20 @@ pub struct DatasetMetadata {
     pub info: DatasetInfo,
     /// `meta/stats.json`, empty when the file is absent.
     pub stats: DatasetStats,
+    /// Nested per-camera entries from `meta/stats.json`.
+    camera_stats: IndexMap<String, CameraStats>,
     /// `meta/tasks.parquet`, in file order.
     pub tasks: Vec<TaskRecord>,
     /// `meta/episodes/`, in file order.
     pub episodes: Vec<EpisodeRecord>,
     features: IndexMap<String, FeatureSpec>,
+}
+
+impl DatasetMetadata {
+    /// Per-camera statistics, in the feature order of `meta/info.json`.
+    pub fn camera_stats(&self) -> &IndexMap<String, CameraStats> {
+        &self.camera_stats
+    }
 }
 
 impl DatasetMetadata {
@@ -247,13 +371,16 @@ impl DatasetMetadata {
             spec.width()
                 .map_err(|error| TrainError::Metadata(format!("feature {key:?}: {error}")))?;
         }
-        let stats = load_stats_for_features(root, &features)?;
+        let stats_document = load_stats_document(root)?;
+        let stats = load_stats_for_features(root, &features, stats_document.as_ref())?;
+        let camera_stats = load_camera_stats(root, &features, stats_document.as_ref())?;
         let tasks = load_tasks(root)?;
         let episodes = load_episodes(root, budget)?;
         let metadata = Self {
             root: root.to_path_buf(),
             info,
             stats,
+            camera_stats,
             tasks,
             episodes,
             features,

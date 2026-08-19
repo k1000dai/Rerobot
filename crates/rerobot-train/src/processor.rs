@@ -27,6 +27,7 @@
 //! boundary is recorded in `docs/compatibility.md`; the alternative — omitting
 //! the steps — would produce a file upstream cannot load.
 
+use crate::data::image::CameraNormalization;
 use crate::error::{Result, TrainError};
 use indexmap::IndexMap;
 use rerobot_core::dataset::json::{dumps_indent_ascii, JsonLike, JsonObject};
@@ -46,6 +47,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 pub struct LoadedPolicyProcessors {
     normalizer: Normalizer,
+    camera_normalizations: IndexMap<String, CameraNormalization>,
 }
 
 impl LoadedPolicyProcessors {
@@ -99,14 +101,28 @@ impl LoadedPolicyProcessors {
 
         let mut features = policy.input_features.clone().unwrap_or_default();
         features.extend(policy.output_features.clone().unwrap_or_default());
-        let normalizer = Normalizer::new(&features, &policy.normalization_mapping, &stats)
+        let camera_normalizations =
+            camera_normalizations_from_state(&features, &preprocessor_state)?;
+        let scalar_features = features
+            .into_iter()
+            .filter(|(_, feature)| feature.r#type != rerobot_core::types::FeatureType::Visual)
+            .collect();
+        let normalizer = Normalizer::new(&scalar_features, &policy.normalization_mapping, &stats)
             .map_err(|error| TrainError::Metadata(error.to_string()))?;
-        Ok(Self { normalizer })
+        Ok(Self {
+            normalizer,
+            camera_normalizations,
+        })
     }
 
     /// The normalizer used by the preprocessor and postprocessor.
     pub fn normalizer(&self) -> &Normalizer {
         &self.normalizer
+    }
+
+    /// Per-camera normalization restored from visual feature statistics.
+    pub fn camera_normalizations(&self) -> &IndexMap<String, CameraNormalization> {
+        &self.camera_normalizations
     }
 }
 
@@ -268,6 +284,35 @@ fn load_state(path: &Path) -> Result<(DatasetStats, HashMap<String, Vec<f32>>)> 
     Ok((stats, flat))
 }
 
+fn camera_normalizations_from_state(
+    features: &IndexMap<String, rerobot_core::types::PolicyFeature>,
+    state: &HashMap<String, Vec<f32>>,
+) -> Result<IndexMap<String, CameraNormalization>> {
+    let mut normalizations = IndexMap::new();
+    for (key, feature) in features {
+        if feature.r#type != rerobot_core::types::FeatureType::Visual {
+            continue;
+        }
+        let mean_key = format!("{key}.mean");
+        let std_key = format!("{key}.std");
+        match (state.get(&mean_key), state.get(&std_key)) {
+            (Some(mean), Some(std)) => {
+                normalizations.insert(
+                    key.clone(),
+                    CameraNormalization::new(mean.clone(), std.clone())?,
+                );
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(TrainError::Metadata(format!(
+                    "camera feature {key:?} requires both mean and std statistics"
+                )));
+            }
+            (None, None) => {}
+        }
+    }
+    Ok(normalizations)
+}
+
 /// `POLICY_PREPROCESSOR_DEFAULT_NAME`.
 pub const POLICY_PREPROCESSOR_NAME: &str = "policy_preprocessor";
 /// `POLICY_POSTPROCESSOR_DEFAULT_NAME`.
@@ -291,6 +336,17 @@ pub fn write_processor_artifacts(
     directory: &Path,
     policy: &ActConfig,
     stats: &DatasetStats,
+) -> Result<Vec<PathBuf>> {
+    write_processor_artifacts_with_cameras(directory, policy, stats, &IndexMap::new())
+}
+
+/// Write processor artifacts while retaining the nested per-camera statistics
+/// that the upstream normalizer broadcasts across image height and width.
+pub fn write_processor_artifacts_with_cameras(
+    directory: &Path,
+    policy: &ActConfig,
+    stats: &DatasetStats,
+    camera_stats: &IndexMap<String, CameraNormalization>,
 ) -> Result<Vec<PathBuf>> {
     std::fs::create_dir_all(directory).map_err(|error| TrainError::io(directory, &error))?;
 
@@ -320,7 +376,12 @@ pub fn write_processor_artifacts(
         &format!("{POLICY_PREPROCESSOR_NAME}.json"),
         &preprocessor,
     )?);
-    written.push(write_state(directory, &normalizer_state, stats)?);
+    written.push(write_state(
+        directory,
+        &normalizer_state,
+        stats,
+        camera_stats,
+    )?);
 
     let postprocessor = postprocessor_json(policy, &outputs, &device, &unnormalizer_state);
     written.push(write_json(
@@ -330,7 +391,12 @@ pub fn write_processor_artifacts(
     )?);
     // Upstream hands the unnormalizer the same `stats` dict, so its state file is
     // the same tensors even though its declared features are only the outputs.
-    written.push(write_state(directory, &unnormalizer_state, stats)?);
+    written.push(write_state(
+        directory,
+        &unnormalizer_state,
+        stats,
+        camera_stats,
+    )?);
 
     Ok(written)
 }
@@ -349,7 +415,12 @@ fn write_json(directory: &Path, name: &str, value: &JsonLike) -> Result<PathBuf>
 /// Every feature, not only the policy's: upstream passes `dataset.meta.stats`
 /// wholesale, so `timestamp`, `frame_index`, `episode_index`, `index` and
 /// `task_index` are in there too.
-fn write_state(directory: &Path, name: &str, stats: &DatasetStats) -> Result<PathBuf> {
+fn write_state(
+    directory: &Path,
+    name: &str,
+    stats: &DatasetStats,
+    camera_stats: &IndexMap<String, CameraNormalization>,
+) -> Result<PathBuf> {
     let path = directory.join(name);
     let mut tensors: HashMap<String, candle_core::Tensor> = HashMap::new();
     for feature in stats.keys() {
@@ -367,6 +438,22 @@ fn write_state(directory: &Path, name: &str, stats: &DatasetStats) -> Result<Pat
                 candle_core::Tensor::from_vec(floats, width, &candle_core::Device::Cpu)?,
             );
         }
+    }
+    for (feature, stats) in camera_stats {
+        if stats.channels().is_none() {
+            continue;
+        }
+        let mean = stats.mean().to_vec();
+        let std = stats.std().to_vec();
+        let shape = (mean.len(), 1, 1);
+        tensors.insert(
+            format!("{feature}.mean"),
+            candle_core::Tensor::from_vec(mean, shape, &candle_core::Device::Cpu)?,
+        );
+        tensors.insert(
+            format!("{feature}.std"),
+            candle_core::Tensor::from_vec(std, shape, &candle_core::Device::Cpu)?,
+        );
     }
     candle_core::safetensors::save(&tensors, &path)?;
     Ok(path)

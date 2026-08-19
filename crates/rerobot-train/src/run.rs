@@ -18,7 +18,7 @@ use crate::config::TrainConfig;
 use crate::data::batch::{collate, collate_images, Batch};
 use crate::data::dataset::StateOnlyDataset;
 use crate::data::image::CameraNormalization;
-use crate::data::meta::ACTION;
+use crate::data::meta::{DatasetMetadata, ACTION};
 use crate::error::{Result, TrainError};
 use crate::model::act::{ActModel, Pass, Randomness};
 use crate::optim::{act_parameter_groups, clip_grad_norm, parameter_l2, AdamW};
@@ -96,6 +96,8 @@ pub struct TrainSession {
     /// [`crate::config::TrainConfig::camera_normalization`], resolved once here so that
     /// every batch the session produces is normalized the same way.
     pub camera_normalization: CameraNormalization,
+    /// The per-camera statistics selected by dataset feature name.
+    camera_normalizations: IndexMap<String, CameraNormalization>,
     /// Frame indices left over from the sampler's current epoch.
     queue: Vec<i64>,
     batch_size: usize,
@@ -146,6 +148,7 @@ impl TrainSession {
         delta_timestamps.insert(ACTION.to_owned(), action_delta_timestamps(chunk_size, fps));
 
         let dataset = StateOnlyDataset::load(&dataset_root, &delta_timestamps, config.tolerance_s)?;
+        let camera_normalizations = resolve_camera_normalizations(config, dataset.metadata())?;
 
         // `make_policy`: the dataset's features become the policy's, split by
         // whether they are actions, plus the cameras the config declares.
@@ -210,6 +213,7 @@ impl TrainSession {
             rng: SplitMix64::new(rerobot_core::random::mix64(seed ^ RUN_SUBSTREAM)),
             grad_clip_norm: preset.grad_clip_norm,
             camera_normalization: config.camera_normalization(),
+            camera_normalizations,
             queue: Vec::new(),
             batch_size: config.batch_size,
             device,
@@ -263,11 +267,17 @@ impl TrainSession {
         &self.device
     }
 
+    /// The per-camera normalization selected for `key`, or identity when the
+    /// dataset did not publish statistics for that feature.
+    pub fn camera_normalizations(&self) -> &IndexMap<String, CameraNormalization> {
+        &self.camera_normalizations
+    }
+
     /// The next batch, cycling through epochs the way `utils.cycle` does.
     ///
     /// A dataset with an embedded `dtype: "image"` column has its decoded frames
-    /// attached here, through [`Batch::with_images`] and under
-    /// [`Self::camera_normalization`], so that [`Self::step`] trains on cameras
+    /// attached here, through [`Batch::with_image_normalizations`] and the resolved
+    /// [`Self::camera_normalizations`] map, so that [`Self::step`] trains on cameras
     /// without the caller assembling anything. A dataset without one produces exactly
     /// the batch it always did.
     pub fn next_batch(&mut self) -> Result<Batch> {
@@ -300,7 +310,7 @@ impl TrainSession {
         if images.is_empty() {
             return Ok(batch);
         }
-        batch.with_images(&images, &self.camera_normalization)
+        batch.with_image_normalizations(&images, &self.camera_normalizations)
     }
 
     /// One optimization step: forward, loss, backward, clip, AdamW, zero.
@@ -599,6 +609,33 @@ fn write_staged_directory(
     Ok(())
 }
 
+fn resolve_camera_normalizations(
+    config: &TrainConfig,
+    metadata: &DatasetMetadata,
+) -> Result<IndexMap<String, CameraNormalization>> {
+    let mut normalizations = IndexMap::new();
+    for key in metadata.feature_keys() {
+        let Some(feature) = metadata.feature(key) else {
+            continue;
+        };
+        if feature.dtype != "image" {
+            continue;
+        }
+        let normalization = if config.dataset_use_imagenet_stats {
+            CameraNormalization::imagenet()
+        } else if let Some(stats) = metadata.camera_stats().get(key) {
+            CameraNormalization::new(
+                stats.mean().iter().map(|value| *value as f32).collect(),
+                stats.std().iter().map(|value| *value as f32).collect(),
+            )?
+        } else {
+            CameraNormalization::identity()
+        };
+        normalizations.insert(key.to_owned(), normalization);
+    }
+    Ok(normalizations)
+}
+
 fn write_checkpoint_contents(
     config: &TrainConfig,
     session: &TrainSession,
@@ -637,10 +674,11 @@ fn write_checkpoint_contents(
     // `train_utils.save_checkpoint` passes both processors, so their four artifacts
     // are part of the layout. They carry the dataset statistics the weights were
     // trained against, which nothing else in the checkpoint records.
-    crate::processor::write_processor_artifacts(
+    crate::processor::write_processor_artifacts_with_cameras(
         &pretrained,
         &policy_config,
         &session.dataset.metadata().stats,
+        session.camera_normalizations(),
     )?;
 
     checkpoint::write_json(

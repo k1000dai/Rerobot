@@ -148,7 +148,8 @@ impl TrainSession {
         delta_timestamps.insert(ACTION.to_owned(), action_delta_timestamps(chunk_size, fps));
 
         let dataset = StateOnlyDataset::load(&dataset_root, &delta_timestamps, config.tolerance_s)?;
-        let camera_normalizations = resolve_camera_normalizations(config, dataset.metadata())?;
+        let dataset_camera_normalizations =
+            resolve_camera_normalizations(config, dataset.metadata())?;
 
         // `make_policy`: the dataset's features become the policy's, split by
         // whether they are actions, plus the cameras the config declares.
@@ -174,16 +175,41 @@ impl TrainSession {
             .chain(policy_config.output_features.clone().unwrap_or_default())
             .filter(|(_, feature)| feature.r#type != rerobot_core::types::FeatureType::Visual)
             .collect();
-        let normalizer = Normalizer::new(
-            &normalized_features,
-            &policy_config.normalization_mapping,
-            &dataset.metadata().stats,
-        )?;
+        let (normalizer, camera_normalizations) =
+            if let Some(pretrained_path) = &policy_config.pretrained_path {
+                let processors = crate::processor::LoadedPolicyProcessors::load(
+                    Path::new(pretrained_path),
+                    &policy_config,
+                )?;
+                (
+                    processors.normalizer().clone(),
+                    processors.camera_normalizations().clone(),
+                )
+            } else {
+                (
+                    Normalizer::new(
+                        &normalized_features,
+                        &policy_config.normalization_mapping,
+                        &dataset.metadata().stats,
+                    )?,
+                    dataset_camera_normalizations,
+                )
+            };
 
         // The model's parameters are drawn from a sub-stream of the run seed so
         // that changing the number of steps cannot change the initial weights.
         let mut init_rng = SplitMix64::new(rerobot_core::random::mix64(seed ^ INIT_SUBSTREAM));
-        let model = ActModel::new(&policy_config, &device, &mut init_rng)?;
+        let mut model = ActModel::new(&policy_config, &device, &mut init_rng)?;
+        if let Some(pretrained_path) = &policy_config.pretrained_path {
+            let model_path = Path::new(pretrained_path).join(checkpoint::MODEL_FILE);
+            if !model_path.is_file() {
+                return Err(TrainError::checkpoint(
+                    &model_path,
+                    "the pretrained ACT policy weights file is missing",
+                ));
+            }
+            model.load(&model_path)?;
+        }
 
         let preset = config.optimizer_preset();
         let optimizer = AdamW::new(

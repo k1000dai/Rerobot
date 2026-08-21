@@ -200,6 +200,80 @@ fn the_documented_invocation_trains_for_one_step_and_writes_a_checkpoint() {
 }
 
 #[test]
+fn a_pretrained_policy_path_loads_and_trains_without_redeclaring_act_shape() {
+    let dir = TempDir::new("pretrained-e2e");
+    let source_output = dir.child("source");
+    let source = run(&slice_args(&source_output, &[]));
+    assert!(
+        source.status.success(),
+        "source run stderr: {}",
+        stderr_of(&source)
+    );
+    let source_policy = source_output.join("checkpoints/000001/pretrained_model");
+
+    let target_output = dir.child("target");
+    let args = vec![
+        "--dataset.repo_id=rerobot/state_only_slice".to_owned(),
+        format!("--dataset.root={}", fixture_dataset().display()),
+        format!("--output_dir={}", target_output.display()),
+        format!("--policy.path={}", source_policy.display()),
+        "--steps=1".to_owned(),
+        "--batch_size=2".to_owned(),
+    ];
+    let result = run(&args);
+    let stdout = stdout_of(&result);
+    let stderr = stderr_of(&result);
+    assert!(
+        result.status.success(),
+        "pretrained run exited {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        result.status.code()
+    );
+    assert!(stdout.contains("step:1 loss:"), "stdout:\n{stdout}");
+    assert!(
+        target_output
+            .join("checkpoints/000001/pretrained_model/model.safetensors")
+            .is_file(),
+        "the pretrained run did not publish a checkpoint"
+    );
+}
+
+#[test]
+fn a_hub_style_pretrained_policy_path_is_refused_without_download() {
+    let dir = TempDir::new("hub-pretrained");
+    let result = run(&slice_args(
+        &dir.child("out"),
+        &["--policy.path=lerobot/act_aloha"],
+    ));
+    assert_eq!(result.status.code(), Some(64));
+    let stderr = stderr_of(&result);
+    assert!(
+        stderr.contains("Hub model IDs are not supported"),
+        "stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn an_oversized_pretrained_policy_config_is_refused_before_json_parsing() {
+    let dir = TempDir::new("oversized-pretrained");
+    let policy_dir = dir.child("pretrained_model");
+    std::fs::create_dir_all(&policy_dir).expect("the policy directory is created");
+    let config_path = policy_dir.join("config.json");
+    let oversized = vec![b' '; rerobot_train::limits::MAX_CHECKPOINT_JSON_BYTES as usize + 1];
+    std::fs::write(&config_path, oversized).expect("the oversized config is written");
+
+    let result = run(&slice_args(
+        &dir.child("out"),
+        &[&format!("--policy.path={}", policy_dir.display())],
+    ));
+    assert_eq!(result.status.code(), Some(64));
+    let stderr = stderr_of(&result);
+    assert!(
+        stderr.contains("checkpoint config limit"),
+        "stderr:\n{stderr}"
+    );
+}
+
+#[test]
 fn the_lerobot_train_command_trains_on_an_embedded_image_dataset() {
     let dir = TempDir::new("embedded-image-e2e");
     let output_dir = dir.child("out");
@@ -508,7 +582,6 @@ fn a_flag_naming_an_unported_feature_is_refused_by_the_parser() {
     let dir = TempDir::new("unsupported-parse");
     for (flag, fragment) in [
         ("--wandb.project=demo", "Weights & Biases"),
-        ("--policy.path=lerobot/act_aloha", "Hub client"),
         ("--env.type=aloha", "Gymnasium"),
         ("--config_path=x.json", "Draccus config loader"),
         ("--dataset.streaming=true", "Hub client"),

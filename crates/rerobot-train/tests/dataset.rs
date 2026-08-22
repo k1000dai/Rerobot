@@ -9,13 +9,48 @@
 
 mod common;
 
-use common::{fixture_dataset, TempDir};
+use common::{
+    copy_fixture_dataset, fixture_dataset, rewrite_episode_rows, rewrite_frame_episode_indices,
+    TempDir,
+};
 use indexmap::IndexMap;
 use rerobot_core::dataset::delta::action_delta_timestamps;
 use rerobot_core::types::FeatureType;
 use rerobot_train::data::dataset::StateOnlyDataset;
 use rerobot_train::data::meta::DatasetMetadata;
 use rerobot_train::error::TrainError;
+use std::sync::{Mutex, Once};
+
+struct ThreadCaptureLogger;
+
+static LOGGER: ThreadCaptureLogger = ThreadCaptureLogger;
+static INSTALL_LOGGER: Once = Once::new();
+static RECORDS: Mutex<Vec<(std::thread::ThreadId, log::Level, String)>> = Mutex::new(Vec::new());
+
+impl log::Log for ThreadCaptureLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::Level::Warn
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            RECORDS.lock().unwrap().push((
+                std::thread::current().id(),
+                record.level(),
+                record.args().to_string(),
+            ));
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn install_capture_logger() {
+    INSTALL_LOGGER.call_once(|| {
+        log::set_logger(&LOGGER).unwrap();
+        log::set_max_level(log::LevelFilter::Warn);
+    });
+}
 
 fn action_window(chunk_size: i64) -> IndexMap<String, Vec<f64>> {
     IndexMap::from([("action".to_owned(), action_delta_timestamps(chunk_size, 10))])
@@ -331,4 +366,142 @@ fn a_shuffled_sampler_is_reproducible_for_a_seed() {
     let mut left = dataset.sampler(None, 0, true, 7).unwrap();
     let mut right = dataset.sampler(None, 0, true, 7).unwrap();
     assert_eq!(left.next_epoch(), right.next_epoch());
+}
+
+#[test]
+fn selecting_episodes_compacts_relative_rows_but_keeps_absolute_delta_windows() {
+    let dir = TempDir::new("episode-filter");
+    let root = dir.child("dataset");
+    copy_fixture_dataset(&root);
+    let info_path = root.join("meta/info.json");
+    let info = std::fs::read_to_string(&info_path).unwrap();
+    std::fs::write(
+        info_path,
+        info.replace("\"total_episodes\": 1", "\"total_episodes\": 2"),
+    )
+    .unwrap();
+    rewrite_episode_rows(&root, &[(0, 0, 2, 2), (1, 2, 4, 2)]);
+    rewrite_frame_episode_indices(&root, &[0, 0, 1, 1]);
+
+    let dataset = StateOnlyDataset::load_for_episodes(&root, &action_window(2), 1e-4, Some(&[1]))
+        .expect("the selected episode loads");
+
+    assert_eq!(dataset.len(), 2);
+    assert_eq!(dataset.num_frames(), 2);
+    assert_eq!(dataset.num_episodes(), 1);
+    let first = dataset.get(0).expect("the first relative row loads");
+    assert_eq!(
+        first.index, 2,
+        "the selected row retains its absolute index"
+    );
+    assert_eq!(first.episode_index, 1);
+    assert_eq!(first.value("observation.state"), Some(&[0.5, 0.5][..]));
+    assert_eq!(
+        first.window("action"),
+        Some(&[vec![0.0, 0.0], vec![-0.5, 0.5]][..]),
+        "delta lookup must use the absolute row inside the selected episode"
+    );
+    assert_eq!(
+        dataset.sampler(None, 0, false, 1000).unwrap().indices(),
+        vec![0, 1],
+        "a sampler over a filtered dataset must return its relative rows"
+    );
+}
+
+#[test]
+fn an_episode_selection_retains_valid_rows_but_sampler_rejects_out_of_range_entries() {
+    let dir = TempDir::new("episode-filter-invalid");
+    let root = dir.child("dataset");
+    copy_fixture_dataset(&root);
+    let info_path = root.join("meta/info.json");
+    let info = std::fs::read_to_string(&info_path).unwrap();
+    std::fs::write(
+        info_path,
+        info.replace("\"total_episodes\": 1", "\"total_episodes\": 2"),
+    )
+    .unwrap();
+    rewrite_episode_rows(&root, &[(0, 0, 2, 2), (1, 2, 4, 2)]);
+    rewrite_frame_episode_indices(&root, &[0, 0, 1, 1]);
+
+    let dataset =
+        StateOnlyDataset::load_for_episodes(&root, &action_window(2), 1e-4, Some(&[1, 99]))
+            .expect("the valid episode remains usable");
+    assert_eq!(dataset.len(), 2);
+    assert_eq!(dataset.num_episodes(), 2);
+    assert_eq!(dataset.episode_index_at(0).unwrap(), 1);
+    let frame = dataset.get(0).unwrap();
+    assert_eq!(frame.index, 2);
+    assert_eq!(frame.frame_index, 2);
+    assert_eq!(frame.timestamp, 0.2);
+    assert!(matches!(
+        dataset.sampler(None, 0, false, 1000),
+        Err(rerobot_train::error::TrainError::Sampler(
+            rerobot_core::dataset::sampler::SamplerError::EpisodeIndexOutOfRange {
+                episode_index: 99,
+                total_episodes: 2,
+            }
+        ))
+    ));
+}
+
+#[test]
+fn episode_range_validation_uses_info_total_episodes_not_episode_table_length() {
+    install_capture_logger();
+    let thread = std::thread::current().id();
+    RECORDS.lock().unwrap().retain(|(id, _, _)| *id != thread);
+
+    let dir = TempDir::new("episode-filter-info-count");
+    let root = dir.child("dataset");
+    copy_fixture_dataset(&root);
+    let info_path = root.join("meta/info.json");
+    let info = std::fs::read_to_string(&info_path).unwrap();
+    std::fs::write(
+        info_path,
+        info.replace("\"total_episodes\": 1", "\"total_episodes\": 2"),
+    )
+    .unwrap();
+
+    let dataset = StateOnlyDataset::load_for_episodes(&root, &action_window(2), 1e-4, Some(&[1]))
+        .expect("an episode valid according to info.json can select zero rows");
+    assert!(dataset.is_empty());
+    assert!(!RECORDS
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(id, level, _)| *id == thread && *level == log::Level::Warn));
+}
+
+#[test]
+fn an_out_of_range_episode_warns_before_a_later_dataset_read_error() {
+    install_capture_logger();
+    let thread = std::thread::current().id();
+    RECORDS.lock().unwrap().retain(|(id, _, _)| *id != thread);
+
+    let dir = TempDir::new("episode-filter-warning-order");
+    let root = dir.child("dataset");
+    copy_fixture_dataset(&root);
+    std::fs::remove_file(root.join("data/chunk-000/file-000.parquet")).unwrap();
+
+    let error = StateOnlyDataset::load_for_episodes(&root, &action_window(2), 1e-4, Some(&[99]))
+        .expect_err("the missing data file must still fail the load");
+    assert!(matches!(error, TrainError::Io { .. }));
+
+    let records = RECORDS.lock().unwrap();
+    assert!(records.iter().any(|(id, level, message)| {
+        *id == thread
+            && *level == log::Level::Warn
+            && message
+                == "Some episodes in the provided episodes list are out of range for this dataset (1)."
+    }));
+}
+
+#[test]
+fn an_empty_episode_selection_is_empty_until_the_sampler_reports_no_valid_frames() {
+    let dataset =
+        StateOnlyDataset::load_for_episodes(&fixture_dataset(), &action_window(2), 1e-4, Some(&[]))
+            .expect("an empty episode filter is a valid dataset selection");
+    assert!(dataset.is_empty());
+    assert_eq!(dataset.len(), 0);
+    assert_eq!(dataset.num_episodes(), 0);
+    assert!(dataset.sampler(None, 0, false, 1000).is_err());
 }

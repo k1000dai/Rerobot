@@ -14,7 +14,10 @@
 
 mod common;
 
-use common::{fixture_dataset, reduced_config, TempDir};
+use common::{
+    copy_fixture_dataset, fixture_dataset, reduced_config, rewrite_episode_rows,
+    rewrite_frame_episode_indices, TempDir,
+};
 use rerobot_core::dataset::json::{loads, JsonLike};
 use rerobot_train::checkpoint::{self, LastCheckpointKind, TrainingStep};
 use rerobot_train::config::TrainConfig;
@@ -69,6 +72,40 @@ fn one_step_produces_a_finite_loss_from_real_data() {
             .all(|index| (0..4).contains(index)),
         "the sampler produced a frame outside the fixture: {:?}",
         step.frame_indices
+    );
+}
+
+#[test]
+fn a_training_run_consumes_only_the_configured_episodes() {
+    let dir = TempDir::new("episode-filter-train");
+    let dataset = dir.child("dataset");
+    copy_fixture_dataset(&dataset);
+    let info_path = dataset.join("meta/info.json");
+    let info = std::fs::read_to_string(&info_path).unwrap();
+    std::fs::write(
+        info_path,
+        info.replace("\"total_episodes\": 1", "\"total_episodes\": 2"),
+    )
+    .unwrap();
+    rewrite_episode_rows(&dataset, &[(0, 0, 2, 2), (1, 2, 4, 2)]);
+    rewrite_frame_episode_indices(&dataset, &[0, 0, 1, 1]);
+
+    let mut config = reduced_config(dataset, dir.child("out"));
+    config.dataset_episodes = Some(vec![1]);
+    config
+        .validate()
+        .expect("the selected episode config validates");
+    let mut logs = |_line: &str| {};
+    let outcome = train(&config, &mut logs).expect("the filtered run completes");
+
+    assert_eq!(outcome.steps.len(), 1);
+    assert!(
+        outcome.steps[0]
+            .frame_indices
+            .iter()
+            .all(|index| (2..4).contains(index)),
+        "the sampler consumed an unselected absolute frame: {:?}",
+        outcome.steps[0].frame_indices
     );
 }
 

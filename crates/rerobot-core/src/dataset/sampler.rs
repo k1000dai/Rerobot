@@ -68,6 +68,13 @@ pub enum SamplerError {
         /// How many episodes the boundary lists describe.
         total_episodes: usize,
     },
+    /// The absolute-to-relative map supplied for an episode-filtered dataset was incomplete.
+    InvalidAbsoluteToRelativeMapping {
+        /// Absolute frame index needing a mapping entry.
+        absolute_index: i64,
+        /// Number of entries in the supplied mapping.
+        mapping_len: usize,
+    },
     /// Every selected episode was empty after the drops.
     NoValidFrames,
 }
@@ -95,6 +102,13 @@ impl fmt::Display for SamplerError {
             } => write!(
                 formatter,
                 "episode index {episode_index} is out of range for {total_episodes} episodes"
+            ),
+            Self::InvalidAbsoluteToRelativeMapping {
+                absolute_index,
+                mapping_len,
+            } => write!(
+                formatter,
+                "absolute frame index {absolute_index} has no relative row in a mapping of length {mapping_len}"
             ),
             Self::NoValidFrames => formatter.write_str(
                 "No valid frames remain after applying drop_n_first_frames and \
@@ -126,6 +140,8 @@ pub struct EpisodeAwareSampler {
     epoch: u64,
     start_index: usize,
     skipped: Vec<SkippedEpisode>,
+    /// Optional absolute-to-relative mapping used by an episode-filtered dataset.
+    absolute_to_relative: Option<Vec<i64>>,
 }
 
 impl EpisodeAwareSampler {
@@ -210,6 +226,7 @@ impl EpisodeAwareSampler {
             epoch: 0,
             start_index: 0,
             skipped,
+            absolute_to_relative: None,
         })
     }
 
@@ -249,7 +266,15 @@ impl EpisodeAwareSampler {
         } else {
             self.cumulative_lengths[episode - 1]
         };
-        Some(self.starts[episode].saturating_add((position - consumed) as i64))
+        let absolute = self.starts[episode].saturating_add((position - consumed) as i64);
+        Some(
+            self.absolute_to_relative
+                .as_ref()
+                .map_or(absolute, |mapping| {
+                    mapping
+                        [usize::try_from(absolute).expect("absolute frame index is non-negative")]
+                }),
+        )
     }
 
     /// `set_epoch`.
@@ -274,6 +299,34 @@ impl EpisodeAwareSampler {
     /// Episodes that contributed nothing, in episode order.
     pub fn skipped_episodes(&self) -> &[SkippedEpisode] {
         &self.skipped
+    }
+
+    /// Convert sampled absolute frame indices into the relative rows of a filtered dataset.
+    ///
+    /// The mapping is indexed by absolute frame number and is validated before use so a
+    /// sampler can never silently return a row from a different episode.
+    pub fn set_absolute_to_relative(&mut self, mapping: Vec<i64>) -> Result<(), SamplerError> {
+        for absolute in self.indices() {
+            let row = usize::try_from(absolute).map_err(|_| {
+                SamplerError::InvalidAbsoluteToRelativeMapping {
+                    absolute_index: absolute,
+                    mapping_len: mapping.len(),
+                }
+            })?;
+            if row >= mapping.len()
+                || mapping[row] < 0
+                || usize::try_from(mapping[row])
+                    .ok()
+                    .is_none_or(|relative| relative >= self.num_frames)
+            {
+                return Err(SamplerError::InvalidAbsoluteToRelativeMapping {
+                    absolute_index: absolute,
+                    mapping_len: mapping.len(),
+                });
+            }
+        }
+        self.absolute_to_relative = Some(mapping);
+        Ok(())
     }
 
     /// The seed the permutation is derived from, together with the epoch.

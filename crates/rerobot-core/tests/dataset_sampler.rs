@@ -58,6 +58,32 @@ fn an_episode_filter_selects_by_episode_index_not_by_frame() {
 }
 
 #[test]
+fn a_filtered_sampler_maps_absolute_episode_ranges_to_relative_dataset_rows() {
+    let mut sampler =
+        EpisodeAwareSampler::new(&[0, 4], &[4, 8], Some(&[1]), 0, 0, false, 0).unwrap();
+    sampler
+        .set_absolute_to_relative(vec![-1, -1, -1, -1, 0, 1, 2, 3])
+        .unwrap();
+    assert_eq!(sampler.indices(), vec![0, 1, 2, 3]);
+}
+
+#[test]
+fn an_incomplete_filtered_sampler_mapping_is_refused_before_iteration() {
+    let mut sampler =
+        EpisodeAwareSampler::new(&[0, 4], &[4, 8], Some(&[1]), 0, 0, false, 0).unwrap();
+    let error = sampler
+        .set_absolute_to_relative(vec![-1, -1, -1, -1])
+        .unwrap_err();
+    assert_eq!(
+        error,
+        SamplerError::InvalidAbsoluteToRelativeMapping {
+            absolute_index: 4,
+            mapping_len: 4,
+        }
+    );
+}
+
+#[test]
 fn an_episode_that_drops_to_nothing_is_skipped_and_recorded_rather_than_failing() {
     let sampler = EpisodeAwareSampler::new(&[0, 10], &[3, 20], None, 0, 5, false, 0).unwrap();
     // Episode 0 has 3 frames and loses 5, so it contributes nothing.

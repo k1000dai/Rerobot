@@ -147,7 +147,12 @@ impl TrainSession {
         let mut delta_timestamps: IndexMap<String, Vec<f64>> = IndexMap::new();
         delta_timestamps.insert(ACTION.to_owned(), action_delta_timestamps(chunk_size, fps));
 
-        let dataset = StateOnlyDataset::load(&dataset_root, &delta_timestamps, config.tolerance_s)?;
+        let dataset = StateOnlyDataset::load_for_episodes(
+            &dataset_root,
+            &delta_timestamps,
+            config.tolerance_s,
+            config.dataset_episodes.as_deref(),
+        )?;
         let dataset_camera_normalizations =
             resolve_camera_normalizations(config, dataset.metadata())?;
 
@@ -222,12 +227,10 @@ impl TrainSession {
         )?;
 
         let sampler = dataset.sampler(
-            config.dataset_episodes.as_deref(),
+            None,
             // ACT declares no `drop_n_last_frames`, so upstream's `getattr`
             // default of 0 applies.
-            0,
-            true,
-            seed,
+            0, true, seed,
         )?;
 
         Ok(Self {

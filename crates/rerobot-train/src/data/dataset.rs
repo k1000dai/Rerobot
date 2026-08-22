@@ -7,10 +7,11 @@
 //! any embedded `dtype: "image"` column into RGB pixels — see [`crate::data::image`]
 //! for the codec set and the bounds every decode is subject to.
 //!
-//! What is not: video decoding, image transforms, depth dequantization, the
-//! streaming dataset, episode-filtered index remapping onto a subset of files,
-//! and the Hub. A dataset needing any of those is refused by
-//! [`crate::data::meta::DatasetMetadata::load`] or here, never partially read.
+//! video decoding, image transforms, depth dequantization, the
+//! streaming dataset, episode predicates, and the Hub. Explicit episode-index
+//! selection is supported for local training and preserves the absolute indices
+//! needed for delta windows; a dataset needing any other unsupported boundary is
+//! refused by [`crate::data::meta::DatasetMetadata::load`] or here, never partially read.
 
 use crate::data::image::DecodedImage;
 use crate::data::meta::{DatasetMetadata, ACTION};
@@ -129,6 +130,11 @@ impl Default for DatasetBudget {
 pub struct StateOnlyDataset {
     metadata: DatasetMetadata,
     delta_indices: IndexMap<String, Vec<i64>>,
+    /// Absolute rows selected by `LeRobotDataset(episodes=...)`, in source order.
+    selected_indices: Option<Vec<usize>>,
+    /// The episode ids requested by `LeRobotDataset(episodes=...)`, including
+    /// entries that upstream warns about and lets the sampler reject later.
+    selected_episodes: Option<Vec<i64>>,
     /// Per feature key, every frame of the dataset, in absolute index order.
     columns: IndexMap<String, Vec<Vec<f32>>>,
     /// Per embedded camera key, every decoded frame in absolute index order.
@@ -159,6 +165,55 @@ impl StateOnlyDataset {
             tolerance_s,
             &DatasetBudget::default(),
         )
+    }
+
+    /// Read the dataset and retain only the requested episodes.
+    ///
+    /// The source columns remain indexed by their absolute dataset frame number so
+    /// delta windows still clamp against the original episode boundaries. The public
+    /// row index is compacted to the selected rows, matching the relative indexing
+    /// exposed by upstream's episode-filtered Hugging Face dataset.
+    pub fn load_for_episodes(
+        root: &std::path::Path,
+        delta_timestamps: &IndexMap<String, Vec<f64>>,
+        tolerance_s: f64,
+        episodes: Option<&[i64]>,
+    ) -> Result<Self> {
+        let Some(episodes) = episodes else {
+            return Self::load(root, delta_timestamps, tolerance_s);
+        };
+
+        // Upstream validates this list immediately after metadata construction and
+        // logs before DatasetReader starts opening data files. Keep that ordering:
+        // a warning must still be observable when a later data read fails.
+        let metadata = DatasetMetadata::load(root)?;
+        let total_episodes = metadata.total_episodes()?;
+        let mut selected = std::collections::HashSet::new();
+        let mut had_out_of_range = false;
+        for episode in episodes {
+            if *episode < 0 || *episode >= total_episodes {
+                had_out_of_range = true;
+                continue;
+            }
+            selected.insert(*episode);
+        }
+        if had_out_of_range {
+            log::warn!(
+                "Some episodes in the provided episodes list are out of range for this dataset ({total_episodes})."
+            );
+        }
+
+        let mut dataset = Self::load(root, delta_timestamps, tolerance_s)?;
+        let selected_episodes = episodes.to_vec();
+        let selected_indices: Vec<usize> = dataset
+            .episode_indices
+            .iter()
+            .enumerate()
+            .filter_map(|(row, episode)| selected.contains(episode).then_some(row))
+            .collect();
+        dataset.selected_indices = Some(selected_indices);
+        dataset.selected_episodes = Some(selected_episodes);
+        Ok(dataset)
     }
 
     /// [`Self::load`], refusing anything outside `budget`.
@@ -337,6 +392,8 @@ impl StateOnlyDataset {
         let dataset = Self {
             metadata,
             delta_indices,
+            selected_indices: None,
+            selected_episodes: None,
             columns,
             image_columns,
             timestamps,
@@ -427,12 +484,14 @@ impl StateOnlyDataset {
 
     /// `__len__`.
     pub fn len(&self) -> usize {
-        self.timestamps.len()
+        self.selected_indices
+            .as_ref()
+            .map_or(self.timestamps.len(), Vec::len)
     }
 
     /// Whether the dataset holds no frames.
     pub fn is_empty(&self) -> bool {
-        self.timestamps.is_empty()
+        self.len() == 0
     }
 
     /// The metadata read from `meta/`.
@@ -452,17 +511,24 @@ impl StateOnlyDataset {
 
     /// `num_episodes`.
     pub fn num_episodes(&self) -> usize {
-        self.metadata.episodes.len()
+        self.selected_episodes
+            .as_ref()
+            .map_or(self.metadata.episodes.len(), Vec::len)
     }
 
     /// The episode identifier owning one dataset-relative frame index.
     pub fn episode_index_at(&self, index: usize) -> Result<i64> {
-        self.episode_indices.get(index).copied().ok_or_else(|| {
-            TrainError::Metadata(format!(
-                "frame {index} is out of range for a dataset of {} frames",
-                self.len()
-            ))
-        })
+        let row = self
+            .selected_indices
+            .as_ref()
+            .map_or(Some(index), |indices| indices.get(index).copied());
+        row.and_then(|row| self.episode_indices.get(row).copied())
+            .ok_or_else(|| {
+                TrainError::Metadata(format!(
+                    "frame {index} is out of range for a dataset of {} frames",
+                    self.len()
+                ))
+            })
     }
 
     /// `__getitem__`.
@@ -473,8 +539,12 @@ impl StateOnlyDataset {
                 self.len()
             )));
         }
-        let absolute = self.absolute_indices[index];
-        let episode_index = self.episode_indices[index];
+        let row = self
+            .selected_indices
+            .as_ref()
+            .map_or(index, |indices| indices[index]);
+        let absolute = self.absolute_indices[row];
+        let episode_index = self.episode_indices[row];
         let episode = self
             .metadata
             .episodes
@@ -519,12 +589,12 @@ impl StateOnlyDataset {
                     padding.insert(key.clone(), window.is_pad);
                 }
                 None => {
-                    windows.insert(key.clone(), vec![values[index].clone()]);
+                    windows.insert(key.clone(), vec![values[row].clone()]);
                 }
             }
         }
 
-        let task_index = self.task_indices[index];
+        let task_index = self.task_indices[row];
         let task = self
             .metadata
             .task(task_index)
@@ -540,12 +610,12 @@ impl StateOnlyDataset {
             .iter()
             .map(|(key, values)| {
                 values
-                    .get(index)
+                    .get(row)
                     .cloned()
                     .map(|image| (key.clone(), image))
                     .ok_or_else(|| {
                         TrainError::Metadata(format!(
-                            "embedded image feature {key:?} reached row {index}, past the {} rows read",
+                            "embedded image feature {key:?} reached row {row}, past the {} rows read",
                             values.len()
                         ))
                     })
@@ -555,8 +625,8 @@ impl StateOnlyDataset {
         Ok(Frame {
             index: absolute,
             episode_index,
-            frame_index: self.frame_indices[index],
-            timestamp: self.timestamps[index],
+            frame_index: self.frame_indices[row],
+            timestamp: self.timestamps[row],
             task_index,
             task,
             windows,
@@ -573,7 +643,8 @@ impl StateOnlyDataset {
         shuffle: bool,
         seed: u64,
     ) -> Result<EpisodeAwareSampler> {
-        Ok(EpisodeAwareSampler::new(
+        let episodes = episodes.or(self.selected_episodes.as_deref());
+        let mut sampler = EpisodeAwareSampler::new(
             &self.metadata.episode_from_indices(),
             &self.metadata.episode_to_indices(),
             episodes,
@@ -581,7 +652,15 @@ impl StateOnlyDataset {
             drop_n_last_frames,
             shuffle,
             seed,
-        )?)
+        )?;
+        if let Some(selected_indices) = &self.selected_indices {
+            let mut mapping = vec![-1; self.timestamps.len()];
+            for (relative, absolute) in selected_indices.iter().enumerate() {
+                mapping[*absolute] = relative as i64;
+            }
+            sampler.set_absolute_to_relative(mapping)?;
+        }
+        Ok(sampler)
     }
 
     /// Whether `action` carries a delta window, which ACT requires.

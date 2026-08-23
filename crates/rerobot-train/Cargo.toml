@@ -30,6 +30,7 @@ cuda = ["candle-core/cuda", "candle-nn/cuda"]
 [dependencies]
 rerobot-core.workspace = true
 indexmap.workspace = true
+log.workspace = true
 num-bigint.workspace = true
 serde_json.workspace = true
 ureq.workspace = true

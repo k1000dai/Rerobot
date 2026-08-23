@@ -1435,3 +1435,50 @@ cargo test -p rerobot-train --test processor visual_processor_state_rejects_part
 cargo test -p rerobot-train --test processor --locked
 10 passed; 0 failed
 ```
+
+## Cycle 22 — episode-filtered training rows
+
+The pinned upstream constructs `LeRobotDataset(..., episodes=[...])` with a
+filtered Arrow dataset, then builds an absolute-to-relative index map for the
+sampler's delta-window lookups. The Rust reader previously accepted the
+configuration field only at the sampler boundary: it still materialized the
+whole dataset and `get(0)` meant absolute frame zero.
+
+**RED** — the first dataset regression test was run before
+`StateOnlyDataset::load_for_episodes` existed:
+
+```
+cargo test -p rerobot-train --test dataset selecting_episodes_compacts_relative_rows_but_keeps_absolute_delta_windows --no-default-features
+error[E0599]: no associated function or constant named `load_for_episodes` found for struct `StateOnlyDataset`
+```
+
+After the first implementation, the end-to-end training regression exposed the
+second boundary defect rather than passing vacuously: the sampler emitted
+absolute `2`, `3` into a two-row filtered dataset and `get(3)` failed with
+`frame 3 is out of range for a dataset of 2 frames`.
+
+The metadata-count regression then failed because the implementation sized its
+validity mask from the number of episode-table rows, warning for episode `1`
+when `info.json` declared two episodes. The GREEN fix uses the declared
+`total_episodes` without allocating a mask from attacker-controlled metadata.
+
+The warning-order regression also failed on a real malformed copy: the missing
+file error returned before the warning was emitted. The constructor now logs
+before opening data files.
+
+**GREEN** — selected rows now have compact relative indexing while retaining
+absolute frame IDs for episode-clamped action windows. The sampler maps its
+eligible absolute positions back to relative rows, the constructor warns about
+out-of-range episode entries before later data reads, and the sampler preserves
+upstream's subsequent out-of-range error. The training session uses that
+filtered dataset for sampler length, checkpoint resume offsets, and real
+updates.
+
+```
+cargo test -p rerobot-core --test dataset_sampler --no-default-features
+21 passed; 0 failed
+cargo test -p rerobot-train --test dataset --no-default-features
+27 passed; 0 failed
+cargo test -p rerobot-train --test train a_training_run_consumes_only_the_configured_episodes --no-default-features
+1 passed; 0 failed
+```

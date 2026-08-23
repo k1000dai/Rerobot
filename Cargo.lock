@@ -1620,6 +1620,7 @@ dependencies = [
  "image",
  "indexmap",
  "libc",
+ "log",
  "num-bigint",
  "parquet",
  "rerobot-core",

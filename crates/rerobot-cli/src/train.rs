@@ -3,7 +3,9 @@
 //! Upstream parses `TrainPipelineConfig` with Draccus, which accepts a dotted
 //! `--a.b.c=value` flag for every field of every nested dataclass, plus
 //! `--config_path` for a YAML or checkpoint config. This is not that parser: it is
-//! explicit allow-list of the flags the local ACT run consumes.
+//! an explicit allow-list of the flags the local ACT run consumes. A saved local
+//! `train_config.json` is accepted as a fresh-run configuration; general YAML and
+//! arbitrary Draccus configurations remain outside this boundary.
 //!
 //! The design rule is that there are exactly three outcomes for any flag, and
 //! never a fourth:
@@ -561,12 +563,72 @@ pub fn parse(args: &[String]) -> Result<TrainConfig, ArgumentError> {
         config.checkpoint_path = Some(checkpoint_dir);
         return Ok(config);
     }
-    if config_path.is_some() {
-        return Err(ArgumentError::Unsupported {
-            flag: "config_path".to_owned(),
-            reason: "resuming or loading a run config needs the Draccus config loader, which is not ported".to_owned(),
-        });
+    if let Some(path) = config_path {
+        if policy_path.is_some() {
+            return Err(ArgumentError::Value {
+                flag: "policy.path".to_owned(),
+                reason: "cannot be combined with --config_path; choose one configuration source"
+                    .to_owned(),
+            });
+        }
+        let mut config =
+            TrainConfig::from_config_file(&path).map_err(|error| ArgumentError::Value {
+                flag: "config_path".to_owned(),
+                reason: error.to_string(),
+            })?;
+        for (flag, value) in policy_overrides {
+            apply_policy_flag(&mut config.policy, &flag, &value)?;
+        }
+        if let Some(value) = repo_id {
+            config.dataset_repo_id = value;
+        }
+        if let Some(value) = root {
+            config.dataset_root = value;
+        }
+        if let Some(value) = output_dir {
+            config.output_dir = value;
+        }
+        if let Some(value) = episodes {
+            config.dataset_episodes = Some(value);
+        }
+        if let Some(value) = job_name {
+            config.job_name = Some(value);
+        }
+        if let Some(value) = seed {
+            config.seed = value;
+        }
+        if let Some(value) = batch_size {
+            config.batch_size = value;
+        }
+        if let Some(value) = steps {
+            config.steps = value;
+        }
+        if let Some(value) = log_freq {
+            config.log_freq = value;
+        }
+        if let Some(value) = save_freq {
+            config.save_freq = value;
+        }
+        if let Some(value) = save_checkpoint {
+            config.save_checkpoint = value;
+        }
+        if let Some(value) = tolerance_s {
+            config.tolerance_s = value;
+        }
+        if let Some(value) = num_workers {
+            config.num_workers = value;
+        }
+        if let Some(value) = use_preset {
+            config.use_policy_training_preset = value;
+        }
+        if let Some(value) = use_imagenet_stats {
+            config.dataset_use_imagenet_stats = value;
+        }
+        config.resume = false;
+        config.checkpoint_path = None;
+        return Ok(config);
     }
+
     if resume == Some(false) {
         // `--resume=false` is a valid explicit default and otherwise has no effect.
     }
@@ -877,6 +939,12 @@ pub fn help_section() -> String {
          \x20                              pretrained_model/train_config.json, or DIR\n\
          \x20                              may be the checkpoint directory or checkpoints/last\n\
          \x20                              (dataset and policy flags are loaded from it)\n\
+         \n\
+         Fresh config:\n\
+         \x20 --config_path=FILE --resume=false\n\
+         \x20                              load a local JSON train_config.json and start a\n\
+         \x20                              new run; CLI values override fields in the file\n\
+         \x20                              (general YAML/Draccus configs are not supported)\n\
          \n\
          Run:\n\
          \x20 --steps=N --batch_size=N --seed=N|null --log_freq=N --save_freq=N\n\

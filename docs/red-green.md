@@ -1482,3 +1482,35 @@ cargo test -p rerobot-train --test dataset --no-default-features
 cargo test -p rerobot-train --test train a_training_run_consumes_only_the_configured_episodes --no-default-features
 1 passed; 0 failed
 ```
+
+## Cycle 23 — fresh training from a saved config
+
+The pinned upstream `lerobot-train` accepts `--config_path` as a configuration
+source as well as for resume. Before this slice, Rerobot accepted the flag only
+for `--resume=true`, so a valid locally-produced `train_config.json` could not
+start a new run without repeating every dataset and policy option.
+
+**RED** — the real executable regression was run before the config loader:
+
+```
+cargo test -p rerobot-cli --test train_cli a_saved_train_config_can_start_a_fresh_run_without_retyping_dataset_or_policy_flags -- --exact --nocapture
+FAILED: --config_path is not supported in this slice: resuming or loading a run config needs the Draccus config loader, which is not ported
+```
+
+The test first trains the committed state-only fixture, then passes its actual
+checkpoint `train_config.json` to a second process. The failure was a parser
+boundary refusal, not a missing fixture or a failed model update.
+
+**GREEN** — `TrainConfig::from_config_file` now reads the bounded native JSON
+form, preserves arbitrary-precision integer fields, and rejects malformed,
+wrong-type, oversized, or non-JSON documents through the checkpoint error path.
+The CLI applies supported overrides, clears resume state, and runs the full ACT
+training/checkpoint path. General YAML/Draccus files remain explicitly outside
+this boundary.
+
+```
+cargo test -p rerobot-cli --test train_cli -- --nocapture
+41 passed; 0 failed
+cargo test -p rerobot-compat --test docs_consistency --locked
+13 passed; 0 failed
+```

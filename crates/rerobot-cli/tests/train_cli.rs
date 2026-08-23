@@ -339,6 +339,41 @@ fn a_local_checkpoint_can_be_resumed_without_retyping_dataset_or_policy_flags() 
 }
 
 #[test]
+fn a_saved_train_config_can_start_a_fresh_run_without_retyping_dataset_or_policy_flags() {
+    let dir = TempDir::new("config-path-e2e");
+    let source_output = dir.child("source");
+    let source = run(&slice_args(&source_output, &[]));
+    assert!(
+        source.status.success(),
+        "source run stderr: {}",
+        stderr_of(&source)
+    );
+
+    let config_path = source_output.join("checkpoints/000001/pretrained_model/train_config.json");
+    let fresh_output = dir.child("fresh");
+    let result = run(&[
+        "--resume=false".to_owned(),
+        format!("--config_path={}", config_path.display()),
+        format!("--output_dir={}", fresh_output.display()),
+        "--steps=1".to_owned(),
+    ]);
+    let stdout = stdout_of(&result);
+    assert!(
+        result.status.success(),
+        "fresh config-path run exited {:?}\nstdout:\n{stdout}\nstderr:\n{}",
+        result.status.code(),
+        stderr_of(&result)
+    );
+    assert!(stdout.contains("step:1 loss:"), "stdout:\n{stdout}");
+    assert!(
+        fresh_output
+            .join("checkpoints/000001/pretrained_model/model.safetensors")
+            .is_file(),
+        "the config-path run did not publish a checkpoint"
+    );
+}
+
+#[test]
 fn the_written_weights_are_a_real_safetensors_file_of_the_expected_size() {
     let dir = TempDir::new("weights");
     let output_dir = dir.child("out");
@@ -479,9 +514,13 @@ fn help_states_the_partial_status_and_lists_what_is_accepted_and_refused() {
         stdout.contains("Refused, with a reason naming what is missing:"),
         "stdout:\n{stdout}"
     );
-    // Every refused flag is listed, so the boundary is discoverable without
-    // reading the source.
+    // Every refused flag is listed, and config_path's accepted forms are described, so
+    // the boundary is discoverable without reading the source.
     assert!(stdout.contains("--config_path"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("--config_path=FILE --resume=false"),
+        "stdout does not describe fresh config loading:\n{stdout}"
+    );
     assert!(stdout.contains("--resume=true"), "stdout:\n{stdout}");
     for flag in ["--wandb", "--policy.path"] {
         assert!(
@@ -583,7 +622,6 @@ fn a_flag_naming_an_unported_feature_is_refused_by_the_parser() {
     for (flag, fragment) in [
         ("--wandb.project=demo", "Weights & Biases"),
         ("--env.type=aloha", "Gymnasium"),
-        ("--config_path=x.json", "Draccus config loader"),
         ("--dataset.streaming=true", "Hub client"),
         ("--optimizer.lr=1e-4", "Draccus optimizer registry"),
         ("--peft=x", "PEFT"),

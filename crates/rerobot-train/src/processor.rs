@@ -20,15 +20,18 @@
 //!
 //! The *artifacts* are ported: their names, their JSON structure byte for byte, and
 //! their safetensors contents. The native ACT deployment boundary also validates
-//! and consumes the saved numeric normalizer state for scalar observations and
-//! action unnormalization. It does not yet execute an arbitrary registry-named
-//! pipeline: the rename, batch, device and full multi-step processor lifecycles
-//! remain represented structurally rather than exposed as a general runtime. That
-//! boundary is recorded in `docs/compatibility.md`; the alternative — omitting
-//! the steps — would produce a file upstream cannot load.
+//! and consumes the saved rename map and numeric normalizer state for scalar
+//! observations and action unnormalization. It does not yet execute an arbitrary
+//! registry-named pipeline: the batch, device and full multi-step processor
+//! lifecycles remain represented structurally rather than exposed as a general
+//! runtime. That boundary is recorded in `docs/compatibility.md`; the alternative
+//! — omitting the steps — would produce a file upstream cannot load.
 
+use crate::data::batch::Batch;
 use crate::data::image::CameraNormalization;
+use crate::data::meta::ACTION;
 use crate::error::{Result, TrainError};
+use candle_core::Tensor;
 use indexmap::IndexMap;
 use rerobot_core::dataset::json::{dumps_indent_ascii, JsonLike, JsonObject};
 use rerobot_core::dataset::stats::{DatasetStats, FeatureStats};
@@ -48,6 +51,7 @@ use std::path::{Path, PathBuf};
 pub struct LoadedPolicyProcessors {
     normalizer: Normalizer,
     camera_normalizations: IndexMap<String, CameraNormalization>,
+    rename_map: IndexMap<String, String>,
 }
 
 impl LoadedPolicyProcessors {
@@ -79,6 +83,7 @@ impl LoadedPolicyProcessors {
             &["unnormalizer_processor", "device_processor"],
             Some("policy_postprocessor_step_0_unnormalizer_processor.safetensors"),
         )?;
+        let rename_map = rename_map_from_pipeline(&preprocessor)?;
 
         let preprocessor_state_path =
             checkpoint_dir.join("policy_preprocessor_step_3_normalizer_processor.safetensors");
@@ -112,6 +117,7 @@ impl LoadedPolicyProcessors {
         Ok(Self {
             normalizer,
             camera_normalizations,
+            rename_map,
         })
     }
 
@@ -124,6 +130,115 @@ impl LoadedPolicyProcessors {
     pub fn camera_normalizations(&self) -> &IndexMap<String, CameraNormalization> {
         &self.camera_normalizations
     }
+
+    /// Apply the saved observation pipeline's rename and normalization steps.
+    ///
+    /// This is the native subset of upstream's preprocessor runtime used by ACT.
+    /// Renaming happens before normalization, and the input batch is not mutated.
+    pub fn process_observation_batch(&self, batch: &Batch) -> Result<Batch> {
+        let renamed = rename_observation_batch(batch, &self.rename_map);
+        renamed.normalized(&self.normalizer)
+    }
+
+    /// The saved observation-key mapping, in upstream insertion order.
+    pub fn rename_map(&self) -> &IndexMap<String, String> {
+        &self.rename_map
+    }
+}
+
+/// Rename observation feature and camera keys using upstream's one-pass mapping.
+///
+/// `IndexMap::insert` preserves the first insertion position while replacing a
+/// colliding value, matching Python dict assignment. Only exact observation keys
+/// in the mapping are renamed; derived padding keys are not implicitly rewritten.
+fn renamed_observation_key(key: &str, rename_map: &IndexMap<String, String>) -> String {
+    if key == ACTION {
+        return key.to_owned();
+    }
+    if let Some(mapped) = rename_map.get(key) {
+        return mapped.clone();
+    }
+    key.to_owned()
+}
+
+/// Rename a collection of raw camera tensors using the saved observation mapping.
+pub fn rename_observation_images(
+    images: &IndexMap<String, Tensor>,
+    rename_map: &IndexMap<String, String>,
+) -> IndexMap<String, Tensor> {
+    let mut renamed = IndexMap::with_capacity(images.len());
+    for (key, tensor) in images {
+        renamed.insert(renamed_observation_key(key, rename_map), tensor.clone());
+    }
+    renamed
+}
+
+/// Rename a batch's observation features and camera keys using upstream's one-pass
+/// mapping. Padding masks are not observation keys and therefore pass through
+/// untouched. The input tensors are shared by clone, but the returned maps and
+/// task/index vectors are independent.
+pub fn rename_observation_batch(batch: &Batch, rename_map: &IndexMap<String, String>) -> Batch {
+    let mut features = IndexMap::with_capacity(batch.features.len());
+    for (key, tensor) in &batch.features {
+        features.insert(renamed_observation_key(key, rename_map), tensor.clone());
+    }
+    let images = rename_observation_images(&batch.images, rename_map);
+    // The upstream observation processor sees one ordered dictionary. Batch keeps
+    // scalar and camera tensors in separate maps, so resolve a cross-map rename
+    // collision as the later camera entry would overwrite the scalar entry.
+    for key in images.keys() {
+        features.shift_remove(key);
+    }
+    Batch {
+        features,
+        images,
+        padding: batch.padding.clone(),
+        tasks: batch.tasks.clone(),
+        indices: batch.indices.clone(),
+    }
+}
+
+fn rename_map_from_pipeline(document: &JsonLike) -> Result<IndexMap<String, String>> {
+    let JsonLike::Object(root) = document else {
+        return Err(TrainError::Metadata(
+            "policy_preprocessor.json root must be an object".to_owned(),
+        ));
+    };
+    let Some(JsonLike::Array(steps)) = root.get("steps") else {
+        return Err(TrainError::Metadata(
+            "policy_preprocessor.json steps must be an array".to_owned(),
+        ));
+    };
+    let Some(JsonLike::Object(step)) = steps.first() else {
+        return Err(TrainError::Metadata(
+            "policy_preprocessor.json has no rename step".to_owned(),
+        ));
+    };
+    let Some(JsonLike::Object(config)) = step.get("config") else {
+        return Err(TrainError::Metadata(
+            "policy_preprocessor.json rename step config must be an object".to_owned(),
+        ));
+    };
+    let Some(rename_map) = config.get("rename_map") else {
+        return Err(TrainError::Metadata(
+            "policy_preprocessor.json rename_map is missing".to_owned(),
+        ));
+    };
+    let JsonLike::Object(rename_map) = rename_map else {
+        return Err(TrainError::Metadata(
+            "policy_preprocessor.json rename_map must be an object".to_owned(),
+        ));
+    };
+    let mut parsed = IndexMap::with_capacity(rename_map.len());
+    for (old, new) in rename_map {
+        let JsonLike::Str(new) = new else {
+            return Err(TrainError::Metadata(format!(
+                "policy_preprocessor.json rename_map entry {old:?} must be a string"
+            )));
+        };
+        parsed.insert(old.clone(), new.clone());
+    }
+    Ok(parsed)
 }
 
 const MAX_PROCESSOR_JSON_BYTES: u64 = 16 * 1024 * 1024;

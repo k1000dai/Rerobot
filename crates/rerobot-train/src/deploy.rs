@@ -14,6 +14,7 @@ use crate::data::meta::ACTION;
 use crate::device;
 use crate::error::{Result, TrainError};
 use crate::model::act::ActModel;
+use crate::processor::{rename_observation_batch, rename_observation_images};
 
 use indexmap::IndexMap;
 use num_bigint::BigInt;
@@ -216,6 +217,7 @@ pub struct InferenceSession {
     normalizer: Normalizer,
     camera_normalization: CameraNormalization,
     camera_normalizations: IndexMap<String, CameraNormalization>,
+    rename_map: IndexMap<String, String>,
     queued_actions: VecDeque<Vec<f32>>,
     temporal_ensembler: Option<TemporalEnsembler>,
 }
@@ -276,6 +278,7 @@ impl InferenceSession {
         }
 
         let processors = crate::processor::LoadedPolicyProcessors::load(checkpoint_dir, &config)?;
+        let rename_map = processors.rename_map().clone();
         let normalizer = processors.normalizer().clone();
         let device_name = device_override.or(config.device.as_deref());
         let device = device::resolve(device_name)?;
@@ -304,6 +307,7 @@ impl InferenceSession {
             normalizer,
             camera_normalization,
             camera_normalizations,
+            rename_map,
             queued_actions: VecDeque::new(),
             temporal_ensembler,
         })
@@ -372,7 +376,8 @@ impl InferenceSession {
         let frame_index = *batch.indices.first().ok_or_else(|| {
             TrainError::Metadata("the single-observation batch has no frame index".to_owned())
         })?;
-        let normalized = batch.normalized(&self.normalizer)?;
+        let renamed = rename_observation_batch(batch, &self.rename_map);
+        let normalized = renamed.normalized(&self.normalizer)?;
         self.select_action_normalized(&normalized, frame_index)
     }
 
@@ -492,12 +497,14 @@ impl InferenceSession {
         let frame = dataset.get(index)?;
         let raw = collate(std::slice::from_ref(&frame), self.model.device())?;
         let images = collate_images(std::slice::from_ref(&frame), self.model.device())?;
-        let raw = if images.is_empty() {
-            raw
+        let renamed = rename_observation_batch(&raw, &self.rename_map);
+        let images = rename_observation_images(&images, &self.rename_map);
+        let normalized_images = if images.is_empty() {
+            renamed
         } else {
-            raw.with_image_normalizations(&images, &self.camera_normalizations)?
+            renamed.with_image_normalizations(&images, &self.camera_normalizations)?
         };
-        raw.normalized(&self.normalizer)
+        normalized_images.normalized(&self.normalizer)
     }
 }
 

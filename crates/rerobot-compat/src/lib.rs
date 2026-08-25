@@ -321,9 +321,9 @@ pub static MODULE_FAMILIES: &[ModuleFamily] = &[
                lifecycle of `newline_task_processor.NewLineTaskProcessorStep` are ported and \
                tested, as is `normalize_processor`'s numeric transform for all four of its \
                modes. The four pre/postprocessor artifacts a checkpoint carries are written \
-               byte-identically to upstream's, and the native ACT deployment path now validates \
-               and consumes their saved numeric state for observation normalization and action \
-               unnormalization. Python aliasing, general registry/config reconstruction, and the \
+               byte-identically to upstream's, and the native ACT deployment path now loads the \
+               saved pipeline's rename map before applying scalar/camera normalization and action \
+               unnormalization. Python aliasing, arbitrary registry/config reconstruction, and the \
                tokenizer, device, batch and full multi-step pipeline runtime remain outside this \
                boundary.",
     },

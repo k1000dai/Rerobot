@@ -21,13 +21,15 @@
 
 mod common;
 
+use candle_core::{Device, Tensor};
 use common::{embedded_image_fixture, fixture_dataset, reduced_config, TempDir};
 use indexmap::IndexMap;
 use rerobot_core::dataset::json::{loads, JsonLike};
+use rerobot_train::data::batch::Batch;
 use rerobot_train::data::image::CameraNormalization;
 use rerobot_train::processor::{
-    write_processor_artifacts, write_processor_artifacts_with_cameras, LoadedPolicyProcessors,
-    POLICY_POSTPROCESSOR_NAME, POLICY_PREPROCESSOR_NAME,
+    rename_observation_batch, write_processor_artifacts, write_processor_artifacts_with_cameras,
+    LoadedPolicyProcessors, POLICY_POSTPROCESSOR_NAME, POLICY_PREPROCESSOR_NAME,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -171,6 +173,112 @@ fn visual_processor_state_rejects_partial_camera_statistics() {
             .contains("requires both mean and std statistics"),
         "partial camera state was not named: {error}"
     );
+}
+
+#[test]
+fn loaded_pipeline_renames_observation_keys_before_normalizing_a_batch() {
+    let (_dir, target) = written("processor-rename-runtime");
+    let config_path = target.join("policy_preprocessor.json");
+    let config = std::fs::read_to_string(&config_path).expect("the preprocessor config reads");
+    let config = config.replace(
+        "\"rename_map\": {}",
+        "\"rename_map\": {\"state\": \"observation.state\"}",
+    );
+    std::fs::write(&config_path, config).expect("the preprocessor rename map writes");
+
+    let metadata =
+        rerobot_train::data::meta::DatasetMetadata::load(&fixture_dataset()).expect("fixture");
+    let mut policy = reduced_config(fixture_dataset(), target.join("out")).policy;
+    let (inputs, outputs) = metadata.policy_feature_split();
+    policy.input_features = Some(inputs);
+    policy.output_features = Some(outputs);
+    let processors =
+        LoadedPolicyProcessors::load(&target, &policy).expect("the saved processor pipeline loads");
+
+    let mut features = IndexMap::new();
+    features.insert(
+        "state".to_owned(),
+        Tensor::new(vec![0.4375_f32, 0.5625], &Device::Cpu).expect("the raw state builds"),
+    );
+    let raw = Batch {
+        features,
+        images: IndexMap::new(),
+        padding: IndexMap::from([(
+            "state".to_owned(),
+            Tensor::new(vec![1_u8], &Device::Cpu).expect("the padding builds"),
+        )]),
+        tasks: vec!["".to_owned()],
+        indices: vec![0],
+    };
+
+    let processed = processors
+        .process_observation_batch(&raw)
+        .expect("the pipeline renames and normalizes the batch");
+    assert!(processed.features.contains_key("observation.state"));
+    assert!(!processed.features.contains_key("state"));
+    assert!(processed.padding.contains_key("state"));
+    assert!(!processed.padding.contains_key("observation.state"));
+    let values = processed
+        .features
+        .get("observation.state")
+        .expect("the renamed feature exists")
+        .to_vec1::<f32>()
+        .expect("the normalized tensor reads");
+    assert!(values.iter().all(|value| value.abs() < 1e-6), "{values:?}");
+}
+
+#[test]
+fn observation_rename_leaves_the_action_feature_untouched() {
+    let mut features = IndexMap::new();
+    features.insert(
+        "observation.state".to_owned(),
+        Tensor::new(vec![1.0_f32], &Device::Cpu).expect("the state builds"),
+    );
+    features.insert(
+        "action".to_owned(),
+        Tensor::new(vec![2.0_f32], &Device::Cpu).expect("the action builds"),
+    );
+    let raw = Batch {
+        features,
+        images: IndexMap::new(),
+        padding: IndexMap::new(),
+        tasks: vec![String::new()],
+        indices: vec![0],
+    };
+    let rename_map = IndexMap::from([
+        ("observation.state".to_owned(), "state".to_owned()),
+        ("action".to_owned(), "renamed.action".to_owned()),
+    ]);
+
+    let renamed = rename_observation_batch(&raw, &rename_map);
+
+    assert!(renamed.features.contains_key("state"));
+    assert!(renamed.features.contains_key("action"));
+    assert!(!renamed.features.contains_key("renamed.action"));
+}
+
+#[test]
+fn malformed_saved_rename_map_is_rejected_before_deployment() {
+    let (_dir, target) = written("processor-malformed-rename");
+    let config_path = target.join("policy_preprocessor.json");
+    let config = std::fs::read_to_string(&config_path).expect("the preprocessor config reads");
+    std::fs::write(
+        &config_path,
+        config.replace("\"rename_map\": {}", "\"rename_map\": {\"state\": 7}"),
+    )
+    .expect("the malformed preprocessor config writes");
+
+    let mut policy = reduced_config(fixture_dataset(), target.join("out")).policy;
+    let metadata =
+        rerobot_train::data::meta::DatasetMetadata::load(&fixture_dataset()).expect("fixture");
+    let (inputs, outputs) = metadata.policy_feature_split();
+    policy.input_features = Some(inputs);
+    policy.output_features = Some(outputs);
+    let error = LoadedPolicyProcessors::load(&target, &policy)
+        .expect_err("a non-string rename target must be rejected");
+    assert!(error
+        .to_string()
+        .contains("rename_map entry \"state\" must be a string"));
 }
 
 // ---------------------------------------------------------------------------

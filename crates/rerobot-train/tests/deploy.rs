@@ -75,6 +75,53 @@ fn a_checkpoint_can_infer_from_a_caller_batch_without_opening_a_dataset() {
     assert!(actual.queried_policy);
 }
 
+#[test]
+fn a_checkpoint_only_session_applies_a_saved_rename_map_before_inference() {
+    let (_dir, checkpoint) = trained_checkpoint();
+    let config_path = checkpoint.join("policy_preprocessor.json");
+    let config = std::fs::read_to_string(&config_path).expect("the preprocessor config reads");
+    std::fs::write(
+        &config_path,
+        config.replace(
+            "\"rename_map\": {}",
+            "\"rename_map\": {\"state\": \"observation.state\"}",
+        ),
+    )
+    .expect("the preprocessor rename map writes");
+
+    let mut session = InferenceSession::load_checkpoint(&checkpoint, None)
+        .expect("the renamed checkpoint loads without a dataset");
+    let metadata = rerobot_train::data::meta::DatasetMetadata::load(&fixture_dataset())
+        .expect("the fixture metadata loads");
+    let mut delta_timestamps = IndexMap::new();
+    delta_timestamps.insert(
+        ACTION.to_owned(),
+        action_delta_timestamps(2, metadata.fps().expect("the fixture fps is valid")),
+    );
+    let dataset = StateOnlyDataset::load(&fixture_dataset(), &delta_timestamps, 1e-4)
+        .expect("the fixture frame loads");
+    let frame = dataset.get(0).expect("the first frame loads");
+    let mut raw =
+        collate(std::slice::from_ref(&frame), session.device()).expect("the batch collates");
+    let images = collate_images(std::slice::from_ref(&frame), session.device())
+        .expect("the camera batch collates");
+    raw = raw
+        .with_images(&images, &session.camera_normalization().clone())
+        .expect("the caller batch accepts its cameras");
+    let state = raw
+        .features
+        .shift_remove("observation.state")
+        .expect("the original state key exists");
+    raw.features.insert("state".to_owned(), state);
+
+    let actual = session
+        .select_action_on_batch(&raw)
+        .expect("the saved rename map is applied before the model");
+    assert_eq!(actual.frame_index, 0);
+    assert_eq!(actual.action.len(), 2);
+    assert!(actual.action.iter().all(|value| value.is_finite()));
+}
+
 fn replace_action_stats(checkpoint: &std::path::Path) {
     for name in [
         "policy_preprocessor_step_3_normalizer_processor.safetensors",

@@ -567,6 +567,30 @@ impl TrainConfig {
         let mut policy = ActConfig::from_checkpoint_value(value_field(root, "policy", path)?)
             .map_err(|error| TrainError::checkpoint(path, error.to_string()))?;
         if let Some(checkpoint_dir) = checkpoint_dir {
+            let policy_config_path = checkpoint_dir
+                .join(crate::checkpoint::PRETRAINED_MODEL_DIR)
+                .join(crate::checkpoint::CONFIG_FILE);
+            let policy_config_text = read_bounded_text(&policy_config_path, "config.json")?;
+            let saved_policy = ActConfig::from_checkpoint_json(&policy_config_text)
+                .map_err(|error| TrainError::checkpoint(&policy_config_path, error.to_string()))?;
+            // `train_config.json` records the user-facing config, while the
+            // sibling policy `config.json` records the resolved feature namespace
+            // that the model and processor artifacts actually use. Resume must use
+            // that resolved namespace, especially when a camera was renamed.
+            if policy
+                .input_features
+                .as_ref()
+                .is_none_or(|features| features.is_empty())
+            {
+                policy.input_features = saved_policy.input_features;
+            }
+            if policy
+                .output_features
+                .as_ref()
+                .is_none_or(|features| features.is_empty())
+            {
+                policy.output_features = saved_policy.output_features;
+            }
             policy.pretrained_path = Some(
                 checkpoint_dir
                     .join(crate::checkpoint::PRETRAINED_MODEL_DIR)
@@ -656,6 +680,16 @@ impl TrainConfig {
 }
 
 fn read_config_document(path: &Path) -> Result<JsonLike> {
+    let text = read_bounded_text(path, "train_config.json")?;
+    rerobot_core::dataset::json::loads(&text).map_err(|error| {
+        TrainError::checkpoint(
+            path,
+            format!("train_config.json is not valid JSON: {error}"),
+        )
+    })
+}
+
+fn read_bounded_text(path: &Path, label: &str) -> Result<String> {
     let file = std::fs::File::open(path).map_err(|error| TrainError::io(path, &error))?;
     let mut bytes = Vec::new();
     file.take(crate::limits::MAX_CHECKPOINT_JSON_BYTES + 1)
@@ -665,23 +699,15 @@ fn read_config_document(path: &Path) -> Result<JsonLike> {
         return Err(TrainError::checkpoint(
             path,
             format!(
-                "train_config.json exceeds the {}-byte limit",
+                "{label} exceeds the {}-byte limit",
                 crate::limits::MAX_CHECKPOINT_JSON_BYTES
             ),
         ));
     }
     let text = String::from_utf8(bytes).map_err(|error| {
-        TrainError::checkpoint(
-            path,
-            format!("train_config.json is not valid UTF-8: {error}"),
-        )
+        TrainError::checkpoint(path, format!("{label} is not valid UTF-8: {error}"))
     })?;
-    rerobot_core::dataset::json::loads(&text).map_err(|error| {
-        TrainError::checkpoint(
-            path,
-            format!("train_config.json is not valid JSON: {error}"),
-        )
-    })
+    Ok(text)
 }
 
 fn eval_json() -> JsonLike {

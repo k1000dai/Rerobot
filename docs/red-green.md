@@ -1514,3 +1514,57 @@ cargo test -p rerobot-cli --test train_cli -- --nocapture
 cargo test -p rerobot-compat --test docs_consistency --locked
 13 passed; 0 failed
 ```
+
+## Cycle 24 — one-pass camera normalization for renamed training inputs
+
+A saved observation rename is applied by the training processor only once. The
+internal batch builder still selected camera tensors under their renamed keys
+before `step_on` applied the saved mapping, which made chained aliases such as
+`left -> top` and `top -> wrist` vulnerable to applying the mapping twice.
+
+**RED** — the focused regression was added before the selector existed:
+
+```
+cargo test -p rerobot-train --test processor camera_normalization_is_selected_after_one_observation_rename
+error[E0425]: cannot find function `camera_normalizations_for_input_images`
+```
+
+The compiler failure is at the intended API boundary; no runtime fixture or
+unrelated test was involved.
+
+**GREEN** — camera statistics are selected using the raw input key and its
+single mapped destination, while the batch retains raw keys until the normal
+observation rename. The focused regression includes a second mapping entry to
+pin the one-pass rule.
+
+```
+cargo test -p rerobot-train --test processor camera_normalization_is_selected_after_one_observation_rename -- --exact
+1 passed; 0 failed
+cargo test -p rerobot-train --all-targets
+all tests passed; 0 failed
+```
+
+## Cycle 25 — bounded policy-config reads during resume reconstruction
+
+`TrainConfig::from_checkpoint_dir` now applies the same 16 MiB checkpoint-JSON
+bound to the resolved `pretrained_model/config.json` that it already applied to
+`train_config.json`. This rejects an oversized policy document before the JSON
+parser or an unbounded `read_to_string` can materialize it.
+
+**RED** — the regression first exercised the old unbounded read and reached the
+JSON parser instead of the checkpoint reader's boundary:
+
+```
+cargo test -p rerobot-train --test train oversized_policy_config_is_rejected_before_unbounded_checkpoint_read --locked -- --exact
+assertion `left == right` failed
+left: .../config.json: Rerobot JSON input byte limit exceeded (16777216): line 1 column 1 (char 0)
+right: .../config.json: config.json exceeds the 16777216-byte limit
+```
+
+**GREEN** — the shared bounded reader returns the checkpoint-specific error before
+parsing:
+
+```
+cargo test -p rerobot-train --test train oversized_policy_config_is_rejected_before_unbounded_checkpoint_read --locked -- --exact
+1 passed; 0 failed
+```

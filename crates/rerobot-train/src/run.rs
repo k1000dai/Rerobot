@@ -22,6 +22,7 @@ use crate::data::meta::{DatasetMetadata, ACTION};
 use crate::error::{Result, TrainError};
 use crate::model::act::{ActModel, Pass, Randomness};
 use crate::optim::{act_parameter_groups, clip_grad_norm, parameter_l2, AdamW};
+use crate::processor::{camera_normalizations_for_input_images, rename_observation_batch};
 use candle_core::Device;
 use indexmap::IndexMap;
 use rerobot_core::dataset::delta::action_delta_timestamps;
@@ -98,6 +99,10 @@ pub struct TrainSession {
     pub camera_normalization: CameraNormalization,
     /// The per-camera statistics selected by dataset feature name.
     camera_normalizations: IndexMap<String, CameraNormalization>,
+    /// The processor statistics used by this session, in policy namespace.
+    processor_stats: rerobot_core::dataset::stats::DatasetStats,
+    /// Observation-key mapping restored from a pretrained processor pipeline.
+    rename_map: IndexMap<String, String>,
     /// Frame indices left over from the sampler's current epoch.
     queue: Vec<i64>,
     batch_size: usize,
@@ -156,9 +161,22 @@ impl TrainSession {
         let dataset_camera_normalizations =
             resolve_camera_normalizations(config, dataset.metadata())?;
 
+        // A pretrained processor can rename dataset observation keys before the
+        // policy sees them. Read that small structural part first: feature inference
+        // must happen in the model's namespace, while the complete processor load
+        // below still validates all saved state before construction continues.
+        let rename_map = if let Some(pretrained_path) = &config.policy.pretrained_path {
+            crate::processor::LoadedPolicyProcessors::load_rename_map(Path::new(pretrained_path))?
+        } else {
+            IndexMap::new()
+        };
+
         // `make_policy`: the dataset's features become the policy's, split by
-        // whether they are actions, plus the cameras the config declares.
-        let (inputs, outputs) = resolved_policy_features(config, dataset.metadata());
+        // whether they are actions, plus the cameras the config declares. When a
+        // pretrained policy already carries input features, upstream preserves that
+        // model namespace and the saved rename processor adapts the dataset to it.
+        let (inputs, outputs) =
+            resolved_policy_features_with_rename(config, dataset.metadata(), &rename_map);
         let mut policy_config = config.policy.clone();
         policy_config.input_features = Some(inputs);
         policy_config.output_features = Some(outputs);
@@ -180,7 +198,7 @@ impl TrainSession {
             .chain(policy_config.output_features.clone().unwrap_or_default())
             .filter(|(_, feature)| feature.r#type != rerobot_core::types::FeatureType::Visual)
             .collect();
-        let (normalizer, camera_normalizations) =
+        let (normalizer, camera_normalizations, processor_stats) =
             if let Some(pretrained_path) = &policy_config.pretrained_path {
                 let processors = crate::processor::LoadedPolicyProcessors::load(
                     Path::new(pretrained_path),
@@ -189,6 +207,7 @@ impl TrainSession {
                 (
                     processors.normalizer().clone(),
                     processors.camera_normalizations().clone(),
+                    processors.stats().clone(),
                 )
             } else {
                 (
@@ -198,6 +217,7 @@ impl TrainSession {
                         &dataset.metadata().stats,
                     )?,
                     dataset_camera_normalizations,
+                    dataset.metadata().stats.clone(),
                 )
             };
 
@@ -243,6 +263,8 @@ impl TrainSession {
             grad_clip_norm: preset.grad_clip_norm,
             camera_normalization: config.camera_normalization(),
             camera_normalizations,
+            processor_stats,
+            rename_map,
             queue: Vec::new(),
             batch_size: config.batch_size,
             device,
@@ -302,6 +324,11 @@ impl TrainSession {
         &self.camera_normalizations
     }
 
+    /// The processor statistics used to normalize this session's observations.
+    pub fn processor_stats(&self) -> &rerobot_core::dataset::stats::DatasetStats {
+        &self.processor_stats
+    }
+
     /// The next batch, cycling through epochs the way `utils.cycle` does.
     ///
     /// A dataset with an embedded `dtype: "image"` column has its decoded frames
@@ -339,7 +366,12 @@ impl TrainSession {
         if images.is_empty() {
             return Ok(batch);
         }
-        batch.with_image_normalizations(&images, &self.camera_normalizations)
+        let normalizations = camera_normalizations_for_input_images(
+            &images,
+            &self.camera_normalizations,
+            &self.rename_map,
+        );
+        batch.with_image_normalizations(&images, &normalizations)
     }
 
     /// One optimization step: forward, loss, backward, clip, AdamW, zero.
@@ -374,7 +406,8 @@ impl TrainSession {
     /// `batch` is *raw*: this normalizes it with [`Self::normalizer`] exactly as
     /// [`Self::step`] does, which is what keeps the two paths one computation.
     pub fn step_on(&mut self, step_number: u64, raw: &Batch) -> Result<StepMetrics> {
-        let batch = raw.normalized(&self.normalizer)?;
+        let renamed = rename_observation_batch(raw, &self.rename_map);
+        let batch = renamed.normalized(&self.normalizer)?;
 
         let before = parameter_l2(self.model.parameters())?;
 
@@ -419,26 +452,36 @@ impl TrainSession {
     }
 }
 
+/// Apply the saved observation-key mapping to dataset-derived policy features.
+///
+/// The mapping is one-pass and insertion ordered, matching the rename processor:
+/// a collision keeps the first key's position and takes the later value. Action
+/// features are not present in this input-only map, but are protected here as a
+/// defensive boundary because the helper is also used by callers outside the
+/// current dataset reader.
+fn rename_policy_features(
+    features: IndexMap<String, rerobot_core::types::PolicyFeature>,
+    rename_map: &IndexMap<String, String>,
+) -> IndexMap<String, rerobot_core::types::PolicyFeature> {
+    features
+        .into_iter()
+        .map(|(key, feature)| {
+            let renamed = if key == ACTION {
+                key
+            } else {
+                rename_map.get(&key).cloned().unwrap_or(key)
+            };
+            (renamed, feature)
+        })
+        .collect()
+}
+
 /// The `(input_features, output_features)` the policy is built from.
 ///
-/// Upstream's `make_policy` takes both entirely from the dataset. This adds one
-/// thing to that: any **camera** feature the config already declares is kept.
-///
-/// It has to be, because the two sources of truth are split here in a way they are
-/// not upstream. A dataset whose cameras this slice cannot decode from disk — an MP4
-/// `dtype: "video"` feature, or frames stored outside the parquet file — reaches
-/// [`TrainSession::step_on`] as caller-supplied tensors instead, and taking the
-/// features from the dataset alone would make that path unreachable no matter what
-/// the user asked for. Declaring the camera on the policy config is the supported way
-/// in, and this is what makes the declaration survive into the model and into the
-/// `config.json` the checkpoint writes.
-///
-/// A dataset with an embedded `dtype: "image"` column needs no declaration: it is a
-/// feature of the dataset, so `policy_feature_split` already reports it as a visual
-/// input and the model is built with it.
-///
-/// Everything that is not a camera still comes from the dataset, so a config cannot
-/// contradict the data it is trained on about the width of a state or an action.
+/// Upstream's `make_policy` takes features from the dataset when starting fresh. This
+/// adds two deployment-compatible details: declared visual inputs survive when they
+/// are supplied by a caller, and a pretrained policy's existing input namespace is
+/// preserved instead of being mixed with dataset aliases.
 pub fn resolved_policy_features(
     config: &TrainConfig,
     metadata: &crate::data::meta::DatasetMetadata,
@@ -446,11 +489,43 @@ pub fn resolved_policy_features(
     IndexMap<String, rerobot_core::types::PolicyFeature>,
     IndexMap<String, rerobot_core::types::PolicyFeature>,
 ) {
-    let (mut inputs, outputs) = metadata.policy_feature_split();
-    if let Some(declared) = &config.policy.input_features {
-        for (key, feature) in declared {
-            if feature.r#type == rerobot_core::types::FeatureType::Visual {
-                inputs.insert(key.clone(), feature.clone());
+    resolved_policy_features_with_rename(config, metadata, &IndexMap::new())
+}
+
+/// Resolve policy features in the namespace that the saved processor exposes.
+fn resolved_policy_features_with_rename(
+    config: &TrainConfig,
+    metadata: &crate::data::meta::DatasetMetadata,
+    rename_map: &IndexMap<String, String>,
+) -> (
+    IndexMap<String, rerobot_core::types::PolicyFeature>,
+    IndexMap<String, rerobot_core::types::PolicyFeature>,
+) {
+    let (dataset_inputs, outputs) = metadata.policy_feature_split();
+    let has_pretrained_inputs = config.policy.pretrained_path.is_some()
+        && config
+            .policy
+            .input_features
+            .as_ref()
+            .is_some_and(|features| !features.is_empty());
+    let mut inputs = if has_pretrained_inputs {
+        // `make_policy` preserves a pretrained policy's input namespace. The
+        // processor's rename step is what makes the current dataset fit it.
+        config.policy.input_features.clone().unwrap_or_default()
+    } else {
+        rename_policy_features(dataset_inputs, rename_map)
+    };
+
+    // For a fresh run, declared visual inputs are caller-provided cameras and are
+    // intentionally added even when the dataset metadata cannot describe their
+    // storage. A pretrained policy already owns its complete input namespace, so
+    // adding current-dataset camera aliases there would create duplicate inputs.
+    if !has_pretrained_inputs {
+        if let Some(declared) = &config.policy.input_features {
+            for (key, feature) in declared {
+                if feature.r#type == rerobot_core::types::FeatureType::Visual {
+                    inputs.insert(key.clone(), feature.clone());
+                }
             }
         }
     }
@@ -685,7 +760,11 @@ fn write_checkpoint_contents(
     // resolved from the dataset -- not the one the user typed, which is what
     // `policy.config.save_pretrained` does upstream.
     let mut policy_config = config.policy.clone();
-    let (inputs, outputs) = resolved_policy_features(config, session.dataset.metadata());
+    let (inputs, outputs) = resolved_policy_features_with_rename(
+        config,
+        session.dataset.metadata(),
+        &session.rename_map,
+    );
     policy_config.input_features = Some(inputs);
     policy_config.output_features = Some(outputs);
     std::fs::write(
@@ -703,11 +782,12 @@ fn write_checkpoint_contents(
     // `train_utils.save_checkpoint` passes both processors, so their four artifacts
     // are part of the layout. They carry the dataset statistics the weights were
     // trained against, which nothing else in the checkpoint records.
-    crate::processor::write_processor_artifacts_with_cameras(
+    crate::processor::write_processor_artifacts_with_cameras_and_rename(
         &pretrained,
         &policy_config,
-        &session.dataset.metadata().stats,
+        session.processor_stats(),
         session.camera_normalizations(),
+        &session.rename_map,
     )?;
 
     checkpoint::write_json(
@@ -731,7 +811,7 @@ fn write_checkpoint_contents(
 
 #[cfg(test)]
 mod tests {
-    use super::write_staged_directory;
+    use super::{rename_policy_features, write_staged_directory};
     use crate::error::TrainError;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -746,6 +826,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn saved_observation_rename_maps_are_applied_before_policy_feature_inference() {
+        use indexmap::IndexMap;
+        use rerobot_core::types::{FeatureType, PolicyFeature};
+
+        let features = IndexMap::from([
+            (
+                "observation.state".to_owned(),
+                PolicyFeature::new(FeatureType::State, [2]),
+            ),
+            (
+                "observation.images.left".to_owned(),
+                PolicyFeature::new(FeatureType::Visual, [3, 32, 32]),
+            ),
+        ]);
+        let rename_map = IndexMap::from([(
+            "observation.images.left".to_owned(),
+            "observation.images.top".to_owned(),
+        )]);
+
+        let renamed = rename_policy_features(features, &rename_map);
+
+        assert!(renamed.contains_key("observation.state"));
+        assert!(!renamed.contains_key("observation.images.left"));
+        assert_eq!(
+            renamed
+                .get("observation.images.top")
+                .expect("the renamed camera is retained")
+                .shape,
+            vec![3.into(), 32.into(), 32.into()]
+        );
     }
 
     #[test]

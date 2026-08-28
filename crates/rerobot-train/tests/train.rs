@@ -230,6 +230,56 @@ fn resuming_uses_checkpoint_processor_statistics_not_dataset_statistics() {
 }
 
 #[test]
+fn resume_reconstructs_the_policy_feature_namespace_from_policy_config() {
+    let (_source_dir, source_outcome, _) = train_once("resume-policy-config");
+    let checkpoint = source_outcome
+        .checkpoints
+        .first()
+        .expect("the source run writes a checkpoint");
+    let train_config =
+        TrainConfig::from_checkpoint_dir(checkpoint).expect("the train config reconstructs");
+    let policy_path = checkpoint.join("pretrained_model/config.json");
+    let policy_text = std::fs::read_to_string(&policy_path).expect("the policy config exists");
+    let policy = rerobot_core::policy::act::ActConfig::from_checkpoint_json(&policy_text)
+        .expect("the policy config parses");
+
+    assert_eq!(train_config.policy.input_features, policy.input_features);
+    assert_eq!(train_config.policy.output_features, policy.output_features);
+    assert!(
+        train_config
+            .policy
+            .input_features
+            .as_ref()
+            .is_some_and(|features| !features.is_empty()),
+        "resume must not discard the model's resolved input namespace"
+    );
+}
+
+#[test]
+fn oversized_policy_config_is_rejected_before_unbounded_checkpoint_read() {
+    let (_source_dir, source_outcome, _) = train_once("oversized-resume-policy-config");
+    let checkpoint = source_outcome
+        .checkpoints
+        .first()
+        .expect("the source run writes a checkpoint");
+    let policy_path = checkpoint.join("pretrained_model/config.json");
+    let oversized = vec![b' '; rerobot_train::limits::MAX_CHECKPOINT_JSON_BYTES as usize + 1];
+    std::fs::write(&policy_path, oversized).expect("the fixture policy config is replaceable");
+
+    let error = TrainConfig::from_checkpoint_dir(checkpoint)
+        .expect_err("a policy config beyond the checkpoint budget must be refused");
+
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "{}: config.json exceeds the {}-byte limit",
+            policy_path.display(),
+            rerobot_train::limits::MAX_CHECKPOINT_JSON_BYTES
+        )
+    );
+}
+
+#[test]
 fn the_step_moves_the_weights_rather_than_merely_running() {
     let (_dir, outcome, _) = train_once("weights-move");
     let step = &outcome.steps[0];

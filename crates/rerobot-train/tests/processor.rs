@@ -25,11 +25,13 @@ use candle_core::{Device, Tensor};
 use common::{embedded_image_fixture, fixture_dataset, reduced_config, TempDir};
 use indexmap::IndexMap;
 use rerobot_core::dataset::json::{loads, JsonLike};
+use rerobot_core::types::NormalizationMode;
 use rerobot_train::data::batch::Batch;
 use rerobot_train::data::image::CameraNormalization;
 use rerobot_train::processor::{
     rename_observation_batch, write_processor_artifacts, write_processor_artifacts_with_cameras,
-    LoadedPolicyProcessors, POLICY_POSTPROCESSOR_NAME, POLICY_PREPROCESSOR_NAME,
+    write_processor_artifacts_with_cameras_and_rename, LoadedPolicyProcessors,
+    POLICY_POSTPROCESSOR_NAME, POLICY_PREPROCESSOR_NAME,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -104,6 +106,176 @@ fn all_four_upstream_artifacts_are_written_under_their_upstream_names() {
     assert_eq!(found, expected);
     assert_eq!(POLICY_PREPROCESSOR_NAME, "policy_preprocessor");
     assert_eq!(POLICY_POSTPROCESSOR_NAME, "policy_postprocessor");
+}
+
+#[test]
+fn saved_rename_map_can_be_read_before_feature_resolution() {
+    let (_dir, target) = written("rename-map-read");
+    let path = target.join("policy_preprocessor.json");
+    let original = std::fs::read_to_string(&path).unwrap();
+    let changed = original.replace(
+        "\"rename_map\": {}",
+        "\"rename_map\": {\"observation.images.left\": \"observation.images.top\"}",
+    );
+    assert_ne!(
+        changed, original,
+        "the fixture must contain an empty rename map"
+    );
+    std::fs::write(&path, changed).unwrap();
+
+    let rename_map = LoadedPolicyProcessors::load_rename_map(&target).unwrap();
+
+    assert_eq!(
+        rename_map
+            .get("observation.images.left")
+            .map(String::as_str),
+        Some("observation.images.top")
+    );
+}
+
+#[test]
+fn written_processor_artifacts_retain_a_saved_rename_map() {
+    let dir = TempDir::new("rename-map-write");
+    let target = dir.child("pretrained_model");
+    let metadata = rerobot_train::data::meta::DatasetMetadata::load(&fixture_dataset()).unwrap();
+    let mut config = reduced_config(fixture_dataset(), dir.child("out"));
+    let (inputs, outputs) = metadata.policy_feature_split();
+    config.policy.input_features = Some(inputs);
+    config.policy.output_features = Some(outputs);
+    let rename_map = IndexMap::from([(
+        "observation.images.left".to_owned(),
+        "observation.images.top".to_owned(),
+    )]);
+
+    write_processor_artifacts_with_cameras_and_rename(
+        &target,
+        &config.policy,
+        &metadata.stats,
+        &IndexMap::new(),
+        &rename_map,
+    )
+    .unwrap();
+
+    let loaded =
+        rerobot_train::processor::LoadedPolicyProcessors::load_rename_map(&target).unwrap();
+    assert_eq!(
+        loaded.get("observation.images.left").map(String::as_str),
+        Some("observation.images.top")
+    );
+}
+
+#[test]
+fn loading_renamed_processor_state_uses_the_destination_feature_key() {
+    let dir = TempDir::new("rename-state-load");
+    let target = dir.child("pretrained_model");
+    let metadata = rerobot_train::data::meta::DatasetMetadata::load(&fixture_dataset()).unwrap();
+    let mut config = reduced_config(fixture_dataset(), dir.child("out"));
+    let (mut inputs, outputs) = metadata.policy_feature_split();
+    let state = inputs.shift_remove("observation.state").unwrap();
+    inputs.insert("observation.robot_state".to_owned(), state);
+    config.policy.input_features = Some(inputs);
+    config.policy.output_features = Some(outputs);
+    config
+        .policy
+        .normalization_mapping
+        .insert("STATE".to_owned(), NormalizationMode::MeanStd);
+    let rename_map = IndexMap::from([(
+        "observation.state".to_owned(),
+        "observation.robot_state".to_owned(),
+    )]);
+
+    write_processor_artifacts_with_cameras_and_rename(
+        &target,
+        &config.policy,
+        &metadata.stats,
+        &IndexMap::new(),
+        &rename_map,
+    )
+    .unwrap();
+
+    let loaded = LoadedPolicyProcessors::load(&target, &config.policy).unwrap();
+    assert_eq!(
+        loaded.normalizer().mode("observation.robot_state"),
+        Some(NormalizationMode::MeanStd)
+    );
+}
+
+#[test]
+fn loading_renamed_camera_state_uses_the_destination_feature_key() {
+    let dir = TempDir::new("rename-camera-load");
+    let target = dir.child("pretrained_model");
+    let metadata =
+        rerobot_train::data::meta::DatasetMetadata::load(&embedded_image_fixture()).unwrap();
+    let mut config = reduced_config(embedded_image_fixture(), dir.child("out"));
+    let (mut inputs, outputs) = metadata.policy_feature_split();
+    let camera = inputs.shift_remove("observation.images.top").unwrap();
+    inputs.insert("observation.images.left".to_owned(), camera);
+    config.policy.input_features = Some(inputs);
+    config.policy.output_features = Some(outputs);
+    let rename_map = IndexMap::from([(
+        "observation.images.top".to_owned(),
+        "observation.images.left".to_owned(),
+    )]);
+    let mut cameras = IndexMap::new();
+    cameras.insert(
+        "observation.images.top".to_owned(),
+        CameraNormalization::new(vec![0.25, 0.5, 0.75], vec![0.1, 0.2, 0.3]).unwrap(),
+    );
+
+    write_processor_artifacts_with_cameras_and_rename(
+        &target,
+        &config.policy,
+        &metadata.stats,
+        &cameras,
+        &rename_map,
+    )
+    .unwrap();
+
+    let loaded = LoadedPolicyProcessors::load(&target, &config.policy).unwrap();
+    assert_eq!(
+        loaded
+            .camera_normalizations()
+            .get("observation.images.left")
+            .expect("the renamed camera receives its saved statistics")
+            .mean(),
+        &[0.25, 0.5, 0.75]
+    );
+}
+
+#[test]
+fn camera_normalization_is_selected_after_one_observation_rename() {
+    let images = IndexMap::from([(
+        "observation.images.left".to_owned(),
+        Tensor::zeros((1, 3, 2, 2), candle_core::DType::F32, &Device::Cpu).unwrap(),
+    )]);
+    let normalizations = IndexMap::from([(
+        "observation.images.top".to_owned(),
+        CameraNormalization::new(vec![0.25, 0.5, 0.75], vec![0.1, 0.2, 0.3]).unwrap(),
+    )]);
+    let rename_map = IndexMap::from([
+        (
+            "observation.images.left".to_owned(),
+            "observation.images.top".to_owned(),
+        ),
+        (
+            "observation.images.top".to_owned(),
+            "observation.images.wrist".to_owned(),
+        ),
+    ]);
+
+    let selected = rerobot_train::processor::camera_normalizations_for_input_images(
+        &images,
+        &normalizations,
+        &rename_map,
+    );
+
+    assert_eq!(
+        selected
+            .get("observation.images.left")
+            .expect("the raw camera receives the target camera statistics")
+            .mean(),
+        &[0.25, 0.5, 0.75]
+    );
 }
 
 #[test]

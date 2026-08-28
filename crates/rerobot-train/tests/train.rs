@@ -262,7 +262,7 @@ fn oversized_policy_config_is_rejected_before_unbounded_checkpoint_read() {
         .checkpoints
         .first()
         .expect("the source run writes a checkpoint");
-    let policy_path = checkpoint.join("pretrained_model/config.json");
+    let policy_path = checkpoint.join("pretrained_model").join("config.json");
     let oversized = vec![b' '; rerobot_train::limits::MAX_CHECKPOINT_JSON_BYTES as usize + 1];
     std::fs::write(&policy_path, oversized).expect("the fixture policy config is replaceable");
 

@@ -1568,3 +1568,22 @@ parsing:
 cargo test -p rerobot-train --test train oversized_policy_config_is_rejected_before_unbounded_checkpoint_read --locked -- --exact
 1 passed; 0 failed
 ```
+
+## Cycle 26 — platform-native checkpoint test paths
+
+The first CI run of commit `34da4bb` passed the macOS and Ubuntu gates but failed
+Windows in the new oversized-policy-config regression. The implementation was
+correct; the test expected a path built with a literal `/`, while the reader built
+it from platform-native components.
+
+**RED** — Windows CI reported:
+
+```
+left:  "...\\pretrained_model\\config.json: config.json exceeds the 16777216-byte limit"
+right: "...\\pretrained_model/config.json: config.json exceeds the 16777216-byte limit"
+test result: FAILED. 45 passed; 1 failed
+```
+
+**GREEN** — the test now uses `.join("pretrained_model").join("config.json")`,
+matching the production path construction. The Windows failure was isolated to
+that regression before any further implementation change.

@@ -1587,3 +1587,37 @@ test result: FAILED. 45 passed; 1 failed
 **GREEN** — the test now uses `.join("pretrained_model").join("config.json")`,
 matching the production path construction. The Windows failure was isolated to
 that regression before any further implementation change.
+
+## Cycle 27 — explicit pretrained observation rename maps
+
+The pinned upstream `TrainPipelineConfig.rename_map` is a user-supplied ordered
+mapping applied when a pretrained policy is constructed. The native CLI and
+checkpoint loader must preserve its string-only JSON domain, insertion order,
+one-pass rename semantics, and override behavior without applying it to fresh
+initialization.
+
+**RED** — the new processor test was replayed in a temporary worktree at the
+pre-slice commit `f5116be`, with the test-only diff applied and no production
+changes. The intended API was absent:
+
+```
+RED_EXIT=101
+error[E0599]: no associated function or constant named `load_with_rename_map`
+found for struct `LoadedPolicyProcessors` in the current scope
+error: could not compile `rerobot-train` (test "processor") due to 1 previous error
+```
+
+**GREEN** — `TrainConfig` now carries the ordered map through native
+`train_config.json`, the CLI parses and rejects wrong JSON value types, and
+pretrained construction uses the explicit map to select the policy namespace and
+processor statistics. The saved map remains the default when no override is
+given; fresh runs refuse a non-empty map, matching upstream validation.
+
+```
+cargo test -p rerobot-train --test processor an_explicit_rename_map_overrides_the_saved_processor_mapping --locked -- --exact
+1 passed; 0 failed
+cargo test -p rerobot-train --test train a_saved_train_config_round_trips_the_ordered_rename_map --locked -- --exact
+1 passed; 0 failed
+cargo test -p rerobot-cli --test train_cli a_pretrained_policy_applies_the_cli_rename_map_during_training --locked -- --exact
+1 passed; 0 failed
+```

@@ -73,6 +73,27 @@ impl LoadedPolicyProcessors {
     /// This matters when a policy is deployed against another dataset whose
     /// statistics describe a different collection run.
     pub fn load(checkpoint_dir: &Path, policy: &ActConfig) -> Result<Self> {
+        Self::load_internal(checkpoint_dir, policy, None)
+    }
+
+    /// Load processor artifacts while replacing their saved observation rename map.
+    ///
+    /// Training passes the user-facing `rename_map` here when a pretrained policy
+    /// is configured with an explicit mapping. The saved JSON is still validated;
+    /// only the mapping applied to statistics and runtime batches is overridden.
+    pub fn load_with_rename_map(
+        checkpoint_dir: &Path,
+        policy: &ActConfig,
+        rename_map: &IndexMap<String, String>,
+    ) -> Result<Self> {
+        Self::load_internal(checkpoint_dir, policy, Some(rename_map))
+    }
+
+    fn load_internal(
+        checkpoint_dir: &Path,
+        policy: &ActConfig,
+        rename_map_override: Option<&IndexMap<String, String>>,
+    ) -> Result<Self> {
         let preprocessor_path = checkpoint_dir.join(POLICY_PREPROCESSOR_NAME.to_owned() + ".json");
         let postprocessor_path =
             checkpoint_dir.join(POLICY_POSTPROCESSOR_NAME.to_owned() + ".json");
@@ -95,7 +116,8 @@ impl LoadedPolicyProcessors {
             &["unnormalizer_processor", "device_processor"],
             Some("policy_postprocessor_step_0_unnormalizer_processor.safetensors"),
         )?;
-        let rename_map = rename_map_from_pipeline(&preprocessor)?;
+        let saved_rename_map = rename_map_from_pipeline(&preprocessor)?;
+        let rename_map = rename_map_override.unwrap_or(&saved_rename_map);
 
         let preprocessor_state_path =
             checkpoint_dir.join("policy_preprocessor_step_3_normalizer_processor.safetensors");
@@ -120,7 +142,7 @@ impl LoadedPolicyProcessors {
         // exposes the destination namespace to the normalizer. Apply the same
         // one-pass mapping to the grouped statistics before resolving either
         // scalar or camera features.
-        let stats = rename_stats(&stats, &rename_map);
+        let stats = rename_stats(&stats, rename_map);
 
         let mut features = policy.input_features.clone().unwrap_or_default();
         features.extend(policy.output_features.clone().unwrap_or_default());
@@ -134,7 +156,7 @@ impl LoadedPolicyProcessors {
         Ok(Self {
             normalizer,
             camera_normalizations,
-            rename_map,
+            rename_map: (*rename_map).clone(),
             stats,
         })
     }

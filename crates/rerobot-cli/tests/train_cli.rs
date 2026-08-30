@@ -238,6 +238,82 @@ fn a_pretrained_policy_path_loads_and_trains_without_redeclaring_act_shape() {
 }
 
 #[test]
+fn a_pretrained_policy_applies_the_cli_rename_map_during_training() {
+    let dir = TempDir::new("pretrained-rename-e2e");
+    let source_output = dir.child("source");
+    let source = run(&slice_args(&source_output, &[]));
+    assert!(
+        source.status.success(),
+        "source run stderr: {}",
+        stderr_of(&source)
+    );
+    let source_policy = source_output.join("checkpoints/000001/pretrained_model");
+
+    let target_output = dir.child("target");
+    let args = vec![
+        "--dataset.repo_id=rerobot/state_only_slice".to_owned(),
+        format!("--dataset.root={}", fixture_dataset().display()),
+        format!("--output_dir={}", target_output.display()),
+        format!("--policy.path={}", source_policy.display()),
+        "--rename_map={\"observation.state\":\"observation.state\"}".to_owned(),
+        "--steps=1".to_owned(),
+        "--batch_size=2".to_owned(),
+    ];
+    let result = run(&args);
+    let stdout = stdout_of(&result);
+    let stderr = stderr_of(&result);
+    assert!(
+        result.status.success(),
+        "renamed pretrained run exited {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        result.status.code()
+    );
+    let preprocessor = std::fs::read_to_string(
+        target_output.join("checkpoints/000001/pretrained_model/policy_preprocessor.json"),
+    )
+    .unwrap();
+    assert!(
+        preprocessor.contains("\"observation.state\": \"observation.state\""),
+        "the CLI mapping was not carried into the processor: {preprocessor}"
+    );
+}
+
+#[test]
+fn a_pretrained_policy_accepts_the_top_level_json_rename_map() {
+    let args = vec![
+        "--dataset.repo_id=rerobot/state_only_slice".to_owned(),
+        format!("--dataset.root={}", fixture_dataset().display()),
+        "--output_dir=/tmp/rerobot-rename-map-test".to_owned(),
+        "--policy.type=act".to_owned(),
+        "--rename_map={\"observation.state\":\"observation.robot_state\"}".to_owned(),
+    ];
+
+    let config = rerobot_cli::train::parse(&args).expect("the JSON mapping is a valid CLI value");
+    assert_eq!(
+        config.rename_map.get("observation.state"),
+        Some(&"observation.robot_state".to_owned())
+    );
+}
+
+#[test]
+fn rename_map_rejects_non_string_json_values_instead_of_defaulting() {
+    let args = vec![
+        "--dataset.repo_id=rerobot/state_only_slice".to_owned(),
+        format!("--dataset.root={}", fixture_dataset().display()),
+        "--output_dir=/tmp/rerobot-rename-map-invalid-test".to_owned(),
+        "--policy.type=act".to_owned(),
+        "--rename_map={\"observation.state\":null}".to_owned(),
+    ];
+
+    let error = rerobot_cli::train::parse(&args).expect_err("null must not become a string");
+    assert!(
+        error
+            .to_string()
+            .contains("rename_map entry \"observation.state\" must be a string"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn a_hub_style_pretrained_policy_path_is_refused_without_download() {
     let dir = TempDir::new("hub-pretrained");
     let result = run(&slice_args(

@@ -1081,6 +1081,41 @@ fn the_saved_train_config_carries_upstreams_full_field_set() {
 }
 
 #[test]
+fn a_saved_train_config_round_trips_the_ordered_rename_map() {
+    let dir = TempDir::new("rename-map-config");
+    let mut config = reduced_config(fixture_dataset(), dir.child("out"));
+    config.rename_map.insert(
+        "observation.state".to_owned(),
+        "observation.robot_state".to_owned(),
+    );
+    config.rename_map.insert(
+        "observation.image".to_owned(),
+        "observation.camera".to_owned(),
+    );
+
+    let document = loads(&config.to_json_text()).unwrap();
+    let JsonLike::Object(root) = document else {
+        panic!("train_config.json should be an object");
+    };
+    let JsonLike::Object(rename_map) = &root["rename_map"] else {
+        panic!("rename_map should be an object");
+    };
+    assert_eq!(
+        rename_map.keys().collect::<Vec<_>>(),
+        vec!["observation.state", "observation.image"]
+    );
+    assert_eq!(
+        rename_map["observation.state"],
+        JsonLike::Str("observation.robot_state".to_owned())
+    );
+
+    let path = dir.child("train_config.json");
+    std::fs::write(&path, config.to_json_text()).unwrap();
+    let loaded = TrainConfig::from_config_file(&path).unwrap();
+    assert_eq!(loaded.rename_map, config.rename_map);
+}
+
+#[test]
 fn the_saved_weights_reload_into_a_model_that_predicts_identically() {
     // This is the round trip that matters: the file a run wrote is the file a run
     // can resume from.

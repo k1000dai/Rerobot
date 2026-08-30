@@ -165,10 +165,15 @@ impl TrainSession {
         // policy sees them. Read that small structural part first: feature inference
         // must happen in the model's namespace, while the complete processor load
         // below still validates all saved state before construction continues.
-        let rename_map = if let Some(pretrained_path) = &config.policy.pretrained_path {
+        let saved_rename_map = if let Some(pretrained_path) = &config.policy.pretrained_path {
             crate::processor::LoadedPolicyProcessors::load_rename_map(Path::new(pretrained_path))?
         } else {
             IndexMap::new()
+        };
+        let rename_map = if config.rename_map.is_empty() {
+            saved_rename_map
+        } else {
+            config.rename_map.clone()
         };
 
         // `make_policy`: the dataset's features become the policy's, split by
@@ -200,9 +205,10 @@ impl TrainSession {
             .collect();
         let (normalizer, camera_normalizations, processor_stats) =
             if let Some(pretrained_path) = &policy_config.pretrained_path {
-                let processors = crate::processor::LoadedPolicyProcessors::load(
+                let processors = crate::processor::LoadedPolicyProcessors::load_with_rename_map(
                     Path::new(pretrained_path),
                     &policy_config,
+                    &rename_map,
                 )?;
                 (
                     processors.normalizer().clone(),

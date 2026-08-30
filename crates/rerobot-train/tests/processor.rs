@@ -201,6 +201,48 @@ fn loading_renamed_processor_state_uses_the_destination_feature_key() {
 }
 
 #[test]
+fn an_explicit_rename_map_overrides_the_saved_processor_mapping() {
+    let dir = TempDir::new("rename-map-override");
+    let target = dir.child("pretrained_model");
+    let metadata = rerobot_train::data::meta::DatasetMetadata::load(&fixture_dataset()).unwrap();
+    let mut config = reduced_config(fixture_dataset(), dir.child("out"));
+    let (mut inputs, outputs) = metadata.policy_feature_split();
+    let state = inputs.shift_remove("observation.state").unwrap();
+    inputs.insert("observation.controller_state".to_owned(), state);
+    config.policy.input_features = Some(inputs);
+    config.policy.output_features = Some(outputs);
+    config
+        .policy
+        .normalization_mapping
+        .insert("STATE".to_owned(), NormalizationMode::MeanStd);
+    let saved_map = IndexMap::from([(
+        "observation.state".to_owned(),
+        "observation.robot_state".to_owned(),
+    )]);
+    let override_map = IndexMap::from([(
+        "observation.state".to_owned(),
+        "observation.controller_state".to_owned(),
+    )]);
+    write_processor_artifacts_with_cameras_and_rename(
+        &target,
+        &config.policy,
+        &metadata.stats,
+        &IndexMap::new(),
+        &saved_map,
+    )
+    .unwrap();
+
+    let loaded =
+        LoadedPolicyProcessors::load_with_rename_map(&target, &config.policy, &override_map)
+            .expect("the explicit map should replace the saved map");
+    assert_eq!(loaded.rename_map(), &override_map);
+    assert_eq!(
+        loaded.normalizer().mode("observation.controller_state"),
+        Some(NormalizationMode::MeanStd)
+    );
+}
+
+#[test]
 fn loading_renamed_camera_state_uses_the_destination_feature_key() {
     let dir = TempDir::new("rename-camera-load");
     let target = dir.child("pretrained_model");

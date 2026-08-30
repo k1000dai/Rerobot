@@ -24,6 +24,7 @@ use rerobot_core::policy::act::ActConfig;
 use rerobot_core::types::NormalizationMode;
 use rerobot_core::BigInt;
 use rerobot_train::config::TrainConfig;
+use rerobot_train::indexmap::IndexMap;
 use std::io::Read;
 use std::path::PathBuf;
 
@@ -114,7 +115,6 @@ pub static UNSUPPORTED_ARGUMENTS: &[(&str, &str)] = &[
     ("job.target", "Hugging Face Jobs dispatch is not ported"),
     ("save_checkpoint_to_hub", "there is no Hub client in this slice"),
     ("sample_weighting", "per-sample loss weighting is not ported"),
-    ("rename_map", "the rename map only applies to a pretrained checkpoint, which cannot be loaded here"),
     ("scheduler", "learning-rate schedulers need the Draccus scheduler registry, which is not ported"),
     ("optimizer", "a hand-specified optimizer needs the Draccus optimizer registry; the ACT preset is used instead"),
     ("dataset.streaming", "the streaming dataset needs the Hub client"),
@@ -372,6 +372,7 @@ pub fn parse(args: &[String]) -> Result<TrainConfig, ArgumentError> {
     let mut num_workers: Option<u32> = None;
     let mut use_preset: Option<bool> = None;
     let mut use_imagenet_stats: Option<bool> = None;
+    let mut rename_map: Option<IndexMap<String, String>> = None;
 
     for (flag, raw) in &flags {
         let value = Value::parse(raw);
@@ -380,6 +381,7 @@ pub fn parse(args: &[String]) -> Result<TrainConfig, ArgumentError> {
             "dataset.root" => root = Some(PathBuf::from(value.as_string(flag)?)),
             "dataset.episodes" => episodes = Some(value.as_int_list(flag)?),
             "dataset.use_imagenet_stats" => use_imagenet_stats = Some(value.as_bool(flag)?),
+            "rename_map" => rename_map = Some(parse_rename_map(flag, raw)?),
             "output_dir" => output_dir = Some(PathBuf::from(value.as_string(flag)?)),
             "config_path" => config_path = Some(PathBuf::from(value.as_string(flag)?)),
             "resume" => resume = Some(value.as_bool(flag)?),
@@ -559,6 +561,9 @@ pub fn parse(args: &[String]) -> Result<TrainConfig, ArgumentError> {
         if let Some(value) = use_imagenet_stats {
             config.dataset_use_imagenet_stats = value;
         }
+        if let Some(value) = &rename_map {
+            config.rename_map = value.clone();
+        }
         config.resume = true;
         config.checkpoint_path = Some(checkpoint_dir);
         return Ok(config);
@@ -623,6 +628,9 @@ pub fn parse(args: &[String]) -> Result<TrainConfig, ArgumentError> {
         }
         if let Some(value) = use_imagenet_stats {
             config.dataset_use_imagenet_stats = value;
+        }
+        if let Some(value) = &rename_map {
+            config.rename_map = value.clone();
         }
         config.resume = false;
         config.checkpoint_path = None;
@@ -695,6 +703,9 @@ pub fn parse(args: &[String]) -> Result<TrainConfig, ArgumentError> {
     }
     if let Some(value) = use_imagenet_stats {
         config.dataset_use_imagenet_stats = value;
+    }
+    if let Some(value) = rename_map {
+        config.rename_map = value;
     }
     Ok(config)
 }
@@ -891,6 +902,31 @@ fn apply_policy_flag(
     Ok(())
 }
 
+fn parse_rename_map(flag: &str, raw: &str) -> Result<IndexMap<String, String>, ArgumentError> {
+    let document =
+        rerobot_core::dataset::json::loads(raw).map_err(|error| ArgumentError::Value {
+            flag: flag.to_owned(),
+            reason: format!("expected a JSON object mapping strings to strings: {error}"),
+        })?;
+    let rerobot_core::dataset::json::JsonLike::Object(entries) = document else {
+        return Err(ArgumentError::Value {
+            flag: flag.to_owned(),
+            reason: "expected a JSON object mapping strings to strings".to_owned(),
+        });
+    };
+    let mut rename_map = IndexMap::with_capacity(entries.len());
+    for (source, target) in entries {
+        let rerobot_core::dataset::json::JsonLike::Str(target) = target else {
+            return Err(ArgumentError::Value {
+                flag: flag.to_owned(),
+                reason: format!("rename_map entry {source:?} must be a string"),
+            });
+        };
+        rename_map.insert(source, target);
+    }
+    Ok(rename_map)
+}
+
 fn optional_string(value: &Value, flag: &str) -> Result<Option<String>, ArgumentError> {
     match value {
         Value::Null => Ok(None),
@@ -953,6 +989,8 @@ pub fn help_section() -> String {
          \x20 --dataset.use_imagenet_stats=BOOL  per-channel camera statistics;\n\
          \x20                                    true (the default) uses IMAGENET_STATS,\n\
          \x20                                    false leaves camera frames untouched\n\
+         \x20 --rename_map='{\"dataset.key\":\"policy.key\"}'\n\
+         \x20                              one-pass observation-key mapping for a pretrained policy\n\
          \n\
          Policy (ACTConfig fields):\n\
          \x20 --policy.chunk_size --policy.n_action_steps --policy.dim_model\n\

@@ -13,6 +13,7 @@
 //! writer cannot drift.
 
 use crate::error::{Result, TrainError};
+use indexmap::IndexMap;
 use rerobot_core::dataset::json::{dumps_pretty_ascii, JsonLike, JsonObject};
 use rerobot_core::policy::act::{ActConfig, AdamWConfig};
 use rerobot_core::BigInt;
@@ -49,6 +50,8 @@ pub struct TrainConfig {
     pub dataset_use_imagenet_stats: bool,
     /// The ACT policy configuration.
     pub policy: ActConfig,
+    /// Upstream's observation feature rename map, from dataset key to policy key.
+    pub rename_map: IndexMap<String, String>,
     /// `output_dir`.
     pub output_dir: PathBuf,
     /// Whether this run restores a previously saved local checkpoint.
@@ -95,6 +98,7 @@ impl TrainConfig {
             dataset_episodes: None,
             dataset_use_imagenet_stats: DEFAULT_USE_IMAGENET_STATS,
             policy,
+            rename_map: IndexMap::new(),
             output_dir,
             resume: false,
             checkpoint_path: None,
@@ -193,6 +197,11 @@ impl TrainConfig {
                 "policy.push_to_hub is set; this slice has no Hub client. Pass \
                  --policy.push_to_hub=false to train locally."
                     .to_owned(),
+            ));
+        }
+        if !self.rename_map.is_empty() && self.policy.pretrained_path.is_none() {
+            return Err(TrainError::unsupported(
+                "rename_map requires a pretrained policy checkpoint; fresh initialization derives feature names from the current dataset".to_owned(),
             ));
         }
         if let Some(episodes) = &self.dataset_episodes {
@@ -433,7 +442,6 @@ impl TrainConfig {
             "job",
             "save_checkpoint_to_hub",
             "sample_weighting",
-            "rename_map",
         ]
     }
 
@@ -492,7 +500,7 @@ impl TrainConfig {
         root.insert("job".into(), job_json());
         root.insert("save_checkpoint_to_hub".into(), JsonLike::Bool(false));
         root.insert("sample_weighting".into(), JsonLike::Null);
-        root.insert("rename_map".into(), JsonLike::Object(JsonObject::new()));
+        root.insert("rename_map".into(), string_map_json(&self.rename_map));
         JsonLike::Object(root)
     }
 
@@ -566,6 +574,7 @@ impl TrainConfig {
         )?;
         let mut policy = ActConfig::from_checkpoint_value(value_field(root, "policy", path)?)
             .map_err(|error| TrainError::checkpoint(path, error.to_string()))?;
+        let rename_map = string_map_field(root, "rename_map", path)?;
         if let Some(checkpoint_dir) = checkpoint_dir {
             let policy_config_path = checkpoint_dir
                 .join(crate::checkpoint::PRETRAINED_MODEL_DIR)
@@ -603,6 +612,7 @@ impl TrainConfig {
         config.dataset_episodes = dataset_episodes;
         config.dataset_use_imagenet_stats = dataset_use_imagenet_stats;
         config.policy = policy;
+        config.rename_map = rename_map;
         config.resume = checkpoint_dir.is_some();
         config.checkpoint_path = checkpoint_dir.map(Path::to_owned);
         config.job_name = optional_string_field(root, "job_name", path)?;
@@ -740,9 +750,45 @@ fn int(value: u64) -> JsonLike {
     JsonLike::Int(num_bigint::BigInt::from(value))
 }
 
-/// A path in the POSIX spelling `pathlib.PurePosixPath` would produce, so that a
-/// `train_config.json` written on Windows names the same path as one written on
-/// Linux.
+/// Encode a string mapping as an ordered JSON object, preserving insertion order.
+fn string_map_json(values: &IndexMap<String, String>) -> JsonLike {
+    let mut object = JsonObject::with_capacity(values.len());
+    for (source, target) in values {
+        object.insert(source.clone(), JsonLike::Str(target.clone()));
+    }
+    JsonLike::Object(object)
+}
+
+fn string_map_field(
+    root: &JsonObject,
+    name: &str,
+    path: &Path,
+) -> Result<IndexMap<String, String>> {
+    let Some(value) = root.get(name) else {
+        return Ok(IndexMap::new());
+    };
+    let JsonLike::Object(entries) = value else {
+        return Err(TrainError::checkpoint(
+            path,
+            format!("{name} is {}, not an object", value.type_name()),
+        ));
+    };
+    let mut result = IndexMap::with_capacity(entries.len());
+    for (source, target) in entries {
+        let JsonLike::Str(target) = target else {
+            return Err(TrainError::checkpoint(
+                path,
+                format!(
+                    "{name} entry {source:?} is {}, not a string",
+                    target.type_name()
+                ),
+            ));
+        };
+        result.insert(source.clone(), target.clone());
+    }
+    Ok(result)
+}
+
 fn object_field<'a>(root: &'a JsonObject, name: &str, path: &Path) -> Result<&'a JsonObject> {
     match root.get(name) {
         Some(JsonLike::Object(value)) => Ok(value),

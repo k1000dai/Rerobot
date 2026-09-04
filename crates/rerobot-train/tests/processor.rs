@@ -472,6 +472,49 @@ fn observation_rename_leaves_the_action_feature_untouched() {
 }
 
 #[test]
+fn observation_rename_renames_temporal_padding_metadata_suffixes_with_the_feature() {
+    let features = IndexMap::from([
+        (
+            "observation.state".to_owned(),
+            Tensor::new(vec![1.0_f32], &Device::Cpu).expect("the state builds"),
+        ),
+        (
+            "observation.state_is_pad".to_owned(),
+            Tensor::new(vec![0.0_f32], &Device::Cpu).expect("the padding flag builds"),
+        ),
+        (
+            "observation.state_padding_mask".to_owned(),
+            Tensor::new(vec![1.0_f32], &Device::Cpu).expect("the padding mask builds"),
+        ),
+    ]);
+    let raw = Batch {
+        features,
+        images: IndexMap::new(),
+        padding: IndexMap::new(),
+        tasks: vec![String::new()],
+        indices: vec![0],
+    };
+    let rename_map = IndexMap::from([(
+        "observation.state".to_owned(),
+        "observation.robot_state".to_owned(),
+    )]);
+
+    let renamed = rename_observation_batch(&raw, &rename_map);
+
+    assert!(renamed.features.contains_key("observation.robot_state"));
+    assert!(renamed
+        .features
+        .contains_key("observation.robot_state_is_pad"));
+    assert!(renamed
+        .features
+        .contains_key("observation.robot_state_padding_mask"));
+    assert!(!renamed.features.contains_key("observation.state_is_pad"));
+    assert!(!renamed
+        .features
+        .contains_key("observation.state_padding_mask"));
+}
+
+#[test]
 fn malformed_saved_rename_map_is_rejected_before_deployment() {
     let (_dir, target) = written("processor-malformed-rename");
     let config_path = target.join("policy_preprocessor.json");

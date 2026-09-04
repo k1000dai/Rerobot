@@ -1621,3 +1621,164 @@ cargo test -p rerobot-train --test train a_saved_train_config_round_trips_the_or
 cargo test -p rerobot-cli --test train_cli a_pretrained_policy_applies_the_cli_rename_map_during_training --locked -- --exact
 1 passed; 0 failed
 ```
+
+## Cycle 28 — ordered native processor-pipeline reconstruction
+
+`DataProcessorPipeline.from_config` reconstructs saved `name`/`steps` entries,
+resolves a registered step before a dynamic class path, executes steps in order,
+transforms feature descriptions, and exposes the stateless `reset` lifecycle
+boundary. The native boundary intentionally limits
+this to the two stateless JSON steps already ported: rename observations and add
+a newline to task prompts. Unknown registry names, dynamic classes, state-bearing
+entries, wrong JSON types, and missing required fields fail explicitly rather than
+becoming no-op steps.
+
+**RED** — the test-only pipeline API was replayed in a detached worktree at the
+pre-slice commit `d96349e`, before adding the module declaration or implementation:
+
+```
+RED_EXIT=101
+error[E0432]: unresolved import `rerobot_core::processor::pipeline`
+ --> crates/rerobot-core/tests/processor_pipeline.rs:7:30
+  |
+7 | use rerobot_core::processor::pipeline::{
+  |                              ^^^^^^^^ could not find `pipeline` in `processor`
+error: could not compile `rerobot-core` (test "processor_pipeline") due to 1 previous error
+```
+
+The failure was at the intended missing module boundary. The focused test suite
+also covers a mixed-invalid config, confirming that an unknown registry name is
+reported before its malformed optional config rather than being silently decoded.
+
+**GREEN** — the native JSON pipeline now reconstructs both registered steps,
+processes ordered transitions, exposes the initial and intermediate states,
+transforms ordered feature maps, and round-trips its supported config shape.
+
+```
+cargo test -p rerobot-core --test processor_pipeline -- --nocapture
+10 passed; 0 failed
+```
+
+## Cycle 29 — upstream drift audit and suffix-metadata integration
+
+The pinned compatibility baseline remains
+`f37be3edbee60f3a09a5183788b91eb19f0c07d1` (LeRobot 0.6.1). The read-only
+upstream audit also fetched the current `main`, `3f2c29ef7e44b1ddccbcda3b6a63939e53639e9e`
+(`feat(rollout): bring your own strategy`, 2026-09-03). Current `main` adds
+`_is_pad`/`_padding_mask` suffix handling to `rename_processor.py` (fixed source:
+<https://github.com/huggingface/lerobot/blob/3f2c29ef7e44b1ddccbcda3b6a63939e53639e9e/src/lerobot/processor/rename_processor.py#L43-L60>).
+The pinned 0.6.1 source remains exact-key only, while the target adopts this
+small, isolated forward-compatible behavior in the processor and ACT batch
+adapter. Current main also adds processor artifact paths, Hub snapshot handling,
+and a broad storage-reader refactor; those remain outside this native JSON/local
+dataset boundary and have not been guessed into it.
+
+**RED** — the new current-main regression was run before adding the suffix rule:
+
+```
+cargo test -p rerobot-core --test rename_processor current_upstream_renames_temporal_padding_metadata_with_its_feature -- --exact
+RED_EXIT=101
+left: ["obs.state", "observation.state_is_pad", "observation.state_padding_mask"]
+right: ["obs.state", "obs.state_is_pad", "obs.state_padding_mask"]
+```
+
+**GREEN** — both runtime adapters now use the same one-pass suffix rule. Exact
+mappings still take precedence, collisions retain Python dict insertion semantics,
+and the pure feature-declaration path remains exact-key-only like upstream's
+separate `transform_features` implementation. Statistics remain exact-key-only
+because upstream's `rename_stats` helper does not apply the new observation-key
+suffix rule.
+
+```
+cargo test -p rerobot-core --test rename_processor current_upstream_renames_temporal_padding_metadata_with_its_feature -- --exact
+1 passed; 0 failed
+cargo test -p rerobot-core --test rename_processor transform_features_keeps_unmapped_padding_metadata_exact -- --exact
+1 passed; 0 failed
+cargo test -p rerobot-core --test rename_processor -- --test-threads=1
+26 passed; 0 failed
+cargo test -p rerobot-train --test processor -- --test-threads=1
+20 passed; 0 failed
+```
+
+## Cycle 30 — fail-fast interpolation allocation
+
+The existing arbitrary-precision `ActionInterpolator` correctly preserved a
+Python multiplier such as `2**60`, but its Rust adapter called
+`Vec::try_reserve(2**60)` before it could return the documented allocation error.
+On macOS that path did not reach the assertion within a bounded probe: a hostile
+control-rate multiplier could hang the process instead of being rejected.
+
+**RED** — the focused regression was run against the pre-fix implementation with
+a 12-second process-group timeout:
+
+```
+cargo test -p rerobot-core --test action_interpolator add_reports_a_multiplier_whose_buffer_cannot_be_allocated -- --exact --nocapture
+RED_TIMEOUT=12s: test did not reach its assertion because the 2**60 reservation path did not fail fast
+```
+
+**GREEN** — `ActionInterpolator::add` now refuses multipliers above the explicit
+`MAX_INTERPOLATION_STEPS = 1_000_000` boundary before asking the allocator to
+reserve slots. The arbitrary-precision value is still retained exactly; only the
+materialized Rust buffer has a bounded resource domain.
+
+```
+cargo test -p rerobot-core --test action_interpolator add_reports_a_multiplier_whose_buffer_cannot_be_allocated -- --exact --nocapture
+1 passed; 0 failed
+cargo test -p rerobot-core --test action_interpolator -- --nocapture
+50 passed; 0 failed
+```
+
+## Cycle 31 — bound the interpolation output grid
+
+After the step-count guard, an adversarial action width still exposed a second
+allocation chain: `1_000` steps of a `17_000`-element action could materialize
+more than sixteen million scalar values and many per-step vectors. The limit has
+to cover the output grid, not only its first dimension.
+
+**RED** — the test-only regression was run after the step-count fix and before
+the output-grid check, again with a bounded process-group timeout:
+
+```
+cargo test -p rerobot-core --test action_interpolator add_rejects_a_reasonable_multiplier_that_would_materialize_too_many_values -- --exact --nocapture
+RED_TIMEOUT=20s: output-grid guard is absent; the 1,000 x 17,000 path did not reach its assertion
+```
+
+**GREEN** — `ActionInterpolator::add` now checks the checked product of the
+interpolation step count and broadcast width against
+`MAX_INTERPOLATION_ELEMENTS = 16_777_216` before reserving the outer buffer.
+This preserves the exact Python integer multiplier while bounding the concrete
+Rust materialization.
+
+```
+cargo test -p rerobot-core --test action_interpolator add_rejects_a_reasonable_multiplier_that_would_materialize_too_many_values -- --exact --nocapture
+1 passed; 0 failed
+cargo test -p rerobot-core --test action_interpolator -- --nocapture
+51 passed; 0 failed
+```
+
+## Cycle 32 — preserve null state-file absence
+
+Upstream's saved step schema distinguishes an absent state file, a JSON `null`
+state file (both mean no state), and a non-null state-file name. The native
+stateless subset rejects the last form because it cannot load safetensors state,
+but must not reject the serialized `null` spelling.
+
+**RED** — the focused config test was added before narrowing the rejection to
+non-null values:
+
+```
+cargo test -p rerobot-core --test processor_pipeline null_state_file_is_treated_as_absent_for_stateless_steps -- --exact
+RED_EXIT=101
+InvalidStep { index: 0, reason: "state_file is unsupported for the native stateless step set" }
+```
+
+**GREEN** — `from_config` now accepts `state_file: null` and omits it again from
+`get_config`, while a non-null state file remains an explicit unsupported-boundary
+error.
+
+```
+cargo test -p rerobot-core --test processor_pipeline null_state_file_is_treated_as_absent_for_stateless_steps -- --exact
+1 passed; 0 failed
+cargo test -p rerobot-core --test processor_pipeline -- --test-threads=1
+11 passed; 0 failed
+```

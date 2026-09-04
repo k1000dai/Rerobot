@@ -317,15 +317,7 @@ pub static MODULE_FAMILIES: &[ModuleFamily] = &[
         name: "processor",
         status: Status::Partial,
         upstream_modules: 19,
-        note: "`rename_processor` (step + `rename_stats`) and the value transform/stateless \
-               lifecycle of `newline_task_processor.NewLineTaskProcessorStep` are ported and \
-               tested, as is `normalize_processor`'s numeric transform for all four of its \
-               modes. The four pre/postprocessor artifacts a checkpoint carries are written \
-               byte-identically to upstream's, and the native ACT training/deployment paths load the \
-               saved pipeline's rename map before applying scalar/camera normalization and action \
-               unnormalization. Python aliasing, arbitrary registry/config reconstruction, and the \
-               tokenizer, device, batch and full multi-step pipeline runtime remain outside this \
-               boundary.",
+        note: "`rename_processor` (step + `rename_stats`) and the value transform/stateless lifecycle of `newline_task_processor.NewLineTaskProcessorStep` are ported and tested, as is `normalize_processor`'s numeric transform for all four of its modes. The four pre/postprocessor artifacts a checkpoint carries are written byte-identically to upstream's; `rerobot_core::processor::pipeline` now reconstructs and executes ordered JSON transitions for the two stateless registered steps and round-trips their config. Python aliasing, mutable custom registration, dynamic imports, tensor state, and the tokenizer, device, batch and normalizer steps remain outside this boundary.",
     },
     ModuleFamily {
         name: "rewards",

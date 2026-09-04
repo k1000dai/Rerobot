@@ -194,14 +194,22 @@ impl LoadedPolicyProcessors {
 /// Rename observation feature and camera keys using upstream's one-pass mapping.
 ///
 /// `IndexMap::insert` preserves the first insertion position while replacing a
-/// colliding value, matching Python dict assignment. Only exact observation keys
-/// in the mapping are renamed; derived padding keys are not implicitly rewritten.
+/// colliding value, matching Python `dict` assignment. Current upstream also
+/// carries a base observation rename through `_is_pad` and `_padding_mask`; the
+/// action key remains outside the observation mapping.
 fn renamed_observation_key(key: &str, rename_map: &IndexMap<String, String>) -> String {
     if key == ACTION {
         return key.to_owned();
     }
     if let Some(mapped) = rename_map.get(key) {
         return mapped.clone();
+    }
+    for suffix in ["_is_pad", "_padding_mask"] {
+        if let Some(base) = key.strip_suffix(suffix) {
+            if let Some(mapped) = rename_map.get(base) {
+                return format!("{mapped}{suffix}");
+            }
+        }
     }
     key.to_owned()
 }
@@ -210,7 +218,12 @@ fn renamed_observation_key(key: &str, rename_map: &IndexMap<String, String>) -> 
 fn rename_stats(stats: &DatasetStats, rename_map: &IndexMap<String, String>) -> DatasetStats {
     let mut renamed = IndexMap::with_capacity(stats.keys().count());
     for feature in stats.keys() {
-        let target = renamed_observation_key(feature, rename_map);
+        let target = rename_map
+            .iter()
+            .find(|(old, _)| old.as_str() == feature)
+            .map(|(_, new)| new.as_str())
+            .unwrap_or(feature)
+            .to_owned();
         let source = stats
             .get(feature)
             .expect("a key yielded by DatasetStats::keys must be present");
@@ -267,7 +280,8 @@ pub fn camera_normalizations_for_input_images(
 }
 
 /// Rename a batch's observation features and camera keys using the saved one-pass
-/// mapping. Padding masks are not observation keys and therefore pass through
+/// mapping. Derived temporal padding keys follow their base feature. The separate
+/// [`Batch::padding`] map is not an observation feature and therefore passes through
 /// untouched. The input tensors are shared by clone, but the returned maps and
 /// task/index vectors are independent.
 pub fn rename_observation_batch(batch: &Batch, rename_map: &IndexMap<String, String>) -> Batch {
@@ -816,4 +830,26 @@ fn encode_feature(feature: &PolicyFeature) -> JsonLike {
         ),
     );
     JsonLike::Object(object)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stats_rename_does_not_apply_observation_metadata_suffix_rules() {
+        let stats = DatasetStats::from_entries(IndexMap::from([(
+            "observation.state_is_pad".to_owned(),
+            FeatureStats::from_entries(IndexMap::from([("mean".to_owned(), vec![1.0])])),
+        )]));
+        let rename_map = IndexMap::from([(
+            "observation.state".to_owned(),
+            "observation.robot_state".to_owned(),
+        )]);
+
+        let renamed = rename_stats(&stats, &rename_map);
+
+        assert!(renamed.get("observation.state_is_pad").is_some());
+        assert!(renamed.get("observation.robot_state_is_pad").is_none());
+    }
 }

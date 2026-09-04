@@ -83,9 +83,12 @@ assert_eq!(err.to_string(), "multiplier must be >= 1, got 0");
 The multiplier is the unbounded Python `int` upstream stores, not a machine
 word: `__init__` checks only `multiplier < 1`, so `2**63` and `10**100` are
 values it holds. Storage, the getter, `enabled` and `get_control_interval` are
-exact at every magnitude. The two operations that cannot be — allocating the
-interpolated buffer, and the `int`-to-float conversion inside `fps *
-multiplier` — return an error naming the value rather than narrowing it.
+exact at every magnitude. The materialized Rust buffer has explicit safety
+limits — `MAX_INTERPOLATION_STEPS` (1,000,000) and
+`MAX_INTERPOLATION_ELEMENTS` (16,777,216 scalars) — so a hostile multiplier or
+wide action returns an error before allocation rather than being narrowed. The
+`int`-to-float conversion inside `fps * multiplier` also returns an error naming
+the value rather than narrowing it.
 
 ```rust
 use rerobot_core::action_interpolator::{ActionInterpolator, InterpolatorError};
@@ -258,8 +261,8 @@ use rerobot_core::processor::newline_task::{NewLineTaskProcessorStep, REGISTRY_N
 use rerobot_core::processor::ComplementaryData;
 use serde_json::json;
 
-// This preserves upstream's spelling. Registry lookup/config reconstruction is
-// part of the not-yet-ported processor pipeline runtime.
+// This preserves upstream's spelling. The native JSON pipeline resolver accepts
+// this name and reconstructs the supported stateless step.
 assert_eq!(REGISTRY_NAME, "smolvla_new_line_processor");
 
 let step = NewLineTaskProcessorStep;
@@ -302,8 +305,56 @@ assert_eq!(step.complementary_data(&data)["task"], json!(null));
 The step declares no configuration and no state, so `get_config` and
 `state_dict` are empty while `load_state_dict` and `reset` are no-ops.
 `transform_features` returns an equal owned clone; unlike upstream, it does not
-alias its input. The processor registry and pipeline-config reconstruction are
-not part of this slice.
+alias its input.
+
+## `processor::pipeline` — the native JSON transition boundary
+
+`JsonProcessorPipeline` reconstructs the upstream `name` / ordered `steps`
+configuration for the two stateless steps implemented here:
+`rename_observations_processor` and `smolvla_new_line_processor`. It processes
+ordered JSON observations and complementary data, can expose each intermediate
+stage with `step_through`, and applies the same steps to `PipelineFeatures`.
+
+```rust
+use rerobot_core::processor::pipeline::{JsonProcessorPipeline, JsonTransition};
+use rerobot_core::processor::rename::Observation;
+use rerobot_core::processor::ComplementaryData;
+use serde_json::json;
+
+let config = json!({
+    "name": "example",
+    "steps": [
+        {
+            "registry_name": "rename_observations_processor",
+            "config": {"rename_map": {"pixels": "observation.image"}}
+        },
+        {"registry_name": "smolvla_new_line_processor", "config": {}}
+    ]
+});
+let pipeline = JsonProcessorPipeline::from_config(&config).unwrap();
+let observation: Observation = [("pixels".to_owned(), json!([1, 2, 3]))].into_iter().collect();
+let complementary_data: ComplementaryData =
+    [("task".to_owned(), json!("pick up the cube"))].into_iter().collect();
+let output = pipeline.process(&JsonTransition::new(observation, complementary_data));
+
+assert_eq!(output.observation["observation.image"], json!([1, 2, 3]));
+assert_eq!(output.complementary_data["task"], json!("pick up the cube\n"));
+```
+
+The native registry currently contains only stateless steps, so
+`JsonProcessorPipeline::reset` is an explicit no-op matching their upstream
+lifecycle. State-bearing or dynamically imported steps are rejected rather than
+silently treated as stateless.
+
+This is deliberately not a full Python `DataProcessorPipeline`: dynamic class
+imports, mutable custom registration, Hub loading, tensor state, and the
+`to_batch` / device / normalizer steps remain explicit unsupported boundaries.
+Runtime observation renaming is one-pass: exact mappings win, and a base mapping
+also renames its derived `_is_pad` and `_padding_mask` keys. Feature declarations
+remain exact-key-only, matching current upstream's separate `transform_features`
+path. The runtime suffix behavior is from current upstream `main`
+(`3f2c29ef7e44b1ddccbcda3b6a63939e53639e9e`); the pinned 0.6.1 baseline remains
+exact-key-only throughout.
 
 ## `dataset` — `lerobot/datasets/utils.py`, `lerobot/datasets/io_utils.py`
 

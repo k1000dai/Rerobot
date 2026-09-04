@@ -3,7 +3,9 @@
 //!
 //! Both functions are single-pass dict rebuilds, so key ordering and
 //! last-write-wins collision behaviour are observable. Ordered maps are used
-//! throughout to preserve them.
+//! throughout to preserve them. The observation transform also carries a base
+//! feature rename through the `_is_pad` and `_padding_mask` keys used by current
+//! upstream temporal sampling.
 
 use crate::types::PipelineFeatureType;
 use indexmap::IndexMap;
@@ -69,13 +71,17 @@ impl RenameObservationsProcessorStep {
     /// the same output key, the later one wins and the entry keeps the position
     /// of the earlier one (Python `dict` assignment semantics).
     ///
-    /// The map is applied exactly once per key, so a map like
-    /// `{"a": "b", "b": "c"}` does not cascade `a -> b -> c`.
+    /// A base feature mapping also renames its derived `_is_pad` and
+    /// `_padding_mask` keys. An exact mapping for one of those derived keys wins.
+    /// The map is applied exactly once per key, so a map like `{"a": "b", "b":
+    /// "c"}` does not cascade `a -> b -> c`.
     pub fn observation(&self, observation: &Observation) -> Observation {
         let mut processed = Observation::with_capacity(observation.len());
         for (key, value) in observation {
-            let new_key = self.rename_map.get(key).unwrap_or(key);
-            processed.insert(new_key.clone(), value.clone());
+            processed.insert(
+                rename_key_with_metadata(key, &self.rename_map),
+                value.clone(),
+            );
         }
         processed
     }
@@ -106,6 +112,26 @@ impl RenameObservationsProcessorStep {
         out.insert(PipelineFeatureType::Observation, renamed);
         Some(out)
     }
+}
+
+/// Rename an observation key and, when applicable, its temporal padding metadata.
+///
+/// Current upstream preserves the relationship between a feature and the derived
+/// `_is_pad`/`_padding_mask` keys. An exact mapping wins over the suffix rule, and
+/// the lookup is performed once, so a destination that is itself another source
+/// key is not traversed a second time.
+fn rename_key_with_metadata(key: &str, rename_map: &IndexMap<String, String>) -> String {
+    if let Some(mapped) = rename_map.get(key) {
+        return mapped.clone();
+    }
+    for suffix in ["_is_pad", "_padding_mask"] {
+        if let Some(base) = key.strip_suffix(suffix) {
+            if let Some(mapped) = rename_map.get(base) {
+                return format!("{mapped}{suffix}");
+            }
+        }
+    }
+    key.to_owned()
 }
 
 /// Rename the top-level keys of a statistics dict, port of `rename_stats`.

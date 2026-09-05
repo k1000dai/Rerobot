@@ -13,6 +13,7 @@
 //! writer cannot drift.
 
 use crate::error::{Result, TrainError};
+use indexmap::IndexMap;
 use rerobot_core::dataset::json::{dumps_pretty_ascii, JsonLike, JsonObject};
 use rerobot_core::policy::act::{ActConfig, AdamWConfig};
 use rerobot_core::BigInt;
@@ -49,6 +50,8 @@ pub struct TrainConfig {
     pub dataset_use_imagenet_stats: bool,
     /// The ACT policy configuration.
     pub policy: ActConfig,
+    /// Upstream's observation feature rename map, from dataset key to policy key.
+    pub rename_map: IndexMap<String, String>,
     /// `output_dir`.
     pub output_dir: PathBuf,
     /// Whether this run restores a previously saved local checkpoint.
@@ -95,6 +98,7 @@ impl TrainConfig {
             dataset_episodes: None,
             dataset_use_imagenet_stats: DEFAULT_USE_IMAGENET_STATS,
             policy,
+            rename_map: IndexMap::new(),
             output_dir,
             resume: false,
             checkpoint_path: None,
@@ -193,6 +197,11 @@ impl TrainConfig {
                 "policy.push_to_hub is set; this slice has no Hub client. Pass \
                  --policy.push_to_hub=false to train locally."
                     .to_owned(),
+            ));
+        }
+        if !self.rename_map.is_empty() && self.policy.pretrained_path.is_none() {
+            return Err(TrainError::unsupported(
+                "rename_map requires a pretrained policy checkpoint; fresh initialization derives feature names from the current dataset".to_owned(),
             ));
         }
         if let Some(episodes) = &self.dataset_episodes {
@@ -433,7 +442,6 @@ impl TrainConfig {
             "job",
             "save_checkpoint_to_hub",
             "sample_weighting",
-            "rename_map",
         ]
     }
 
@@ -492,7 +500,7 @@ impl TrainConfig {
         root.insert("job".into(), job_json());
         root.insert("save_checkpoint_to_hub".into(), JsonLike::Bool(false));
         root.insert("sample_weighting".into(), JsonLike::Null);
-        root.insert("rename_map".into(), JsonLike::Object(JsonObject::new()));
+        root.insert("rename_map".into(), string_map_json(&self.rename_map));
         JsonLike::Object(root)
     }
 
@@ -503,48 +511,43 @@ impl TrainConfig {
 
     /// Reconstruct the local ACT training configuration stored in a checkpoint.
     ///
-    /// This intentionally reads only the fields this native training boundary
+    /// This intentionally reads only the fields the local training boundary
     /// consumes. Missing or wrongly typed fields are reported as checkpoint
     /// corruption rather than replaced with a fresh-run default.
     pub fn from_checkpoint_dir(checkpoint_dir: &Path) -> Result<Self> {
         let path = checkpoint_dir
             .join(crate::checkpoint::PRETRAINED_MODEL_DIR)
             .join(crate::checkpoint::TRAIN_CONFIG_NAME);
-        let file = std::fs::File::open(&path).map_err(|error| TrainError::io(&path, &error))?;
-        let mut bytes = Vec::new();
-        file.take(crate::limits::MAX_CHECKPOINT_JSON_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|error| TrainError::io(&path, &error))?;
-        if bytes.len() as u64 > crate::limits::MAX_CHECKPOINT_JSON_BYTES {
+        let document = read_config_document(&path)?;
+        Self::from_config_document(&document, &path, Some(checkpoint_dir))
+    }
+
+    /// Reconstruct a fresh local ACT run from a saved `train_config.json`.
+    ///
+    /// The file is the JSON form emitted by [`Self::to_json_text`]. YAML and
+    /// arbitrary Draccus configurations are intentionally not accepted here:
+    /// this is a native JSON checkpoint/config boundary, not a general YAML
+    /// parser. Unlike [`Self::from_checkpoint_dir`], this does not restore
+    /// optimizer state or mark the run as a resume.
+    pub fn from_config_file(path: &Path) -> Result<Self> {
+        let document = read_config_document(path)?;
+        Self::from_config_document(&document, path, None)
+    }
+
+    fn from_config_document(
+        document: &JsonLike,
+        path: &Path,
+        checkpoint_dir: Option<&Path>,
+    ) -> Result<Self> {
+        let JsonLike::Object(root) = document else {
             return Err(TrainError::checkpoint(
-                &path,
-                format!(
-                    "train_config.json exceeds the {}-byte limit",
-                    crate::limits::MAX_CHECKPOINT_JSON_BYTES
-                ),
-            ));
-        }
-        let text = String::from_utf8(bytes).map_err(|error| {
-            TrainError::checkpoint(
-                &path,
-                format!("train_config.json is not valid UTF-8: {error}"),
-            )
-        })?;
-        let document = rerobot_core::dataset::json::loads(&text).map_err(|error| {
-            TrainError::checkpoint(
-                &path,
-                format!("train_config.json is not valid JSON: {error}"),
-            )
-        })?;
-        let JsonLike::Object(root) = &document else {
-            return Err(TrainError::checkpoint(
-                &path,
+                path,
                 "train_config.json is not a JSON object",
             ));
         };
-        let dataset = object_field(root, "dataset", &path)?;
-        let dataset_repo_id = string_field(dataset, "repo_id", &path)?;
-        let dataset_root = PathBuf::from(string_field(dataset, "root", &path)?);
+        let dataset = object_field(root, "dataset", path)?;
+        let dataset_repo_id = string_field(dataset, "repo_id", path)?;
+        let dataset_root = PathBuf::from(string_field(dataset, "root", path)?);
         let dataset_episodes = match dataset.get("episodes") {
             None | Some(JsonLike::Null) => None,
             Some(JsonLike::Array(values)) => Some(
@@ -552,13 +555,13 @@ impl TrainConfig {
                     .iter()
                     .enumerate()
                     .map(|(index, value)| {
-                        i64_field(value, &format!("dataset.episodes[{index}]"), &path)
+                        i64_field(value, &format!("dataset.episodes[{index}]"), path)
                     })
                     .collect::<Result<Vec<_>>>()?,
             ),
             Some(other) => {
                 return Err(TrainError::checkpoint(
-                    &path,
+                    path,
                     format!("dataset.episodes is {}, not an array", other.type_name()),
                 ))
             }
@@ -566,35 +569,63 @@ impl TrainConfig {
         let dataset_use_imagenet_stats = bool_field(
             dataset,
             "use_imagenet_stats",
-            &path,
+            path,
             DEFAULT_USE_IMAGENET_STATS,
         )?;
-        let mut policy = ActConfig::from_checkpoint_value(value_field(root, "policy", &path)?)
-            .map_err(|error| TrainError::checkpoint(&path, error.to_string()))?;
-        policy.pretrained_path = Some(
-            checkpoint_dir
+        let mut policy = ActConfig::from_checkpoint_value(value_field(root, "policy", path)?)
+            .map_err(|error| TrainError::checkpoint(path, error.to_string()))?;
+        let rename_map = string_map_field(root, "rename_map", path)?;
+        if let Some(checkpoint_dir) = checkpoint_dir {
+            let policy_config_path = checkpoint_dir
                 .join(crate::checkpoint::PRETRAINED_MODEL_DIR)
-                .to_string_lossy()
-                .into_owned(),
-        );
-        let output_dir = PathBuf::from(string_field(root, "output_dir", &path)?);
+                .join(crate::checkpoint::CONFIG_FILE);
+            let policy_config_text = read_bounded_text(&policy_config_path, "config.json")?;
+            let saved_policy = ActConfig::from_checkpoint_json(&policy_config_text)
+                .map_err(|error| TrainError::checkpoint(&policy_config_path, error.to_string()))?;
+            // `train_config.json` records the user-facing config, while the
+            // sibling policy `config.json` records the resolved feature namespace
+            // that the model and processor artifacts actually use. Resume must use
+            // that resolved namespace, especially when a camera was renamed.
+            if policy
+                .input_features
+                .as_ref()
+                .is_none_or(|features| features.is_empty())
+            {
+                policy.input_features = saved_policy.input_features;
+            }
+            if policy
+                .output_features
+                .as_ref()
+                .is_none_or(|features| features.is_empty())
+            {
+                policy.output_features = saved_policy.output_features;
+            }
+            policy.pretrained_path = Some(
+                checkpoint_dir
+                    .join(crate::checkpoint::PRETRAINED_MODEL_DIR)
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        let output_dir = PathBuf::from(string_field(root, "output_dir", path)?);
         let mut config = Self::new(dataset_repo_id, dataset_root, output_dir);
         config.dataset_episodes = dataset_episodes;
         config.dataset_use_imagenet_stats = dataset_use_imagenet_stats;
         config.policy = policy;
-        config.resume = true;
-        config.checkpoint_path = Some(checkpoint_dir.to_owned());
-        config.job_name = optional_string_field(root, "job_name", &path)?;
-        config.seed = optional_u64_field(root, "seed", &path)?;
-        config.num_workers = u32_field(root, "num_workers", &path, 0)?;
-        config.batch_size = usize_field(root, "batch_size", &path)?;
-        config.steps = u64_field(root, "steps", &path)?;
-        config.log_freq = u64_field(root, "log_freq", &path)?;
-        config.tolerance_s = f64_field(root, "tolerance_s", &path)?;
-        config.save_checkpoint = bool_field(root, "save_checkpoint", &path, true)?;
-        config.save_freq = bigint_field(root, "save_freq", &path)?;
+        config.rename_map = rename_map;
+        config.resume = checkpoint_dir.is_some();
+        config.checkpoint_path = checkpoint_dir.map(Path::to_owned);
+        config.job_name = optional_string_field(root, "job_name", path)?;
+        config.seed = optional_u64_field(root, "seed", path)?;
+        config.num_workers = u32_field(root, "num_workers", path, 0)?;
+        config.batch_size = usize_field(root, "batch_size", path)?;
+        config.steps = u64_field(root, "steps", path)?;
+        config.log_freq = u64_field(root, "log_freq", path)?;
+        config.tolerance_s = f64_field(root, "tolerance_s", path)?;
+        config.save_checkpoint = bool_field(root, "save_checkpoint", path, true)?;
+        config.save_freq = bigint_field(root, "save_freq", path)?;
         config.use_policy_training_preset =
-            bool_field(root, "use_policy_training_preset", &path, true)?;
+            bool_field(root, "use_policy_training_preset", path, true)?;
         Ok(config)
     }
 
@@ -658,6 +689,37 @@ impl TrainConfig {
     }
 }
 
+fn read_config_document(path: &Path) -> Result<JsonLike> {
+    let text = read_bounded_text(path, "train_config.json")?;
+    rerobot_core::dataset::json::loads(&text).map_err(|error| {
+        TrainError::checkpoint(
+            path,
+            format!("train_config.json is not valid JSON: {error}"),
+        )
+    })
+}
+
+fn read_bounded_text(path: &Path, label: &str) -> Result<String> {
+    let file = std::fs::File::open(path).map_err(|error| TrainError::io(path, &error))?;
+    let mut bytes = Vec::new();
+    file.take(crate::limits::MAX_CHECKPOINT_JSON_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| TrainError::io(path, &error))?;
+    if bytes.len() as u64 > crate::limits::MAX_CHECKPOINT_JSON_BYTES {
+        return Err(TrainError::checkpoint(
+            path,
+            format!(
+                "{label} exceeds the {}-byte limit",
+                crate::limits::MAX_CHECKPOINT_JSON_BYTES
+            ),
+        ));
+    }
+    let text = String::from_utf8(bytes).map_err(|error| {
+        TrainError::checkpoint(path, format!("{label} is not valid UTF-8: {error}"))
+    })?;
+    Ok(text)
+}
+
 fn eval_json() -> JsonLike {
     let mut object = JsonObject::new();
     object.insert("n_episodes".into(), int(50));
@@ -688,9 +750,45 @@ fn int(value: u64) -> JsonLike {
     JsonLike::Int(num_bigint::BigInt::from(value))
 }
 
-/// A path in the POSIX spelling `pathlib.PurePosixPath` would produce, so that a
-/// `train_config.json` written on Windows names the same path as one written on
-/// Linux.
+/// Encode a string mapping as an ordered JSON object, preserving insertion order.
+fn string_map_json(values: &IndexMap<String, String>) -> JsonLike {
+    let mut object = JsonObject::with_capacity(values.len());
+    for (source, target) in values {
+        object.insert(source.clone(), JsonLike::Str(target.clone()));
+    }
+    JsonLike::Object(object)
+}
+
+fn string_map_field(
+    root: &JsonObject,
+    name: &str,
+    path: &Path,
+) -> Result<IndexMap<String, String>> {
+    let Some(value) = root.get(name) else {
+        return Ok(IndexMap::new());
+    };
+    let JsonLike::Object(entries) = value else {
+        return Err(TrainError::checkpoint(
+            path,
+            format!("{name} is {}, not an object", value.type_name()),
+        ));
+    };
+    let mut result = IndexMap::with_capacity(entries.len());
+    for (source, target) in entries {
+        let JsonLike::Str(target) = target else {
+            return Err(TrainError::checkpoint(
+                path,
+                format!(
+                    "{name} entry {source:?} is {}, not a string",
+                    target.type_name()
+                ),
+            ));
+        };
+        result.insert(source.clone(), target.clone());
+    }
+    Ok(result)
+}
+
 fn object_field<'a>(root: &'a JsonObject, name: &str, path: &Path) -> Result<&'a JsonObject> {
     match root.get(name) {
         Some(JsonLike::Object(value)) => Ok(value),

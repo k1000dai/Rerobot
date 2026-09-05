@@ -291,6 +291,24 @@ impl JsonProcessorPipeline {
                     index,
                     reason: "expected an object".to_owned(),
                 })?;
+            if let Some(artifacts) = entry.get("artifacts") {
+                match artifacts {
+                    Value::Object(artifacts) if artifacts.is_empty() => {}
+                    Value::Object(_) => {
+                        return Err(ProcessorPipelineError::InvalidStep {
+                            index,
+                            reason: "artifacts are unsupported for the native stateless step set"
+                                .to_owned(),
+                        })
+                    }
+                    _ => {
+                        return Err(ProcessorPipelineError::WrongType {
+                            path: format!("steps[{index}].artifacts"),
+                            expected: "an object",
+                        })
+                    }
+                }
+            }
             let registry_name = entry.get("registry_name");
             let identifier = registry_name
                 .or_else(|| entry.get("class"))

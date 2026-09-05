@@ -1782,3 +1782,31 @@ cargo test -p rerobot-core --test processor_pipeline null_state_file_is_treated_
 cargo test -p rerobot-core --test processor_pipeline -- --test-threads=1
 11 passed; 0 failed
 ```
+
+## Cycle 33 — reject unsupported processor artifacts explicitly
+
+Current LeRobot `main` adds `artifacts` entries to saved processor-step
+configuration and resolves those paths during checkpoint loading. The native
+pipeline currently implements only stateless rename and newline steps, so it
+must not accept such a config and silently drop the artifact declaration.
+
+**RED** — before the boundary check, a non-empty `artifacts` object was accepted
+and disappeared from `get_config`:
+
+```
+cargo test -p rerobot-core --test processor_pipeline nonempty_processor_artifacts_are_refused_instead_of_silently_dropped -- --exact
+RED_EXIT=101
+called `Result::unwrap_err()` on an `Ok` value: JsonProcessorPipeline { name: "DataProcessorPipeline", steps: [Rename(...)] }
+```
+
+**GREEN** — non-empty artifact declarations now fail as an explicit unsupported
+native boundary; an empty object remains harmless, and a non-object value is a
+wrong-type error. This keeps future artifact loading opt-in and prevents a
+checkpoint from being reported as equivalent after losing required files.
+
+```
+cargo test -p rerobot-core --test processor_pipeline nonempty_processor_artifacts_are_refused_instead_of_silently_dropped -- --exact
+1 passed; 0 failed
+cargo test -p rerobot-core --test processor_pipeline -- --test-threads=1
+12 passed; 0 failed
+```

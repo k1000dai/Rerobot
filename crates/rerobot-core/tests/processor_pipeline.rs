@@ -262,6 +262,24 @@ fn null_state_file_is_treated_as_absent_for_stateless_steps() {
 }
 
 #[test]
+fn nonempty_processor_artifacts_are_refused_instead_of_silently_dropped() {
+    let error = JsonProcessorPipeline::from_config(&json!({
+        "steps": [{
+            "registry_name": "rename_observations_processor",
+            "config": {"rename_map": {}},
+            "artifacts": {"state": "processor/state.safetensors"},
+        }]
+    }))
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ProcessorPipelineError::InvalidStep { index: 0, reason }
+            if reason.contains("artifacts are unsupported")
+    ));
+}
+
+#[test]
 fn reset_is_a_noop_for_the_stateless_native_steps() {
     let mut pipeline = JsonProcessorPipeline::from_config(&json!({
         "steps": [

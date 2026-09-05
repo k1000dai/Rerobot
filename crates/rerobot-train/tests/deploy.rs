@@ -4,8 +4,8 @@ mod common;
 
 use candle_core::{Device, Tensor};
 use common::{
-    copy_fixture_dataset, fixture_dataset, reduced_config, rewrite_episode_rows,
-    rewrite_frame_episode_indices, TempDir,
+    copy_fixture_dataset, embedded_image_fixture, fixture_dataset, reduced_config,
+    rewrite_episode_rows, rewrite_frame_episode_indices, TempDir,
 };
 use indexmap::IndexMap;
 use rerobot_core::dataset::delta::action_delta_timestamps;
@@ -21,6 +21,14 @@ fn trained_checkpoint() -> (TempDir, PathBuf) {
     let output = dir.child("train");
     let config = reduced_config(fixture_dataset(), output.clone());
     train(&config, &mut |_| {}).expect("the reduced ACT run trains");
+    (dir, output.join("checkpoints/000001/pretrained_model"))
+}
+
+fn trained_image_checkpoint() -> (TempDir, PathBuf) {
+    let dir = TempDir::new("deploy-image");
+    let output = dir.child("train");
+    let config = reduced_config(embedded_image_fixture(), output.clone());
+    train(&config, &mut |_| {}).expect("the reduced camera ACT run trains");
     (dir, output.join("checkpoints/000001/pretrained_model"))
 }
 
@@ -53,13 +61,11 @@ fn a_checkpoint_can_infer_from_a_caller_batch_without_opening_a_dataset() {
     let dataset = StateOnlyDataset::load(&fixture_dataset(), &delta_timestamps, 1e-4)
         .expect("the fixture frame loads");
     let frame = dataset.get(0).expect("the first frame loads");
-    let raw =
+    let mut raw =
         collate(std::slice::from_ref(&frame), from_batch.device()).expect("the batch collates");
     let images = collate_images(std::slice::from_ref(&frame), from_batch.device())
         .expect("the camera batch collates");
-    let raw = raw
-        .with_images(&images, &from_batch.camera_normalization().clone())
-        .expect("the caller batch accepts its cameras");
+    raw.images = images;
 
     let mut dataset_backed = InferenceSession::load(&checkpoint, &fixture_dataset(), None)
         .expect("the dataset-backed session loads");
@@ -73,6 +79,44 @@ fn a_checkpoint_can_infer_from_a_caller_batch_without_opening_a_dataset() {
     assert_eq!(actual.frame_index, expected.frame_index);
     assert_eq!(actual.action, expected.action);
     assert!(actual.queried_policy);
+}
+
+#[test]
+fn checkpoint_only_inference_normalizes_raw_cameras_like_dataset_backed_inference() {
+    let (_dir, checkpoint) = trained_image_checkpoint();
+    let mut from_batch = InferenceSession::load_checkpoint(&checkpoint, None)
+        .expect("a camera checkpoint-only inference session loads");
+
+    let metadata = rerobot_train::data::meta::DatasetMetadata::load(&embedded_image_fixture())
+        .expect("the camera fixture metadata loads");
+    let mut delta_timestamps = IndexMap::new();
+    delta_timestamps.insert(
+        ACTION.to_owned(),
+        action_delta_timestamps(2, metadata.fps().expect("the camera fixture fps is valid")),
+    );
+    let dataset = StateOnlyDataset::load(&embedded_image_fixture(), &delta_timestamps, 1e-4)
+        .expect("the camera fixture frame loads");
+    let frame = dataset.get(0).expect("the first camera frame loads");
+    let mut raw =
+        collate(std::slice::from_ref(&frame), from_batch.device()).expect("the batch collates");
+    let images = collate_images(std::slice::from_ref(&frame), from_batch.device())
+        .expect("the raw camera batch collates");
+    // Bypass `with_images` deliberately: a runtime caller hands the deployment
+    // boundary raw [0, 1] camera tensors, and the checkpoint processor must apply
+    // the saved per-camera statistics exactly once.
+    raw.images = images;
+
+    let mut dataset_backed = InferenceSession::load(&checkpoint, &embedded_image_fixture(), None)
+        .expect("the camera dataset-backed session loads");
+    let expected = dataset_backed
+        .select_action(0)
+        .expect("the reference camera observation produces an action");
+    let actual = from_batch
+        .select_action_on_batch(&raw)
+        .expect("the checkpoint-only session normalizes raw cameras");
+
+    assert_eq!(actual.frame_index, expected.frame_index);
+    assert_eq!(actual.action, expected.action);
 }
 
 #[test]
@@ -105,9 +149,7 @@ fn a_checkpoint_only_session_applies_a_saved_rename_map_before_inference() {
         collate(std::slice::from_ref(&frame), session.device()).expect("the batch collates");
     let images = collate_images(std::slice::from_ref(&frame), session.device())
         .expect("the camera batch collates");
-    raw = raw
-        .with_images(&images, &session.camera_normalization().clone())
-        .expect("the caller batch accepts its cameras");
+    raw.images = images;
     let state = raw
         .features
         .shift_remove("observation.state")

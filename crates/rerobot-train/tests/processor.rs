@@ -350,6 +350,73 @@ fn visual_processor_state_round_trips_per_camera_statistics() {
 }
 
 #[test]
+fn loaded_pipeline_normalizes_raw_camera_tensors_before_returning_the_batch() {
+    let dir = TempDir::new("processor-camera-runtime");
+    let target = dir.child("pretrained_model");
+    std::fs::create_dir_all(&target).unwrap();
+    let metadata =
+        rerobot_train::data::meta::DatasetMetadata::load(&embedded_image_fixture()).unwrap();
+    let mut config = reduced_config(embedded_image_fixture(), dir.child("out"));
+    let (inputs, outputs) = metadata.policy_feature_split();
+    config.policy.input_features = Some(inputs);
+    config.policy.output_features = Some(outputs);
+    let camera_stats =
+        CameraNormalization::new(vec![0.25, 0.5, 0.75], vec![0.1, 0.2, 0.3]).unwrap();
+    let cameras = IndexMap::from([("observation.images.top".to_owned(), camera_stats.clone())]);
+    write_processor_artifacts_with_cameras(&target, &config.policy, &metadata.stats, &cameras)
+        .expect("processor artifacts are written");
+    let preprocessor_path = target.join("policy_preprocessor.json");
+    let preprocessor = std::fs::read_to_string(&preprocessor_path).unwrap();
+    std::fs::write(
+        &preprocessor_path,
+        preprocessor.replace(
+            "\"rename_map\": {}",
+            "\"rename_map\": {\"camera.raw\": \"observation.images.top\"}",
+        ),
+    )
+    .unwrap();
+    let processors = LoadedPolicyProcessors::load(&target, &config.policy)
+        .expect("the saved processor pipeline loads");
+
+    let raw_image = Tensor::full(0.0_f32, (1, 3, 2, 2), &Device::Cpu).unwrap();
+    let raw = Batch {
+        features: IndexMap::from([
+            (
+                "observation.state".to_owned(),
+                Tensor::new(vec![0.4375_f32, 0.5625], &Device::Cpu).unwrap(),
+            ),
+            (
+                "observation.environment_state".to_owned(),
+                Tensor::new(vec![10.0_f32, -1.0], &Device::Cpu).unwrap(),
+            ),
+        ]),
+        images: IndexMap::from([("camera.raw".to_owned(), raw_image.clone())]),
+        padding: IndexMap::new(),
+        tasks: vec![String::new()],
+        indices: vec![0],
+    };
+
+    let processed = processors
+        .process_observation_batch(&raw)
+        .expect("the pipeline processes scalar and camera observations");
+    let actual = processed
+        .image("observation.images.top")
+        .expect("the camera remains attached to the processed batch");
+    let expected = camera_stats
+        .apply("observation.images.top", &raw_image)
+        .unwrap();
+    let difference = (actual - &expected)
+        .unwrap()
+        .abs()
+        .unwrap()
+        .max_all()
+        .unwrap()
+        .to_scalar::<f32>()
+        .unwrap();
+    assert_eq!(difference, 0.0);
+}
+
+#[test]
 fn visual_processor_state_rejects_partial_camera_statistics() {
     let dir = TempDir::new("processor-partial-camera-stats");
     let target = dir.child("pretrained_model");

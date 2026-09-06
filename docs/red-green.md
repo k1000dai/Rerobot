@@ -1810,3 +1810,30 @@ cargo test -p rerobot-core --test processor_pipeline nonempty_processor_artifact
 cargo test -p rerobot-core --test processor_pipeline -- --test-threads=1
 12 passed; 0 failed
 ```
+
+## Cycle 34 — execute saved camera normalization in the native processor runtime
+
+`LoadedPolicyProcessors::process_observation_batch` already applied the saved
+rename map and scalar normalizer, but it returned camera tensors untouched. That
+was a compatibility hole for callers using the public processor runtime directly:
+checkpoint-trained visual policies would receive raw `[0, 1]` images instead of
+the per-camera statistics saved beside the model.
+
+**RED** — the focused regression was run before the runtime fix:
+
+```
+cargo test -p rerobot-train --test processor loaded_pipeline_normalizes_raw_camera_tensors_before_returning_the_batch --locked
+RED_EXIT=101
+```
+
+**GREEN** — the runtime now takes the renamed camera map through
+`Batch::with_image_normalizations` before applying scalar normalization. Missing
+camera statistics retain the upstream identity behavior, and the input batch is
+still not mutated.
+
+```
+cargo test -p rerobot-train --test processor loaded_pipeline_normalizes_raw_camera_tensors_before_returning_the_batch --locked
+1 passed; 0 failed
+cargo test -p rerobot-train --test processor --locked
+21 passed; 0 failed
+```

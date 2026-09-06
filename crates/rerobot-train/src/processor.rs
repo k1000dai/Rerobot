@@ -24,7 +24,9 @@
 //! observations and action unnormalization. It does not yet execute an arbitrary
 //! registry-named pipeline: the batch, device and full multi-step processor
 //! lifecycles remain represented structurally rather than exposed as a general
-//! runtime. That boundary is recorded in `docs/compatibility.md`; the alternative
+//! runtime. The native runtime applies the saved rename map and scalar/camera
+//! normalization to caller-owned observation batches. That boundary is recorded in
+//! `docs/compatibility.md`; the alternative
 //! — omitting the steps — would produce a file upstream cannot load.
 
 use crate::data::batch::Batch;
@@ -180,8 +182,17 @@ impl LoadedPolicyProcessors {
     ///
     /// This is the native subset of upstream's preprocessor runtime used by ACT.
     /// Renaming happens before normalization, and the input batch is not mutated.
+    /// Camera entries are raw `f32` `[0, 1]` tensors, just as they are at the
+    /// `Batch::with_images` boundary; this method applies the saved per-camera
+    /// statistics before the scalar normalizer runs.
     pub fn process_observation_batch(&self, batch: &Batch) -> Result<Batch> {
-        let renamed = rename_observation_batch(batch, &self.rename_map);
+        let mut renamed = rename_observation_batch(batch, &self.rename_map);
+        let images = std::mem::take(&mut renamed.images);
+        let renamed = if images.is_empty() {
+            renamed
+        } else {
+            renamed.with_image_normalizations(&images, &self.camera_normalizations)?
+        };
         renamed.normalized(&self.normalizer)
     }
 

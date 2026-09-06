@@ -3,7 +3,9 @@
 //! Upstream parses `TrainPipelineConfig` with Draccus, which accepts a dotted
 //! `--a.b.c=value` flag for every field of every nested dataclass, plus
 //! `--config_path` for a YAML or checkpoint config. This is not that parser: it is
-//! explicit allow-list of the flags the local ACT run consumes.
+//! an explicit allow-list of the flags the local ACT run consumes. A saved local
+//! `train_config.json` is accepted as a fresh-run configuration; general YAML and
+//! arbitrary Draccus configurations remain outside this boundary.
 //!
 //! The design rule is that there are exactly three outcomes for any flag, and
 //! never a fourth:
@@ -22,6 +24,7 @@ use rerobot_core::policy::act::ActConfig;
 use rerobot_core::types::NormalizationMode;
 use rerobot_core::BigInt;
 use rerobot_train::config::TrainConfig;
+use rerobot_train::indexmap::IndexMap;
 use std::io::Read;
 use std::path::PathBuf;
 
@@ -112,7 +115,6 @@ pub static UNSUPPORTED_ARGUMENTS: &[(&str, &str)] = &[
     ("job.target", "Hugging Face Jobs dispatch is not ported"),
     ("save_checkpoint_to_hub", "there is no Hub client in this slice"),
     ("sample_weighting", "per-sample loss weighting is not ported"),
-    ("rename_map", "the rename map only applies to a pretrained checkpoint, which cannot be loaded here"),
     ("scheduler", "learning-rate schedulers need the Draccus scheduler registry, which is not ported"),
     ("optimizer", "a hand-specified optimizer needs the Draccus optimizer registry; the ACT preset is used instead"),
     ("dataset.streaming", "the streaming dataset needs the Hub client"),
@@ -370,6 +372,7 @@ pub fn parse(args: &[String]) -> Result<TrainConfig, ArgumentError> {
     let mut num_workers: Option<u32> = None;
     let mut use_preset: Option<bool> = None;
     let mut use_imagenet_stats: Option<bool> = None;
+    let mut rename_map: Option<IndexMap<String, String>> = None;
 
     for (flag, raw) in &flags {
         let value = Value::parse(raw);
@@ -378,6 +381,7 @@ pub fn parse(args: &[String]) -> Result<TrainConfig, ArgumentError> {
             "dataset.root" => root = Some(PathBuf::from(value.as_string(flag)?)),
             "dataset.episodes" => episodes = Some(value.as_int_list(flag)?),
             "dataset.use_imagenet_stats" => use_imagenet_stats = Some(value.as_bool(flag)?),
+            "rename_map" => rename_map = Some(parse_rename_map(flag, raw)?),
             "output_dir" => output_dir = Some(PathBuf::from(value.as_string(flag)?)),
             "config_path" => config_path = Some(PathBuf::from(value.as_string(flag)?)),
             "resume" => resume = Some(value.as_bool(flag)?),
@@ -557,16 +561,82 @@ pub fn parse(args: &[String]) -> Result<TrainConfig, ArgumentError> {
         if let Some(value) = use_imagenet_stats {
             config.dataset_use_imagenet_stats = value;
         }
+        if let Some(value) = &rename_map {
+            config.rename_map = value.clone();
+        }
         config.resume = true;
         config.checkpoint_path = Some(checkpoint_dir);
         return Ok(config);
     }
-    if config_path.is_some() {
-        return Err(ArgumentError::Unsupported {
-            flag: "config_path".to_owned(),
-            reason: "resuming or loading a run config needs the Draccus config loader, which is not ported".to_owned(),
-        });
+    if let Some(path) = config_path {
+        if policy_path.is_some() {
+            return Err(ArgumentError::Value {
+                flag: "policy.path".to_owned(),
+                reason: "cannot be combined with --config_path; choose one configuration source"
+                    .to_owned(),
+            });
+        }
+        let mut config =
+            TrainConfig::from_config_file(&path).map_err(|error| ArgumentError::Value {
+                flag: "config_path".to_owned(),
+                reason: error.to_string(),
+            })?;
+        for (flag, value) in policy_overrides {
+            apply_policy_flag(&mut config.policy, &flag, &value)?;
+        }
+        if let Some(value) = repo_id {
+            config.dataset_repo_id = value;
+        }
+        if let Some(value) = root {
+            config.dataset_root = value;
+        }
+        if let Some(value) = output_dir {
+            config.output_dir = value;
+        }
+        if let Some(value) = episodes {
+            config.dataset_episodes = Some(value);
+        }
+        if let Some(value) = job_name {
+            config.job_name = Some(value);
+        }
+        if let Some(value) = seed {
+            config.seed = value;
+        }
+        if let Some(value) = batch_size {
+            config.batch_size = value;
+        }
+        if let Some(value) = steps {
+            config.steps = value;
+        }
+        if let Some(value) = log_freq {
+            config.log_freq = value;
+        }
+        if let Some(value) = save_freq {
+            config.save_freq = value;
+        }
+        if let Some(value) = save_checkpoint {
+            config.save_checkpoint = value;
+        }
+        if let Some(value) = tolerance_s {
+            config.tolerance_s = value;
+        }
+        if let Some(value) = num_workers {
+            config.num_workers = value;
+        }
+        if let Some(value) = use_preset {
+            config.use_policy_training_preset = value;
+        }
+        if let Some(value) = use_imagenet_stats {
+            config.dataset_use_imagenet_stats = value;
+        }
+        if let Some(value) = &rename_map {
+            config.rename_map = value.clone();
+        }
+        config.resume = false;
+        config.checkpoint_path = None;
+        return Ok(config);
     }
+
     if resume == Some(false) {
         // `--resume=false` is a valid explicit default and otherwise has no effect.
     }
@@ -633,6 +703,9 @@ pub fn parse(args: &[String]) -> Result<TrainConfig, ArgumentError> {
     }
     if let Some(value) = use_imagenet_stats {
         config.dataset_use_imagenet_stats = value;
+    }
+    if let Some(value) = rename_map {
+        config.rename_map = value;
     }
     Ok(config)
 }
@@ -829,6 +902,31 @@ fn apply_policy_flag(
     Ok(())
 }
 
+fn parse_rename_map(flag: &str, raw: &str) -> Result<IndexMap<String, String>, ArgumentError> {
+    let document =
+        rerobot_core::dataset::json::loads(raw).map_err(|error| ArgumentError::Value {
+            flag: flag.to_owned(),
+            reason: format!("expected a JSON object mapping strings to strings: {error}"),
+        })?;
+    let rerobot_core::dataset::json::JsonLike::Object(entries) = document else {
+        return Err(ArgumentError::Value {
+            flag: flag.to_owned(),
+            reason: "expected a JSON object mapping strings to strings".to_owned(),
+        });
+    };
+    let mut rename_map = IndexMap::with_capacity(entries.len());
+    for (source, target) in entries {
+        let rerobot_core::dataset::json::JsonLike::Str(target) = target else {
+            return Err(ArgumentError::Value {
+                flag: flag.to_owned(),
+                reason: format!("rename_map entry {source:?} must be a string"),
+            });
+        };
+        rename_map.insert(source, target);
+    }
+    Ok(rename_map)
+}
+
 fn optional_string(value: &Value, flag: &str) -> Result<Option<String>, ArgumentError> {
     match value {
         Value::Null => Ok(None),
@@ -878,6 +976,12 @@ pub fn help_section() -> String {
          \x20                              may be the checkpoint directory or checkpoints/last\n\
          \x20                              (dataset and policy flags are loaded from it)\n\
          \n\
+         Fresh config:\n\
+         \x20 --config_path=FILE --resume=false\n\
+         \x20                              load a local JSON train_config.json and start a\n\
+         \x20                              new run; CLI values override fields in the file\n\
+         \x20                              (general YAML/Draccus configs are not supported)\n\
+         \n\
          Run:\n\
          \x20 --steps=N --batch_size=N --seed=N|null --log_freq=N --save_freq=N\n\
          \x20 --save_checkpoint=BOOL --tolerance_s=SECONDS --job_name=NAME\n\
@@ -885,6 +989,8 @@ pub fn help_section() -> String {
          \x20 --dataset.use_imagenet_stats=BOOL  per-channel camera statistics;\n\
          \x20                                    true (the default) uses IMAGENET_STATS,\n\
          \x20                                    false leaves camera frames untouched\n\
+         \x20 --rename_map='{\"dataset.key\":\"policy.key\"}'\n\
+         \x20                              one-pass observation-key mapping for a pretrained policy\n\
          \n\
          Policy (ACTConfig fields):\n\
          \x20 --policy.chunk_size --policy.n_action_steps --policy.dim_model\n\

@@ -18,8 +18,8 @@ use serde_json::Value;
 ///
 /// Upstream keeps the SmolVLA-era name for backward compatibility with
 /// serialized processor configs; it is deliberately not the class name. This
-/// constant preserves the wire spelling only. Rerobot's processor registry and
-/// pipeline-config reconstruction are not ported yet.
+/// constant preserves the wire spelling used by the native JSON processor
+/// registry and pipeline-config reconstruction.
 pub const REGISTRY_NAME: &str = "smolvla_new_line_processor";
 
 /// A processor step that ensures the `task` description ends with a newline.

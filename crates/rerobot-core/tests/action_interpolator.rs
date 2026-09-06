@@ -637,3 +637,20 @@ fn adding_before_draining_discards_the_unconsumed_tail() {
     i.add(&[6.0]).unwrap();
     assert_eq!(i.get(), Some([4.0f32].as_slice()));
 }
+
+#[test]
+fn add_rejects_a_reasonable_multiplier_that_would_materialize_too_many_values() {
+    // A steps-only guard is not enough: 1,000 steps of a 17,000-wide action
+    // still asks for more than sixteen million scalar values and many separate
+    // heap allocations. The resource check must cover the whole output grid.
+    let mut wide: ActionInterpolator<f32> = ActionInterpolator::new(1_000).unwrap();
+    let previous = vec![0.0f32; 17_000];
+    wide.add(&previous).unwrap();
+    wide.get();
+    assert_eq!(
+        wide.add(&previous).unwrap_err(),
+        InterpolatorError::BufferNotAllocatable {
+            multiplier: BigInt::from(1_000)
+        }
+    );
+}

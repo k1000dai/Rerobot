@@ -117,10 +117,9 @@ assert_eq!(action.frame_index, 0);
 When observations come from a simulator, camera adapter, or another runtime,
 the checkpoint can be loaded without opening a dataset and consumed through the
 same single-observation `Batch` boundary as upstream `ACTPolicy.select_action`.
-Use `session.device()` for Candle tensor placement and
-`session.camera_normalizations()` when attaching camera tensors with
-`Batch::with_image_normalizations` (the singular `camera_normalization()` helper
-remains for a one-camera legacy caller):
+Use `session.device()` for Candle tensor placement and attach **raw** camera
+tensors in `[0, 1]` to `Batch::images`; `select_action_on_batch` applies the
+checkpoint's saved per-camera normalization and observation rename map:
 
 ```no_run
 use rerobot_train::data::batch::Batch;
@@ -131,7 +130,7 @@ let mut session = InferenceSession::load_checkpoint(
     Path::new("outputs/train/demo/checkpoints/000001/pretrained_model"),
     Some("cpu"),
 )?;
-let raw_batch: Batch = todo!("assemble one raw observation and attach camera tensors");
+let raw_batch: Batch = todo!("assemble one raw observation and camera tensors");
 let action = session.select_action_on_batch(&raw_batch)?;
 assert!(action.action.iter().all(|value| value.is_finite()));
 # Ok::<(), rerobot_train::error::TrainError>(())

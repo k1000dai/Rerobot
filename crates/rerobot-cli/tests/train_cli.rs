@@ -238,6 +238,82 @@ fn a_pretrained_policy_path_loads_and_trains_without_redeclaring_act_shape() {
 }
 
 #[test]
+fn a_pretrained_policy_applies_the_cli_rename_map_during_training() {
+    let dir = TempDir::new("pretrained-rename-e2e");
+    let source_output = dir.child("source");
+    let source = run(&slice_args(&source_output, &[]));
+    assert!(
+        source.status.success(),
+        "source run stderr: {}",
+        stderr_of(&source)
+    );
+    let source_policy = source_output.join("checkpoints/000001/pretrained_model");
+
+    let target_output = dir.child("target");
+    let args = vec![
+        "--dataset.repo_id=rerobot/state_only_slice".to_owned(),
+        format!("--dataset.root={}", fixture_dataset().display()),
+        format!("--output_dir={}", target_output.display()),
+        format!("--policy.path={}", source_policy.display()),
+        "--rename_map={\"observation.state\":\"observation.state\"}".to_owned(),
+        "--steps=1".to_owned(),
+        "--batch_size=2".to_owned(),
+    ];
+    let result = run(&args);
+    let stdout = stdout_of(&result);
+    let stderr = stderr_of(&result);
+    assert!(
+        result.status.success(),
+        "renamed pretrained run exited {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        result.status.code()
+    );
+    let preprocessor = std::fs::read_to_string(
+        target_output.join("checkpoints/000001/pretrained_model/policy_preprocessor.json"),
+    )
+    .unwrap();
+    assert!(
+        preprocessor.contains("\"observation.state\": \"observation.state\""),
+        "the CLI mapping was not carried into the processor: {preprocessor}"
+    );
+}
+
+#[test]
+fn a_pretrained_policy_accepts_the_top_level_json_rename_map() {
+    let args = vec![
+        "--dataset.repo_id=rerobot/state_only_slice".to_owned(),
+        format!("--dataset.root={}", fixture_dataset().display()),
+        "--output_dir=/tmp/rerobot-rename-map-test".to_owned(),
+        "--policy.type=act".to_owned(),
+        "--rename_map={\"observation.state\":\"observation.robot_state\"}".to_owned(),
+    ];
+
+    let config = rerobot_cli::train::parse(&args).expect("the JSON mapping is a valid CLI value");
+    assert_eq!(
+        config.rename_map.get("observation.state"),
+        Some(&"observation.robot_state".to_owned())
+    );
+}
+
+#[test]
+fn rename_map_rejects_non_string_json_values_instead_of_defaulting() {
+    let args = vec![
+        "--dataset.repo_id=rerobot/state_only_slice".to_owned(),
+        format!("--dataset.root={}", fixture_dataset().display()),
+        "--output_dir=/tmp/rerobot-rename-map-invalid-test".to_owned(),
+        "--policy.type=act".to_owned(),
+        "--rename_map={\"observation.state\":null}".to_owned(),
+    ];
+
+    let error = rerobot_cli::train::parse(&args).expect_err("null must not become a string");
+    assert!(
+        error
+            .to_string()
+            .contains("rename_map entry \"observation.state\" must be a string"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn a_hub_style_pretrained_policy_path_is_refused_without_download() {
     let dir = TempDir::new("hub-pretrained");
     let result = run(&slice_args(
@@ -335,6 +411,41 @@ fn a_local_checkpoint_can_be_resumed_without_retyping_dataset_or_policy_flags() 
             .join("checkpoints/000002/pretrained_model/model.safetensors")
             .is_file(),
         "the resumed run did not publish step two"
+    );
+}
+
+#[test]
+fn a_saved_train_config_can_start_a_fresh_run_without_retyping_dataset_or_policy_flags() {
+    let dir = TempDir::new("config-path-e2e");
+    let source_output = dir.child("source");
+    let source = run(&slice_args(&source_output, &[]));
+    assert!(
+        source.status.success(),
+        "source run stderr: {}",
+        stderr_of(&source)
+    );
+
+    let config_path = source_output.join("checkpoints/000001/pretrained_model/train_config.json");
+    let fresh_output = dir.child("fresh");
+    let result = run(&[
+        "--resume=false".to_owned(),
+        format!("--config_path={}", config_path.display()),
+        format!("--output_dir={}", fresh_output.display()),
+        "--steps=1".to_owned(),
+    ]);
+    let stdout = stdout_of(&result);
+    assert!(
+        result.status.success(),
+        "fresh config-path run exited {:?}\nstdout:\n{stdout}\nstderr:\n{}",
+        result.status.code(),
+        stderr_of(&result)
+    );
+    assert!(stdout.contains("step:1 loss:"), "stdout:\n{stdout}");
+    assert!(
+        fresh_output
+            .join("checkpoints/000001/pretrained_model/model.safetensors")
+            .is_file(),
+        "the config-path run did not publish a checkpoint"
     );
 }
 
@@ -479,9 +590,13 @@ fn help_states_the_partial_status_and_lists_what_is_accepted_and_refused() {
         stdout.contains("Refused, with a reason naming what is missing:"),
         "stdout:\n{stdout}"
     );
-    // Every refused flag is listed, so the boundary is discoverable without
-    // reading the source.
+    // Every refused flag is listed, and config_path's accepted forms are described, so
+    // the boundary is discoverable without reading the source.
     assert!(stdout.contains("--config_path"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("--config_path=FILE --resume=false"),
+        "stdout does not describe fresh config loading:\n{stdout}"
+    );
     assert!(stdout.contains("--resume=true"), "stdout:\n{stdout}");
     for flag in ["--wandb", "--policy.path"] {
         assert!(
@@ -583,7 +698,6 @@ fn a_flag_naming_an_unported_feature_is_refused_by_the_parser() {
     for (flag, fragment) in [
         ("--wandb.project=demo", "Weights & Biases"),
         ("--env.type=aloha", "Gymnasium"),
-        ("--config_path=x.json", "Draccus config loader"),
         ("--dataset.streaming=true", "Hub client"),
         ("--optimizer.lr=1e-4", "Draccus optimizer registry"),
         ("--peft=x", "PEFT"),

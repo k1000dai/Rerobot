@@ -1,6 +1,7 @@
 //! Behaviour parity tests for the rename processor, derived from upstream
 //! `tests/processor/test_rename_processor.py` at commit
-//! f37be3edbee60f3a09a5183788b91eb19f0c07d1.
+//! f37be3edbee60f3a09a5183788b91eb19f0c07d1, with the current upstream suffix
+//! extension pinned by `origin/main` commit `3f2c29ef7e44b1ddccbcda3b6a63939e53639e9e`.
 
 use indexmap::IndexMap;
 use rerobot_core::processor::rename::{
@@ -71,6 +72,46 @@ fn keys_absent_from_the_map_are_kept_verbatim() {
     assert_eq!(out["reward"], json!(1.0));
     assert_eq!(out["info"], json!({"episode": 1}));
     assert!(!out.contains_key("pixels"));
+}
+
+#[test]
+fn an_explicit_padding_mapping_takes_precedence_over_the_derived_suffix_rule() {
+    let step = RenameObservationsProcessorStep::new([
+        ("observation.state", "obs.state"),
+        ("observation.state_is_pad", "explicit.pad"),
+    ]);
+    let out = step.observation(&obs(&[
+        ("observation.state", json!([1.0])),
+        ("observation.state_is_pad", json!([false])),
+        ("observation.state_padding_mask", json!([true])),
+    ]));
+
+    assert_eq!(
+        out.keys().collect::<Vec<_>>(),
+        vec!["obs.state", "explicit.pad", "obs.state_padding_mask",]
+    );
+    assert_eq!(out["explicit.pad"], json!([false]));
+    assert_eq!(out["obs.state_padding_mask"], json!([true]));
+}
+
+#[test]
+fn current_upstream_renames_temporal_padding_metadata_with_its_feature() {
+    // The moved upstream implementation preserves the two derived keys when a
+    // feature is renamed. Exact-key mappings still take precedence over this
+    // suffix rule, and the rule is one-pass rather than cascading.
+    let step = RenameObservationsProcessorStep::new([("observation.state", "obs.state")]);
+    let out = step.observation(&obs(&[
+        ("observation.state", json!([1.0])),
+        ("observation.state_is_pad", json!([false])),
+        ("observation.state_padding_mask", json!([true])),
+    ]));
+
+    assert_eq!(
+        out.keys().cloned().collect::<Vec<_>>(),
+        vec!["obs.state", "obs.state_is_pad", "obs.state_padding_mask"]
+    );
+    assert_eq!(out["obs.state_is_pad"], json!([false]));
+    assert_eq!(out["obs.state_padding_mask"], json!([true]));
 }
 
 #[test]
@@ -192,6 +233,23 @@ fn transform_features_handles_overlapping_keys_like_the_observation_path() {
     let o = &out[&PipelineFeatureType::Observation];
     assert_eq!(o["b"], PolicyFeature::new(FeatureType::State, vec![1]));
     assert_eq!(o["c"], PolicyFeature::new(FeatureType::Action, vec![2]));
+}
+
+#[test]
+fn transform_features_keeps_unmapped_padding_metadata_exact() {
+    // Current upstream's feature declaration transform only maps exact feature
+    // names; the suffix extension is for runtime observation dictionaries.
+    let step = RenameObservationsProcessorStep::new([("observation.state", "obs.state")]);
+    let input = features(&[
+        ("observation.state", FeatureType::State, &[1]),
+        ("observation.state_is_pad", FeatureType::State, &[1]),
+    ]);
+    let out = step.transform_features(&input).unwrap();
+    let observation = &out[&PipelineFeatureType::Observation];
+
+    assert!(observation.contains_key("obs.state"));
+    assert!(observation.contains_key("observation.state_is_pad"));
+    assert!(!observation.contains_key("obs.state_is_pad"));
 }
 
 #[test]

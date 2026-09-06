@@ -150,7 +150,7 @@ pub static ENTRY_POINTS: &[EntryPoint] = &[
         target: "lerobot.scripts.lerobot_train:main",
         status: Status::Partial,
         summary: "Train a policy.",
-        note: "Runnable for one vertical slice: the ACT policy on a local or native Hub-downloaded LeRobot v3.0 snapshot with state/action columns and embedded PNG/JPEG camera columns (including dataset-provided per-camera normalization when `use_imagenet_stats=false`), or through the in-memory camera batch API. A local `--policy.path=DIR` warm-start loads the ACT `config.json`, weights, and four saved processor artifacts, then applies supported CLI policy overrides; Hub model IDs remain refused because native model download is not part of this boundary. `--policy.device` takes `cpu`, and `cuda`/`cuda:0` when built with the `cuda` feature; a GPU that was asked for and cannot be provided is an error rather than a silent fallback. A local one-process checkpoint can be resumed with `--resume=true --config_path=...`, restoring model, AdamW state, RNG and sampler position; Python's three-generator/distributed/accelerate resume semantics remain outside the boundary. Video decoding, external image files, image transforms, Hub streaming/revision flags, accelerate, mixed precision, LR schedulers, PEFT and environment evaluation are refused with a reason rather than ignored.",
+        note: "Runnable for one vertical slice: the ACT policy on a local or native Hub-downloaded LeRobot v3.0 snapshot with state/action columns and embedded PNG/JPEG camera columns (including dataset-provided per-camera normalization when `use_imagenet_stats=false`), or through the in-memory camera batch API. A local `--policy.path=DIR` warm-start loads the ACT `config.json`, weights, and four saved processor artifacts, then applies supported CLI policy overrides; `--rename_map='{\"dataset.key\":\"policy.key\"}'` is accepted for pretrained runs and overrides the saved observation mapping; `--config_path=FILE --resume=false` also loads a native JSON `train_config.json` as a fresh run with CLI overrides; general YAML/Draccus config files remain refused; Hub model IDs remain refused because native model download is not part of this boundary. `--policy.device` takes `cpu`, and `cuda`/`cuda:0` when built with the `cuda` feature; a GPU that was asked for and cannot be provided is an error rather than a silent fallback. A local one-process checkpoint can be resumed with `--resume=true --config_path=...`, restoring model, AdamW state, RNG and sampler position; Python's three-generator/distributed/accelerate resume semantics remain outside the boundary. Video decoding, external image files, image transforms, Hub streaming/revision flags, accelerate, mixed precision, LR schedulers, PEFT and environment evaluation are refused with a reason rather than ignored.",
     },
     EntryPoint {
         name: "lerobot-train-tokenizer",
@@ -252,9 +252,9 @@ pub static MODULE_FAMILIES: &[ModuleFamily] = &[
             "`configs.types` str-enums and `PolicyFeature` are ported and tested. The ACT policy's \
                concrete config is too, including the `from_pretrained`/`_save_pretrained` \
                checkpoint JSON path and the Draccus value conversions it decodes through. The \
-               Draccus CLI parser is not, and neither is `configs.train`: `lerobot-train` \
-               consumes an explicit allow-list of flags instead, refusing everything else by \
-               name.",
+               full Draccus CLI parser is not, but `lerobot-train` now preserves the native JSON \
+               `train_config.json` path and its ordered `rename_map` field while consuming an \
+               explicit allow-list of flags and refusing everything else by name.",
     },
     ModuleFamily {
         name: "data_processing",
@@ -317,15 +317,7 @@ pub static MODULE_FAMILIES: &[ModuleFamily] = &[
         name: "processor",
         status: Status::Partial,
         upstream_modules: 19,
-        note: "`rename_processor` (step + `rename_stats`) and the value transform/stateless \
-               lifecycle of `newline_task_processor.NewLineTaskProcessorStep` are ported and \
-               tested, as is `normalize_processor`'s numeric transform for all four of its \
-               modes. The four pre/postprocessor artifacts a checkpoint carries are written \
-               byte-identically to upstream's, and the native ACT deployment path now validates \
-               and consumes their saved numeric state for observation normalization and action \
-               unnormalization. Python aliasing, general registry/config reconstruction, and the \
-               tokenizer, device, batch and full multi-step pipeline runtime remain outside this \
-               boundary.",
+        note: "`rename_processor` (step + `rename_stats`) and the value transform/stateless lifecycle of `newline_task_processor.NewLineTaskProcessorStep` are ported and tested, as is `normalize_processor`'s numeric transform for all four of its modes. The four pre/postprocessor artifacts a checkpoint carries are written byte-identically to upstream's; `rerobot_core::processor::pipeline` now reconstructs and executes ordered JSON transitions for the two stateless registered steps and round-trips their config. Python aliasing, mutable custom registration, dynamic imports, tensor state, and the tokenizer, device, batch and normalizer steps remain outside this boundary.",
     },
     ModuleFamily {
         name: "rewards",

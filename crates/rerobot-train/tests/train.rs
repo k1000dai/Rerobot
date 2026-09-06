@@ -230,6 +230,56 @@ fn resuming_uses_checkpoint_processor_statistics_not_dataset_statistics() {
 }
 
 #[test]
+fn resume_reconstructs_the_policy_feature_namespace_from_policy_config() {
+    let (_source_dir, source_outcome, _) = train_once("resume-policy-config");
+    let checkpoint = source_outcome
+        .checkpoints
+        .first()
+        .expect("the source run writes a checkpoint");
+    let train_config =
+        TrainConfig::from_checkpoint_dir(checkpoint).expect("the train config reconstructs");
+    let policy_path = checkpoint.join("pretrained_model/config.json");
+    let policy_text = std::fs::read_to_string(&policy_path).expect("the policy config exists");
+    let policy = rerobot_core::policy::act::ActConfig::from_checkpoint_json(&policy_text)
+        .expect("the policy config parses");
+
+    assert_eq!(train_config.policy.input_features, policy.input_features);
+    assert_eq!(train_config.policy.output_features, policy.output_features);
+    assert!(
+        train_config
+            .policy
+            .input_features
+            .as_ref()
+            .is_some_and(|features| !features.is_empty()),
+        "resume must not discard the model's resolved input namespace"
+    );
+}
+
+#[test]
+fn oversized_policy_config_is_rejected_before_unbounded_checkpoint_read() {
+    let (_source_dir, source_outcome, _) = train_once("oversized-resume-policy-config");
+    let checkpoint = source_outcome
+        .checkpoints
+        .first()
+        .expect("the source run writes a checkpoint");
+    let policy_path = checkpoint.join("pretrained_model").join("config.json");
+    let oversized = vec![b' '; rerobot_train::limits::MAX_CHECKPOINT_JSON_BYTES as usize + 1];
+    std::fs::write(&policy_path, oversized).expect("the fixture policy config is replaceable");
+
+    let error = TrainConfig::from_checkpoint_dir(checkpoint)
+        .expect_err("a policy config beyond the checkpoint budget must be refused");
+
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "{}: config.json exceeds the {}-byte limit",
+            policy_path.display(),
+            rerobot_train::limits::MAX_CHECKPOINT_JSON_BYTES
+        )
+    );
+}
+
+#[test]
 fn the_step_moves_the_weights_rather_than_merely_running() {
     let (_dir, outcome, _) = train_once("weights-move");
     let step = &outcome.steps[0];
@@ -1028,6 +1078,41 @@ fn the_saved_train_config_carries_upstreams_full_field_set() {
             "train_config.json is missing {field}, so upstream could not read it back"
         );
     }
+}
+
+#[test]
+fn a_saved_train_config_round_trips_the_ordered_rename_map() {
+    let dir = TempDir::new("rename-map-config");
+    let mut config = reduced_config(fixture_dataset(), dir.child("out"));
+    config.rename_map.insert(
+        "observation.state".to_owned(),
+        "observation.robot_state".to_owned(),
+    );
+    config.rename_map.insert(
+        "observation.image".to_owned(),
+        "observation.camera".to_owned(),
+    );
+
+    let document = loads(&config.to_json_text()).unwrap();
+    let JsonLike::Object(root) = document else {
+        panic!("train_config.json should be an object");
+    };
+    let JsonLike::Object(rename_map) = &root["rename_map"] else {
+        panic!("rename_map should be an object");
+    };
+    assert_eq!(
+        rename_map.keys().collect::<Vec<_>>(),
+        vec!["observation.state", "observation.image"]
+    );
+    assert_eq!(
+        rename_map["observation.state"],
+        JsonLike::Str("observation.robot_state".to_owned())
+    );
+
+    let path = dir.child("train_config.json");
+    std::fs::write(&path, config.to_json_text()).unwrap();
+    let loaded = TrainConfig::from_config_file(&path).unwrap();
+    assert_eq!(loaded.rename_map, config.rename_map);
 }
 
 #[test]

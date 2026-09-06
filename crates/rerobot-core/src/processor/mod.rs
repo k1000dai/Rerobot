@@ -9,6 +9,7 @@ use indexmap::IndexMap;
 use serde_json::Value;
 
 pub mod newline_task;
+pub mod pipeline;
 pub mod rename;
 
 /// Insertion-ordered feature dict for one pipeline stage.

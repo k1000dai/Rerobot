@@ -8,6 +8,18 @@
 use num_bigint::BigInt;
 use std::fmt;
 
+/// Hard upper bound for the number of interpolated action vectors retained at
+/// once. The upstream Python list can grow until `MemoryError`; a Rust
+/// `Vec<Vec<T>>` must refuse a hostile multiplier before the allocator is asked
+/// for a potentially enormous virtual allocation.
+pub const MAX_INTERPOLATION_STEPS: usize = 1_000_000;
+
+/// Hard upper bound for scalar elements in one materialized interpolation
+/// buffer. This complements [`MAX_INTERPOLATION_STEPS`]: a modest step count
+/// combined with an exceptionally wide action must not create an unbounded
+/// number of per-step vectors.
+pub const MAX_INTERPOLATION_ELEMENTS: usize = 1 << 24;
+
 /// Scalar element type an [`ActionInterpolator`] can operate on.
 ///
 /// Implemented for `f32` (matching a `torch.float32` action tensor, the default
@@ -251,6 +263,12 @@ impl<T: Scalar> ActionInterpolator<T> {
                 };
                 let steps = usize::try_from(&self.multiplier)
                     .ok()
+                    .filter(|steps| *steps <= MAX_INTERPOLATION_STEPS)
+                    .filter(|steps| {
+                        steps
+                            .checked_mul(width)
+                            .is_some_and(|elements| elements <= MAX_INTERPOLATION_ELEMENTS)
+                    })
                     .filter(|steps| self.buffer.try_reserve(*steps).is_ok())
                     .ok_or_else(|| InterpolatorError::BufferNotAllocatable {
                         multiplier: self.multiplier.clone(),

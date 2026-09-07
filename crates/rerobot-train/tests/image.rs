@@ -25,7 +25,7 @@ use rerobot_core::policy::act::ActConfig;
 use rerobot_core::random::SplitMix64;
 use rerobot_core::types::{FeatureType, PolicyFeature};
 use rerobot_core::BigInt;
-use rerobot_train::data::batch::{collate, Batch};
+use rerobot_train::data::batch::{collate, collate_images, Batch};
 use rerobot_train::data::dataset::StateOnlyDataset;
 use rerobot_train::data::image::CameraNormalization;
 use rerobot_train::data::meta::DatasetMetadata;
@@ -645,14 +645,8 @@ fn a_training_step_through_the_session_moves_the_backbone() {
     );
 
     let before = backbone_snapshot(&session);
-    let raw = session
-        .next_batch()
-        .unwrap()
-        .with_images(
-            &camera_map(&[TOP], config.batch_size, EXTENT),
-            &CameraNormalization::imagenet(),
-        )
-        .unwrap();
+    let mut raw = session.next_batch().unwrap();
+    raw.images = camera_map(&[TOP], config.batch_size, EXTENT);
     let metrics = session.step_on(1, &raw).unwrap();
 
     assert!(metrics.loss.is_finite() && metrics.grad_norm > 0.0);
@@ -671,6 +665,38 @@ fn a_training_step_through_the_session_moves_the_backbone() {
         "AdamW ran but no backbone parameter changed; the backbone group is not being \
          optimized"
     );
+}
+
+#[test]
+fn step_on_normalizes_raw_camera_tensors_like_the_dataset_path() {
+    let first_dir = TempDir::new("raw-camera-step");
+    let mut first_config = reduced_config(common::embedded_image_fixture(), first_dir.child("out"));
+    first_config.validate().unwrap();
+    let mut raw_session = TrainSession::new(&first_config).unwrap();
+    let preview = raw_session.next_batch().unwrap();
+    let frames: Vec<_> = preview
+        .indices
+        .iter()
+        .map(|index| raw_session.dataset.get(*index as usize).unwrap())
+        .collect();
+    let mut raw_batch = collate(&frames, raw_session.device()).unwrap();
+    raw_batch.images = collate_images(&frames, raw_session.device()).unwrap();
+
+    let second_dir = TempDir::new("normalized-camera-step");
+    let mut expected_config =
+        reduced_config(common::embedded_image_fixture(), second_dir.child("out"));
+    expected_config.validate().unwrap();
+    let mut expected_session = TrainSession::new(&expected_config).unwrap();
+
+    let raw_metrics = raw_session.step_on(1, &raw_batch).unwrap();
+    let expected_metrics = expected_session.step(1).unwrap();
+    assert_eq!(raw_metrics.frame_indices, expected_metrics.frame_indices);
+    assert_eq!(
+        raw_metrics.loss, expected_metrics.loss,
+        "step_on must apply the session's camera normalization to raw images"
+    );
+    assert_eq!(raw_metrics.l1_loss, expected_metrics.l1_loss);
+    assert_eq!(raw_metrics.grad_norm, expected_metrics.grad_norm);
 }
 
 /// The sum of squares of every backbone parameter, one entry per tensor.

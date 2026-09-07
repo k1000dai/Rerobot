@@ -1837,3 +1837,40 @@ cargo test -p rerobot-train --test processor loaded_pipeline_normalizes_raw_came
 cargo test -p rerobot-train --test processor --locked
 21 passed; 0 failed
 ```
+
+## Cycle 35 — normalize caller-owned camera batches before training
+
+`TrainSession::step_on` documents a caller-owned batch boundary for cameras. Before
+this slice it renamed and scalar-normalized that batch, but left its camera tensors
+in raw `[0, 1]` form. The dataset path normalized cameras in `next_batch`, so the
+same frames produced different training updates depending on whether they arrived
+from the sampler or an in-memory adapter.
+
+**RED** — the new end-to-end regression used the committed embedded-image fixture,
+ran the real ACT update twice on the same sampled frames, and compared the raw
+caller path with the ordinary dataset path:
+
+```
+cargo test -p rerobot-train --test image step_on_normalizes_raw_camera_tensors_like_the_dataset_path --locked -- --exact
+assertion `left == right` failed: step_on must apply the session's camera normalization to raw images
+left: 17.794048309326172
+right: 17.646963119506836
+```
+
+The mismatch was in the loss after model construction, not a parser or fixture
+failure. A later attempt also caught the lifecycle hazard where moving normalization
+into `step_on` would double-normalize the already camera-processed batch returned by
+`next_batch`; the final implementation keeps that path separate from the raw API.
+
+**GREEN** — `step` now performs the existing dataset rename/scalar-normalization
+boundary and runs a private preprocessed update body. `step_on` applies per-camera
+statistics to raw input keys first, then performs the same one-pass rename and
+scalar normalization before entering that body. State-only callers retain the old
+path, and camera renames use the existing raw-key selector.
+
+```
+cargo test -p rerobot-train --test image step_on_normalizes_raw_camera_tensors_like_the_dataset_path --locked -- --exact
+1 passed; 0 failed
+cargo test -p rerobot-train --test image --locked
+21 passed; 0 failed
+```

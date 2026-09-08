@@ -258,6 +258,52 @@ fn offline_rollout_reports_each_requested_frame_in_order() {
 }
 
 #[test]
+fn rollout_with_sink_streams_each_action_after_policy_selection() {
+    let (_dir, checkpoint) = trained_checkpoint();
+    let mut session = InferenceSession::load(&checkpoint, &fixture_dataset(), None)
+        .expect("the checkpoint loads");
+    let mut actions = Vec::new();
+
+    let mut trace = Vec::new();
+    session
+        .rollout_with_sink(0, 3, |step| {
+            actions.push(step.action.clone());
+            trace.push(step.clone());
+            Ok(())
+        })
+        .expect("the rollout reaches the action sink");
+
+    assert_eq!(actions.len(), trace.len());
+    assert_eq!(
+        actions,
+        trace
+            .iter()
+            .map(|step| step.action.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn rollout_with_sink_stops_before_the_next_frame_when_the_sink_fails() {
+    let (_dir, checkpoint) = trained_checkpoint();
+    let mut session = InferenceSession::load(&checkpoint, &fixture_dataset(), None)
+        .expect("the checkpoint loads");
+    let mut calls = 0;
+
+    let error = session
+        .rollout_with_sink(0, 3, |_action| {
+            calls += 1;
+            Err(rerobot_train::error::TrainError::unsupported(
+                "action sink stopped",
+            ))
+        })
+        .expect_err("a sink failure must abort the rollout");
+
+    assert_eq!(calls, 1);
+    assert!(error.to_string().contains("action sink stopped"));
+}
+
+#[test]
 fn each_offline_rollout_starts_with_fresh_policy_state() {
     let (_dir, checkpoint) = trained_checkpoint();
     let dataset = fixture_dataset();

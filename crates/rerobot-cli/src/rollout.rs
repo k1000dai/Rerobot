@@ -220,11 +220,12 @@ pub fn run(
         &config.dataset_root,
         config.device.as_deref(),
     )?;
-    for step in session.rollout(config.start_index, config.steps)? {
+    session.rollout_with_sink(config.start_index, config.steps, |step| {
         observe(&format!(
             "frame:{} action:{:?} queried:{}",
             step.frame_index, step.action, step.queried_policy
         ));
-    }
+        Ok(())
+    })?;
     Ok(())
 }

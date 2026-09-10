@@ -1606,6 +1606,7 @@ dependencies = [
 name = "rerobot-hardware"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "serialport",
 ]
 

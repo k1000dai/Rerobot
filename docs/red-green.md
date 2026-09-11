@@ -1874,3 +1874,32 @@ cargo test -p rerobot-train --test image step_on_normalizes_raw_camera_tensors_l
 cargo test -p rerobot-train --test image --locked
 21 passed; 0 failed
 ```
+
+## Cycle 36 — refuse current-upstream processor artifacts at the training boundary
+
+The pinned LeRobot 0.6.1 processor JSON has no `artifacts` entries. Current
+upstream `main` at `b6ec0060779550c0a157ae34feb89e0cf86012a8` adds them when a
+processor step saves extra files and resolves each declared relative path before
+constructing the step (`src/lerobot/processor/pipeline.py:563-577,1051-1099`).
+The native ACT loader does not yet implement that path resolution, so accepting
+and ignoring a non-empty declaration would produce a checkpoint that is not
+actually equivalent.
+
+**RED** — before the validation boundary was added, a test-bearing preprocessor
+with `artifacts: {"normalizer": "normalizer.safetensors"}` loaded successfully:
+
+```
+cargo test -p rerobot-train --test processor nonempty_current_upstream_processor_artifacts_are_rejected_before_deployment --locked -- --exact --nocapture
+RED_EXIT=101
+unsupported processor artifacts must not be silently ignored: LoadedPolicyProcessors { ... }
+```
+
+**GREEN** — `validate_pipeline` now accepts an empty compatibility object but
+rejects a non-empty or wrongly typed `artifacts` field before any safetensors
+state is loaded. This is an explicit unsupported boundary, not a claim that
+current-main artifact-backed processors are deployable.
+
+```
+cargo test -p rerobot-train --test processor nonempty_current_upstream_processor_artifacts_are_rejected_before_deployment --locked -- --exact --nocapture
+1 passed; 0 failed
+```

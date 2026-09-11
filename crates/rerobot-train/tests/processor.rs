@@ -605,6 +605,28 @@ fn malformed_saved_rename_map_is_rejected_before_deployment() {
         .contains("rename_map entry \"state\" must be a string"));
 }
 
+#[test]
+fn nonempty_current_upstream_processor_artifacts_are_rejected_before_deployment() {
+    let (_dir, target) = written("processor-unsupported-artifacts");
+    let config_path = target.join("policy_preprocessor.json");
+    let config = std::fs::read_to_string(&config_path).expect("the preprocessor config reads");
+    let config = config.replace(
+        "      \"config\": {\n        \"rename_map\": {}\n      }",
+        "      \"artifacts\": {\n        \"normalizer\": \"normalizer.safetensors\"\n      },\n      \"config\": {\n        \"rename_map\": {}\n      }",
+    );
+    std::fs::write(&config_path, config).expect("the artifact-bearing config writes");
+
+    let mut policy = reduced_config(fixture_dataset(), target.join("out")).policy;
+    let metadata =
+        rerobot_train::data::meta::DatasetMetadata::load(&fixture_dataset()).expect("fixture");
+    let (inputs, outputs) = metadata.policy_feature_split();
+    policy.input_features = Some(inputs);
+    policy.output_features = Some(outputs);
+    let error = LoadedPolicyProcessors::load(&target, &policy)
+        .expect_err("unsupported processor artifacts must not be silently ignored");
+    assert!(error.to_string().contains("artifacts"), "{error}");
+}
+
 // ---------------------------------------------------------------------------
 // The JSON, byte for byte
 // ---------------------------------------------------------------------------

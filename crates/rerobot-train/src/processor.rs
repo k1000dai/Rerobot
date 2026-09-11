@@ -419,6 +419,21 @@ fn validate_pipeline(
                 "{expected_name}.json step {index} must be an object"
             )));
         };
+        if let Some(artifacts) = step.get("artifacts") {
+            match artifacts {
+                JsonLike::Object(artifacts) if artifacts.is_empty() => {}
+                JsonLike::Object(_) => {
+                    return Err(TrainError::Metadata(format!(
+                        "{expected_name}.json step {index} artifacts are unsupported by the native stateless processor boundary"
+                    )));
+                }
+                _ => {
+                    return Err(TrainError::Metadata(format!(
+                        "{expected_name}.json step {index} artifacts must be an object"
+                    )));
+                }
+            }
+        }
         if step.get("registry_name") != Some(&JsonLike::Str((*expected).to_owned())) {
             return Err(TrainError::Metadata(format!(
                 "{expected_name}.json step {index} is not {expected}"

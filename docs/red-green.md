@@ -1903,3 +1903,41 @@ current-main artifact-backed processors are deployable.
 cargo test -p rerobot-train --test processor nonempty_current_upstream_processor_artifacts_are_rejected_before_deployment --locked -- --exact --nocapture
 1 passed; 0 failed
 ```
+
+## Cycle 37 — stream caller-owned deployment batches through the ACT boundary
+
+The checkpoint-only deployment API already accepted one raw observation batch.
+The missing vertical slice was the finite runtime loop needed by a simulator or
+camera adapter: reset the queued action trace, apply the saved rename and
+normalization processors to every observation, emit each action to a sink, and
+stop without consuming another observation when the sink fails.
+
+**RED** — the first end-to-end deployment test was added before the adapter:
+
+```
+cargo test -p rerobot-train --test deploy caller_batch_stream_reuses_the_policy_queue_and_delivers_each_action --locked
+error[E0599]: no method named `rollout_batches_with_sink` found for struct `InferenceSession`
+help: there is a method `rollout_with_sink` with a similar name
+RED_EXIT=101
+```
+
+**GREEN** — `InferenceSession::rollout_batches_with_sink` now resets at trace
+start, consumes only single-observation `Batch` values through
+`select_action_on_batch`, forwards `InferenceStep` values to the caller sink,
+and enforces the existing rollout-step resource limit. Focused tests cover the
+queue's first/continued action decisions, sink failure short-circuiting,
+rejecting a known-overlong iterator before consumption, and resetting a queued
+chunk before a new trace:
+
+```
+cargo test -p rerobot-train --test deploy caller_batch_stream --locked
+4 passed; 0 failed
+```
+
+The method also enforces the existing rollout-step resource limit for iterators
+whose upper bound is unknown; it does not process the item that crosses the cap.
+
+The method intentionally does not infer episode boundaries from caller-owned
+batches; the simulator or hardware adapter must call `reset()` between episodes.
+This is a hardware-independent deployment seam, not a claim that a robot driver
+or Gymnasium environment is ported.

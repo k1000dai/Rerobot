@@ -120,8 +120,11 @@ Three details worth knowing up front:
   action queue or temporal ensembler. Finite action traces are emitted in the
   checkpoint's action units. The library also loads a checkpoint without a
   dataset and accepts a caller-owned single-observation `Batch`, which is the
-  boundary for simulator or camera adapters. Robot drivers, Gymnasium
-  environments, and video shards remain refused.
+  boundary for simulator or camera adapters. The library also provides a finite
+  `rollout_batches_with_sink` loop that resets the action queue at trace start,
+  applies the saved preprocessing to each caller batch, and stops on sink errors;
+  callers explicitly reset at environment episode boundaries. Robot drivers,
+  Gymnasium environments, and video shards remain refused.
 
 ## Development
 

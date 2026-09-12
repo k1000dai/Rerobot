@@ -388,6 +388,55 @@ impl InferenceSession {
         self.select_action_normalized(&normalized, frame_index)
     }
 
+    /// Run a finite stream of caller-owned observations and deliver each action.
+    ///
+    /// This is the deployment seam for a simulator or another runtime that owns
+    /// observation acquisition. The session is reset before the stream starts, so a
+    /// queued action from an earlier trace cannot leak into this one. Each item must
+    /// be a single-observation raw batch and is passed through the same rename,
+    /// camera/scalar normalization, action queue or temporal ensembler, and action
+    /// unnormalization path as [`Self::select_action_on_batch`]. The caller must call
+    /// [`Self::reset`] when its environment starts a new episode: a caller-owned
+    /// batch has no dataset episode table from which this method could infer that
+    /// boundary.
+    ///
+    /// The stream is capped at [`crate::limits::MAX_ROLLOUT_TRACE_STEPS`] items. If
+    /// the iterator reports a larger upper bound, it is rejected before consuming
+    /// it. Iterators without a usable upper bound are rejected after the cap is
+    /// reached, without processing the extra batch, so an accidental unbounded
+    /// source cannot run forever inside this adapter.
+    pub fn rollout_batches_with_sink<I, F>(&mut self, batches: I, mut sink: F) -> Result<usize>
+    where
+        I: IntoIterator<Item = Batch>,
+        F: FnMut(&InferenceStep) -> Result<()>,
+    {
+        let batches = batches.into_iter();
+        if batches
+            .size_hint()
+            .1
+            .is_some_and(|upper| upper > crate::limits::MAX_ROLLOUT_TRACE_STEPS)
+        {
+            return Err(TrainError::unsupported(format!(
+                "caller-owned rollout stream exceeds the limit {}",
+                crate::limits::MAX_ROLLOUT_TRACE_STEPS
+            )));
+        }
+        self.reset();
+        let mut count = 0usize;
+        for batch in batches {
+            if count == crate::limits::MAX_ROLLOUT_TRACE_STEPS {
+                return Err(TrainError::unsupported(format!(
+                    "caller-owned rollout stream exceeds the limit {} items",
+                    crate::limits::MAX_ROLLOUT_TRACE_STEPS
+                )));
+            }
+            let step = self.select_action_on_batch(&batch)?;
+            sink(&step)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     fn select_action_normalized(
         &mut self,
         batch: &Batch,

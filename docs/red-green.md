@@ -1941,3 +1941,35 @@ The method intentionally does not infer episode boundaries from caller-owned
 batches; the simulator or hardware adapter must call `reset()` between episodes.
 This is a hardware-independent deployment seam, not a claim that a robot driver
 or Gymnasium environment is ported.
+
+## Cycle 38 — pace the finite SO-101 control loop
+
+At the pinned LeRobot commit, the hardware rollout records the elapsed time for
+one observation/policy/action cycle and waits for `max(1 / fps - elapsed, 0)`
+with `robot_utils.precise_sleep`. The existing Rust SO-101 path wrote actions as
+fast as the serial/model path allowed, so it did not preserve the configured
+30 Hz default or the user-selected `fps`.
+
+**RED** — the precision helper was specified by a focused test before it was
+implemented:
+
+```
+cargo test -p rerobot-cli --lib rollout::tests::precise_sleep_waits_for_a_positive_duration --locked
+error[E0425]: cannot find function `precise_sleep` in this scope
+RED_EXIT=101
+```
+
+**GREEN** — `RolloutConfig` now accepts a positive finite `--fps` (default
+`30.0`), the hardware loop computes the remaining interval after each complete
+read/select/write cycle, and `precise_sleep` mirrors upstream's macOS/Windows
+sleep-margin plus final-spin behavior while using the scheduler on other
+platforms. Offline dataset-backed rollout remains unchanged. The regression
+coverage includes exact interval arithmetic, no sleep after an overrun, float
+CLI parsing/rejection, and a positive-duration sleep:
+
+```
+cargo test -p rerobot-cli --lib rollout::tests --locked
+3 passed; 0 failed
+cargo test -p rerobot-cli --test rollout_cli --locked
+8 passed; 0 failed
+```

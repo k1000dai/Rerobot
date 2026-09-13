@@ -15,9 +15,10 @@ use rerobot_train::error::TrainError;
 use rerobot_train::indexmap::IndexMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 /// The executable's supported offline rollout configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct RolloutConfig {
     /// Directory containing `config.json` and `model.safetensors`.
     pub policy_path: PathBuf,
@@ -36,7 +37,25 @@ pub struct RolloutConfig {
     pub calibration_path: Option<PathBuf>,
     /// Explicit acknowledgement that the hardware path may enable torque.
     pub confirm: bool,
+    /// Target hardware control-loop frequency, matching upstream's default.
+    pub fps: f64,
 }
+
+impl PartialEq for RolloutConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.policy_path == other.policy_path
+            && self.dataset_root == other.dataset_root
+            && self.steps == other.steps
+            && self.start_index == other.start_index
+            && self.device == other.device
+            && self.robot_port == other.robot_port
+            && self.calibration_path == other.calibration_path
+            && self.confirm == other.confirm
+            && self.fps.to_bits() == other.fps.to_bits()
+    }
+}
+
+impl Eq for RolloutConfig {}
 
 /// Why a rollout command could not be started.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +152,69 @@ fn parse_index(flag: &str, value: &str) -> Result<usize, ArgumentError> {
     })
 }
 
+fn parse_fps(flag: &str, value: &str) -> Result<f64, ArgumentError> {
+    let fps = value.parse::<f64>().map_err(|_| ArgumentError::Value {
+        flag: flag.to_owned(),
+        reason: "expected a positive finite number".to_owned(),
+    })?;
+    if !fps.is_finite() || fps <= 0.0 {
+        return Err(ArgumentError::Value {
+            flag: flag.to_owned(),
+            reason: "expected a positive finite number".to_owned(),
+        });
+    }
+    Ok(fps)
+}
+
+/// Return the sleep remaining after one hardware control tick.
+///
+/// Upstream sleeps for `max(1 / fps - elapsed, 0)` after reading the
+/// observation, selecting an action, and sending it. Invalid frequencies are
+/// rejected by the CLI; returning zero here keeps the low-level helper
+/// bounded for library callers too.
+fn control_sleep_duration(fps: f64, elapsed: Duration) -> Duration {
+    if !fps.is_finite() || fps <= 0.0 {
+        return Duration::ZERO;
+    }
+    let interval_seconds = 1.0 / fps;
+    if !interval_seconds.is_finite() || interval_seconds > Duration::MAX.as_secs_f64() {
+        return Duration::ZERO;
+    }
+    Duration::from_secs_f64(interval_seconds).saturating_sub(elapsed)
+}
+
+/// Sleep until a control-loop deadline without oversleeping short intervals.
+///
+/// This mirrors upstream `robot_utils.precise_sleep`: on macOS and Windows it
+/// sleeps most of a long remainder and spins for the final 10 ms; other targets
+/// use the platform scheduler directly.
+fn precise_sleep(duration: Duration) {
+    if duration.is_zero() {
+        return;
+    }
+    if !(cfg!(target_os = "macos") || cfg!(target_os = "windows")) {
+        std::thread::sleep(duration);
+        return;
+    }
+    let Some(deadline) = Instant::now().checked_add(duration) else {
+        std::thread::sleep(duration);
+        return;
+    };
+    let spin_threshold = Duration::from_millis(10);
+    let sleep_margin = Duration::from_millis(5);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        if remaining > spin_threshold {
+            std::thread::sleep(remaining.saturating_sub(sleep_margin));
+        } else {
+            std::hint::spin_loop();
+        }
+    }
+}
+
 /// Parse the supported `lerobot-rollout` arguments.
 pub fn parse(args: &[String]) -> Result<RolloutConfig, ArgumentError> {
     let mut policy_path = None;
@@ -144,6 +226,7 @@ pub fn parse(args: &[String]) -> Result<RolloutConfig, ArgumentError> {
     let mut robot_port = None;
     let mut calibration_path = None;
     let mut confirm = false;
+    let mut fps = 30.0;
 
     for (flag, value) in split_flags(args)? {
         match flag.as_str() {
@@ -151,6 +234,7 @@ pub fn parse(args: &[String]) -> Result<RolloutConfig, ArgumentError> {
             "dataset.root" => dataset_root = Some(PathBuf::from(value)),
             "steps" => steps = Some(parse_index(&flag, &value)?),
             "start_index" => start_index = parse_index(&flag, &value)?,
+            "fps" => fps = parse_fps(&flag, &value)?,
             "policy.device" => device = Some(value),
             "robot.type" if value == "so101_follower" => robot_type = Some(value),
             "robot.type" => {
@@ -284,12 +368,13 @@ pub fn parse(args: &[String]) -> Result<RolloutConfig, ArgumentError> {
         robot_port,
         calibration_path,
         confirm,
+        fps,
     })
 }
 
 /// Help section for the supported offline invocation.
 pub fn help_section() -> &'static str {
-    "Accepted rollout options:\n  --policy.path=DIR       ACT checkpoint's pretrained_model directory\n  --dataset.root=DIR      local LeRobot dataset root\n  --steps=N               finite number of actions to emit\n  --start_index=N         first dataset frame (default: 0)\n  --policy.device=cpu     optional device override\n\nHardware source (state-only SO-101 follower):\n  --robot.type=so101_follower\n  --robot.port=PATH       serial port at 1 Mbps\n  --robot.calibration=FILE upstream calibration JSON\n  --robot.confirm=true    required before enabling torque\n\nThe dataset path loads a local checkpoint and emits actions without hardware. The\nSO-101 path reads six calibrated joint observations, runs the local ACT checkpoint,\nsends finite position actions, and releases torque on exit. Cameras, environments,\nteleoperators, async inference, and video shards remain refused."
+    "Accepted rollout options:\n  --policy.path=DIR       ACT checkpoint's pretrained_model directory\n  --dataset.root=DIR      local LeRobot dataset root\n  --steps=N               finite number of actions to emit\n  --start_index=N         first dataset frame (default: 0)\n  --fps=HZ                hardware control-loop target (default: 30)\n  --policy.device=cpu     optional device override\n\nHardware source (state-only SO-101 follower):\n  --robot.type=so101_follower\n  --robot.port=PATH       serial port at 1 Mbps\n  --robot.calibration=FILE upstream calibration JSON\n  --robot.confirm=true    required before enabling torque\n\nThe dataset path loads a local checkpoint and emits actions without hardware. The\nSO-101 path reads six calibrated joint observations, runs the local ACT checkpoint,\nsends finite position actions, and releases torque on exit. Cameras, environments,\nteleoperators, async inference, and video shards remain refused."
 }
 
 /// Build the single-observation batch expected by `InferenceSession`.
@@ -398,10 +483,13 @@ fn run_so101(
             Ok(())
         };
         for frame_index in 0..config.steps {
+            let loop_start = Instant::now();
             send_step(
                 i64::try_from(frame_index)
                     .map_err(|_| hardware_error("rollout frame index does not fit in i64"))?,
             )?;
+            let sleep_time = control_sleep_duration(config.fps, loop_start.elapsed());
+            precise_sleep(sleep_time);
         }
         Ok(())
     })();
@@ -481,5 +569,28 @@ mod tests {
         let error = action_array(&step).expect_err("SO-101 actions cannot be truncated or padded");
 
         assert!(error.to_string().contains("six"), "{error}");
+    }
+
+    #[test]
+    fn control_sleep_duration_keeps_hardware_rollout_at_the_requested_fps() {
+        assert_eq!(
+            control_sleep_duration(20.0, std::time::Duration::from_millis(10)),
+            std::time::Duration::from_millis(40)
+        );
+    }
+
+    #[test]
+    fn control_sleep_duration_does_not_sleep_after_an_overrun() {
+        assert_eq!(
+            control_sleep_duration(20.0, std::time::Duration::from_millis(60)),
+            std::time::Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn precise_sleep_waits_for_a_positive_duration() {
+        let start = Instant::now();
+        precise_sleep(std::time::Duration::from_millis(2));
+        assert!(start.elapsed() >= std::time::Duration::from_millis(2));
     }
 }

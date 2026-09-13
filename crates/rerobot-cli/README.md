@@ -48,7 +48,7 @@ lerobot-rollout --policy.path=outputs/train/demo/checkpoints/000001/pretrained_m
 lerobot-rollout --policy.path=outputs/train/demo/checkpoints/000001/pretrained_model \\
                 --robot.type=so101_follower --robot.port=/dev/tty.usbmodemXXX \\
                 --robot.calibration=~/.cache/huggingface/lerobot/calibration.json \\
-                --robot.confirm=true --steps=10
+                --robot.confirm=true --steps=10 --fps=30
 
 # The fifteen unported commands say so and exit 2:
 lerobot-eval; echo $?        # -> 2

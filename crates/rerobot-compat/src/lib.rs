@@ -214,7 +214,7 @@ pub static ENTRY_POINTS: &[EntryPoint] = &[
         target: "lerobot.scripts.lerobot_rollout:main",
         status: Status::Partial,
         summary: "Run a trained policy on a real robot with pluggable strategies.",
-        note: "Runnable for a hardware-independent local ACT deployment and a finite, state-only SO-101 follower deployment: the local path loads checkpoint processor state and dataset observations; the hardware path loads upstream calibration JSON, pings and validates all six Feetech IDs, uses one sync-read position request, converts calibrated state units, runs a local ACT checkpoint, writes six finite position goals only after explicit confirmation, and disables torque on every exit. Cameras, teleoperators, environments, visualization, video shards, and other rollout strategies remain explicitly refused.",
+        note: "Runnable for a hardware-independent local ACT deployment and a finite, state-only SO-101 follower deployment: the local path loads checkpoint processor state and dataset observations; the hardware path loads upstream calibration JSON, pings and validates all six Feetech IDs, uses one sync-read position request, converts calibrated state units, runs a local ACT checkpoint, writes six finite position goals only after explicit confirmation, paces each control tick at the positive finite `--fps` target (default 30 Hz), and disables torque on every exit. Cameras, teleoperators, environments, visualization, video shards, and other rollout strategies remain explicitly refused.",
     },
 ];
 

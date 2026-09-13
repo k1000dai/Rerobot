@@ -155,6 +155,7 @@ fn rollout_accepts_a_calibrated_so101_hardware_source() {
         "--robot.port=/dev/ttyACM0".to_owned(),
         "--robot.calibration=/tmp/calibration.json".to_owned(),
         "--robot.confirm=true".to_owned(),
+        "--fps=20.5".to_owned(),
         "--steps=3".to_owned(),
     ];
 
@@ -170,6 +171,21 @@ fn rollout_accepts_a_calibrated_so101_hardware_source() {
         Some(Path::new("/tmp/calibration.json"))
     );
     assert!(config.confirm);
+    assert_eq!(config.fps, 20.5);
+}
+
+#[test]
+fn rollout_rejects_a_non_positive_or_non_finite_control_frequency() {
+    for value in ["0", "-1", "NaN", "inf"] {
+        let args = vec![
+            "--policy.path=/tmp/policy".to_owned(),
+            "--dataset.root=/tmp/dataset".to_owned(),
+            "--steps=1".to_owned(),
+            format!("--fps={value}"),
+        ];
+        let error = parse(&args).expect_err("control frequency must be finite and positive");
+        assert!(error.to_string().contains("positive finite"), "{error}");
+    }
 }
 
 #[test]

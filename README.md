@@ -15,7 +15,7 @@ suite. Everything that does not work says so and exits non-zero.
 | --- | --- |
 | Upstream target | `lerobot` 0.6.1 (`f37be3edbee60f3a09a5183788b91eb19f0c07d1`) |
 | Milestone | 3 of N — core utility slice, local ACT training, and hardware-independent checkpoint deployment |
-| Runnable executables | 3 of 18 (`lerobot-info`, local ACT `lerobot-train`, and dataset-backed local ACT `lerobot-rollout`); the other 15 exist and fail explicitly |
+| Runnable executables | 3 of 18 (`lerobot-info`, local ACT `lerobot-train`, and local ACT `lerobot-rollout` with dataset-backed or finite SO-101 paths); the other 15 exist and fail explicitly |
 | Tests | Updated counts are reported by the verification run; the ACT training and deployment slices are compared element by element against upstream running on PyTorch where the boundary is available |
 | Minimum Rust | 1.85 — the floor of the locked dependency tree, built and tested on that exact toolchain by the `msrv` CI job |
 
@@ -123,8 +123,13 @@ Three details worth knowing up front:
   boundary for simulator or camera adapters. The library also provides a finite
   `rollout_batches_with_sink` loop that resets the action queue at trace start,
   applies the saved preprocessing to each caller batch, and stops on sink errors;
-  callers explicitly reset at environment episode boundaries. Robot drivers,
-  Gymnasium environments, and video shards remain refused.
+  callers explicitly reset at environment episode boundaries. The CLI also has a
+  finite SO-101 follower path: it loads upstream calibration, validates the six-
+  servo handshake, performs sync-read observations, runs the real checkpoint
+  inference boundary, sends position goals only after explicit confirmation, and
+  releases torque on exit. A protocol-valid mock transport exercises that full
+  adapter in CI; physical serial hardware is not exercised here. Other robot
+  drivers, Gymnasium environments, and video shards remain refused.
 
 ## Development
 

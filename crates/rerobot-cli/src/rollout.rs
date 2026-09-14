@@ -6,14 +6,15 @@
 //! refused by name.
 
 use rerobot_core::BigInt;
-use rerobot_hardware::feetech::open_serial;
-use rerobot_hardware::so101::{load_calibration, So101Follower};
+use rerobot_hardware::feetech::{open_serial, FeetechBus};
+use rerobot_hardware::so101::{load_calibration, JointCalibration, So101Follower};
 use rerobot_train::candle_core::{Device, Tensor};
 use rerobot_train::data::batch::Batch;
 use rerobot_train::deploy::{InferenceSession, InferenceStep};
 use rerobot_train::error::TrainError;
 use rerobot_train::indexmap::IndexMap;
 use std::fmt;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -447,6 +448,23 @@ fn run_so101(
         InferenceSession::load_checkpoint(&config.policy_path, config.device.as_deref())?;
     let calibration = load_calibration(calibration_path).map_err(hardware_error)?;
     let bus = open_serial(port).map_err(hardware_error)?;
+    run_so101_with_bus(config, observe, &mut session, bus, calibration).map(|_| ())
+}
+
+/// Run the hardware adapter over an already validated byte transport.
+///
+/// The serial-opening function above is deliberately kept outside this routine: the
+/// policy and calibration are loaded before a hardware side effect, while this
+/// generic boundary lets the same handshake/control loop be exercised against a
+/// protocol-valid transport in tests. It returns the transport after a successful
+/// run so tests can inspect the exact packets emitted by the real adapter.
+fn run_so101_with_bus<T: Read + Write>(
+    config: &RolloutConfig,
+    observe: &mut dyn FnMut(&str),
+    session: &mut InferenceSession,
+    bus: FeetechBus<T>,
+    calibration: [JointCalibration; 6],
+) -> rerobot_train::error::Result<T> {
     let mut robot = So101Follower::with_calibration(bus, calibration);
     let mut torque_attempted = false;
     let result = (|| {
@@ -499,7 +517,7 @@ fn run_so101(
         Ok(())
     };
     match (result, cleanup) {
-        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Ok(())) => Ok(robot.into_inner()),
         (Err(error), Ok(())) => Err(error),
         (Ok(()), Err(error)) => Err(error),
         (Err(error), Err(cleanup_error)) => Err(hardware_error(format!(
@@ -534,7 +552,243 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rerobot_core::dataset::stats::{DatasetStats, FeatureStats};
+    use rerobot_core::policy::act::ActConfig;
+    use rerobot_core::random::SplitMix64;
+    use rerobot_core::types::{FeatureType, PolicyFeature};
+    use rerobot_hardware::feetech::FeetechBus;
+    use rerobot_train::candle_core::Device;
     use rerobot_train::deploy::InferenceStep;
+    use rerobot_train::model::act::ActModel;
+    use std::collections::VecDeque;
+    use std::io::{self, Read, Write};
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "rerobot-rollout-unit-{}-{label}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("test directory creates");
+            Self(path)
+        }
+
+        fn child(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[derive(Default)]
+    struct RespondingPort {
+        incoming: VecDeque<u8>,
+        packets: Vec<Vec<u8>>,
+    }
+
+    impl RespondingPort {
+        fn status(id: u8, parameters: &[u8]) -> Vec<u8> {
+            let mut packet = vec![0xff, 0xff, id, (parameters.len() + 2) as u8, 0];
+            packet.extend_from_slice(parameters);
+            let checksum = !packet[2..]
+                .iter()
+                .fold(0_u8, |sum, byte| sum.wrapping_add(*byte));
+            packet.push(checksum);
+            packet
+        }
+
+        fn queue_status(&mut self, id: u8, parameters: &[u8]) {
+            self.incoming.extend(Self::status(id, parameters));
+        }
+    }
+
+    impl Read for RespondingPort {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if self.incoming.is_empty() {
+                return Ok(0);
+            }
+            let count = output.len().min(self.incoming.len());
+            for byte in &mut output[..count] {
+                *byte = self
+                    .incoming
+                    .pop_front()
+                    .expect("count came from the queue");
+            }
+            Ok(count)
+        }
+    }
+
+    impl Write for RespondingPort {
+        fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+            self.packets.push(input.to_vec());
+            if input.len() < 6 {
+                return Ok(input.len());
+            }
+            let id = input[2];
+            let instruction = input[4];
+            let parameters = &input[5..input.len() - 1];
+            match instruction {
+                0x01 => self.queue_status(id, &[]),
+                0x02 => {
+                    let address = parameters[0];
+                    let length = usize::from(parameters[1]);
+                    let values = if address == rerobot_hardware::so101::MODEL_NUMBER {
+                        vec![0x09, 0x03]
+                    } else {
+                        vec![0; length]
+                    };
+                    self.queue_status(id, &values);
+                }
+                0x82 => {
+                    let length = usize::from(parameters[1]);
+                    for servo_id in &parameters[2..] {
+                        let values = if length == 2 {
+                            vec![0x00, 0x08]
+                        } else {
+                            vec![0; length]
+                        };
+                        self.queue_status(*servo_id, &values);
+                    }
+                }
+                _ => {}
+            }
+            Ok(input.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn six_joint_policy() -> (TempDir, PathBuf) {
+        let directory = TempDir::new("mock-so101-policy");
+        let checkpoint = directory.child("pretrained_model");
+        std::fs::create_dir_all(&checkpoint).expect("checkpoint directory creates");
+        let mut policy = ActConfig::default();
+        policy.device = Some("cpu".to_owned());
+        policy.input_features = Some(IndexMap::from([(
+            "observation.state".to_owned(),
+            PolicyFeature::new(FeatureType::State, [6]),
+        )]));
+        policy.output_features = Some(IndexMap::from([(
+            "action".to_owned(),
+            PolicyFeature::new(FeatureType::Action, [6]),
+        )]));
+        policy.chunk_size = 2.into();
+        policy.n_action_steps = 2.into();
+        policy.dim_model = 32.into();
+        policy.n_heads = 4.into();
+        policy.dim_feedforward = 64.into();
+        policy.n_encoder_layers = 1.into();
+        policy.n_decoder_layers = 1.into();
+        policy.n_vae_encoder_layers = 1.into();
+        policy.latent_dim = 8.into();
+        policy.pretrained_backbone_weights = None;
+        policy.validate().expect("the six-joint policy validates");
+
+        let mut rng = SplitMix64::new(7);
+        let model = ActModel::new(&policy, &Device::Cpu, &mut rng).expect("model builds");
+        model
+            .save(&checkpoint.join("model.safetensors"))
+            .expect("model weights save");
+        std::fs::write(checkpoint.join("config.json"), policy.to_checkpoint_json())
+            .expect("policy config saves");
+
+        let stats = DatasetStats::from_entries(IndexMap::from([
+            (
+                "observation.state".to_owned(),
+                FeatureStats::from_entries(IndexMap::from([
+                    ("mean".to_owned(), vec![0.0; 6]),
+                    ("std".to_owned(), vec![1.0; 6]),
+                    ("min".to_owned(), vec![-1.0; 6]),
+                    ("max".to_owned(), vec![1.0; 6]),
+                ])),
+            ),
+            (
+                "action".to_owned(),
+                FeatureStats::from_entries(IndexMap::from([
+                    ("mean".to_owned(), vec![0.0; 6]),
+                    ("std".to_owned(), vec![1.0; 6]),
+                    ("min".to_owned(), vec![-1.0; 6]),
+                    ("max".to_owned(), vec![1.0; 6]),
+                ])),
+            ),
+        ]));
+        rerobot_train::processor::write_processor_artifacts(&checkpoint, &policy, &stats)
+            .expect("processor artifacts save");
+        (directory, checkpoint)
+    }
+
+    #[test]
+    fn mock_so101_rollout_runs_the_real_policy_boundary_and_releases_torque() {
+        let (_checkpoint_dir, checkpoint) = six_joint_policy();
+        let config = RolloutConfig {
+            policy_path: checkpoint,
+            dataset_root: PathBuf::new(),
+            steps: 1,
+            start_index: 0,
+            device: Some("cpu".to_owned()),
+            robot_port: Some(PathBuf::from("mock")),
+            calibration_path: Some(PathBuf::from("mock-calibration.json")),
+            confirm: true,
+            fps: 1_000_000.0,
+        };
+        let mut logs = Vec::new();
+        let port = RespondingPort::default();
+        let calibration = [rerobot_hardware::so101::JointCalibration::default(); 6];
+        let mut session = InferenceSession::load_checkpoint(&config.policy_path, Some("cpu"))
+            .expect("the mock policy checkpoint loads before hardware access");
+
+        let port = run_so101_with_bus(
+            &config,
+            &mut |line| logs.push(line.to_owned()),
+            &mut session,
+            FeetechBus::new(port),
+            calibration,
+        )
+        .expect("the mock bus completes the real SO-101 adapter");
+
+        assert_eq!(logs.len(), 1, "one finite control tick is emitted");
+        assert!(logs[0].contains("source:so101"), "{}", logs[0]);
+        let torque_on = port
+            .packets
+            .iter()
+            .filter(|packet| {
+                packet.len() >= 8 && packet[4] == 0x03 && packet[5] == 40 && packet[6] == 1
+            })
+            .count();
+        let torque_off = port
+            .packets
+            .iter()
+            .filter(|packet| {
+                packet.len() >= 8 && packet[4] == 0x03 && packet[5] == 40 && packet[6] == 0
+            })
+            .count();
+        assert_eq!(
+            torque_on, 6,
+            "all joints must be enabled before the first goal"
+        );
+        assert_eq!(torque_off, 6, "all joints must be released after the trace");
+        assert!(
+            port.packets
+                .iter()
+                .any(|packet| packet.len() >= 6 && packet[4] == 0x82),
+            "the adapter must use the sync-read observation path"
+        );
+        assert!(
+            port.packets
+                .iter()
+                .any(|packet| packet.len() >= 6 && packet[4] == 0x83),
+            "the adapter must use the sync-write action path"
+        );
+    }
 
     #[test]
     fn so101_state_batch_is_one_float32_observation() {

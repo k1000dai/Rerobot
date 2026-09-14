@@ -393,34 +393,53 @@ impl TrainSession {
     /// caught.
     pub fn step(&mut self, step_number: u64) -> Result<StepMetrics> {
         let raw = self.next_batch()?;
-        self.step_on(step_number, &raw)
+        let batch =
+            rename_observation_batch(&raw, &self.rename_map).normalized(&self.normalizer)?;
+        self.step_preprocessed(step_number, &batch)
     }
 
-    /// [`Self::step`] on a batch the caller supplies rather than one the sampler
+    /// [`Self::step`] on a raw batch the caller supplies rather than one the sampler
     /// produced.
     ///
-    /// The entry point for cameras this slice cannot decode from disk: a dataset whose
-    /// frames live outside its parquet files, or images a caller renders, records or
-    /// transforms itself. Such a run assembles its own batches — [`Self::next_batch`]
-    /// for the state and action columns, then [`Batch::with_images`] for the camera
-    /// tensors — and steps them through here.
-    ///
-    /// A dataset with an *embedded* `dtype: "image"` column needs none of that:
-    /// [`Self::next_batch`] already attaches its decoded frames, and [`Self::step`]
-    /// trains on them.
-    ///
-    /// `batch` is *raw*: this normalizes it with [`Self::normalizer`] exactly as
-    /// [`Self::step`] does, which is what keeps the two paths one computation.
+    /// Camera tensors must be raw `[0, 1]` tensors. This method applies the selected
+    /// per-camera normalization before the scalar normalizer and then runs the same
+    /// optimization body as [`Self::step`].
     pub fn step_on(&mut self, step_number: u64, raw: &Batch) -> Result<StepMetrics> {
-        let renamed = rename_observation_batch(raw, &self.rename_map);
-        let batch = renamed.normalized(&self.normalizer)?;
+        let batch = if raw.images.is_empty() {
+            rename_observation_batch(raw, &self.rename_map).normalized(&self.normalizer)?
+        } else {
+            // Caller-owned camera batches arrive in the same raw [0, 1] form as
+            // `next_batch` before its processor boundary. Select statistics by the
+            // input key first, then apply the one-pass observation rename. Doing
+            // those in the opposite order would make a mapping such as left -> top
+            // depend on whether top also appeared in the mapping.
+            let normalizations = camera_normalizations_for_input_images(
+                &raw.images,
+                &self.camera_normalizations,
+                &self.rename_map,
+            );
+            let camera_batch = Batch {
+                features: raw.features.clone(),
+                images: IndexMap::new(),
+                padding: raw.padding.clone(),
+                tasks: raw.tasks.clone(),
+                indices: raw.indices.clone(),
+            }
+            .with_image_normalizations(&raw.images, &normalizations)?;
+            rename_observation_batch(&camera_batch, &self.rename_map)
+                .normalized(&self.normalizer)?
+        };
+        self.step_preprocessed(step_number, &batch)
+    }
 
+    /// Run the optimization body on a batch whose processor pipeline has already run.
+    fn step_preprocessed(&mut self, step_number: u64, batch: &Batch) -> Result<StepMetrics> {
         let before = parameter_l2(self.model.parameters())?;
 
         let output = self
             .model
-            .forward(&batch, Pass::Train(Randomness::Seeded(&mut self.rng)))?;
-        let loss = self.model.loss(&batch, &output)?;
+            .forward(batch, Pass::Train(Randomness::Seeded(&mut self.rng)))?;
+        let loss = self.model.loss(batch, &output)?;
 
         // Checked before the optimizer runs, so a poisoned gradient cannot reach the
         // weights: AdamW would turn every parameter it touches into NaN, and the

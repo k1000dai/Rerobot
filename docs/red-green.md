@@ -1810,3 +1810,166 @@ cargo test -p rerobot-core --test processor_pipeline nonempty_processor_artifact
 cargo test -p rerobot-core --test processor_pipeline -- --test-threads=1
 12 passed; 0 failed
 ```
+
+## Cycle 34 — execute saved camera normalization in the native processor runtime
+
+`LoadedPolicyProcessors::process_observation_batch` already applied the saved
+rename map and scalar normalizer, but it returned camera tensors untouched. That
+was a compatibility hole for callers using the public processor runtime directly:
+checkpoint-trained visual policies would receive raw `[0, 1]` images instead of
+the per-camera statistics saved beside the model.
+
+**RED** — the focused regression was run before the runtime fix:
+
+```
+cargo test -p rerobot-train --test processor loaded_pipeline_normalizes_raw_camera_tensors_before_returning_the_batch --locked
+RED_EXIT=101
+```
+
+**GREEN** — the runtime now takes the renamed camera map through
+`Batch::with_image_normalizations` before applying scalar normalization. Missing
+camera statistics retain the upstream identity behavior, and the input batch is
+still not mutated.
+
+```
+cargo test -p rerobot-train --test processor loaded_pipeline_normalizes_raw_camera_tensors_before_returning_the_batch --locked
+1 passed; 0 failed
+cargo test -p rerobot-train --test processor --locked
+21 passed; 0 failed
+```
+
+## Cycle 35 — normalize caller-owned camera batches before training
+
+`TrainSession::step_on` documents a caller-owned batch boundary for cameras. Before
+this slice it renamed and scalar-normalized that batch, but left its camera tensors
+in raw `[0, 1]` form. The dataset path normalized cameras in `next_batch`, so the
+same frames produced different training updates depending on whether they arrived
+from the sampler or an in-memory adapter.
+
+**RED** — the new end-to-end regression used the committed embedded-image fixture,
+ran the real ACT update twice on the same sampled frames, and compared the raw
+caller path with the ordinary dataset path:
+
+```
+cargo test -p rerobot-train --test image step_on_normalizes_raw_camera_tensors_like_the_dataset_path --locked -- --exact
+assertion `left == right` failed: step_on must apply the session's camera normalization to raw images
+left: 17.794048309326172
+right: 17.646963119506836
+```
+
+The mismatch was in the loss after model construction, not a parser or fixture
+failure. A later attempt also caught the lifecycle hazard where moving normalization
+into `step_on` would double-normalize the already camera-processed batch returned by
+`next_batch`; the final implementation keeps that path separate from the raw API.
+
+**GREEN** — `step` now performs the existing dataset rename/scalar-normalization
+boundary and runs a private preprocessed update body. `step_on` applies per-camera
+statistics to raw input keys first, then performs the same one-pass rename and
+scalar normalization before entering that body. State-only callers retain the old
+path, and camera renames use the existing raw-key selector.
+
+```
+cargo test -p rerobot-train --test image step_on_normalizes_raw_camera_tensors_like_the_dataset_path --locked -- --exact
+1 passed; 0 failed
+cargo test -p rerobot-train --test image --locked
+21 passed; 0 failed
+```
+
+## Cycle 36 — refuse current-upstream processor artifacts at the training boundary
+
+The pinned LeRobot 0.6.1 processor JSON has no `artifacts` entries. Current
+upstream `main` at `b6ec0060779550c0a157ae34feb89e0cf86012a8` adds them when a
+processor step saves extra files and resolves each declared relative path before
+constructing the step (`src/lerobot/processor/pipeline.py:563-577,1051-1099`).
+The native ACT loader does not yet implement that path resolution, so accepting
+and ignoring a non-empty declaration would produce a checkpoint that is not
+actually equivalent.
+
+**RED** — before the validation boundary was added, a test-bearing preprocessor
+with `artifacts: {"normalizer": "normalizer.safetensors"}` loaded successfully:
+
+```
+cargo test -p rerobot-train --test processor nonempty_current_upstream_processor_artifacts_are_rejected_before_deployment --locked -- --exact --nocapture
+RED_EXIT=101
+unsupported processor artifacts must not be silently ignored: LoadedPolicyProcessors { ... }
+```
+
+**GREEN** — `validate_pipeline` now accepts an empty compatibility object but
+rejects a non-empty or wrongly typed `artifacts` field before any safetensors
+state is loaded. This is an explicit unsupported boundary, not a claim that
+current-main artifact-backed processors are deployable.
+
+```
+cargo test -p rerobot-train --test processor nonempty_current_upstream_processor_artifacts_are_rejected_before_deployment --locked -- --exact --nocapture
+1 passed; 0 failed
+```
+
+## Cycle 37 — stream caller-owned deployment batches through the ACT boundary
+
+The checkpoint-only deployment API already accepted one raw observation batch.
+The missing vertical slice was the finite runtime loop needed by a simulator or
+camera adapter: reset the queued action trace, apply the saved rename and
+normalization processors to every observation, emit each action to a sink, and
+stop without consuming another observation when the sink fails.
+
+**RED** — the first end-to-end deployment test was added before the adapter:
+
+```
+cargo test -p rerobot-train --test deploy caller_batch_stream_reuses_the_policy_queue_and_delivers_each_action --locked
+error[E0599]: no method named `rollout_batches_with_sink` found for struct `InferenceSession`
+help: there is a method `rollout_with_sink` with a similar name
+RED_EXIT=101
+```
+
+**GREEN** — `InferenceSession::rollout_batches_with_sink` now resets at trace
+start, consumes only single-observation `Batch` values through
+`select_action_on_batch`, forwards `InferenceStep` values to the caller sink,
+and enforces the existing rollout-step resource limit. Focused tests cover the
+queue's first/continued action decisions, sink failure short-circuiting,
+rejecting a known-overlong iterator before consumption, and resetting a queued
+chunk before a new trace:
+
+```
+cargo test -p rerobot-train --test deploy caller_batch_stream --locked
+4 passed; 0 failed
+```
+
+The method also enforces the existing rollout-step resource limit for iterators
+whose upper bound is unknown; it does not process the item that crosses the cap.
+
+The method intentionally does not infer episode boundaries from caller-owned
+batches; the simulator or hardware adapter must call `reset()` between episodes.
+This is a hardware-independent deployment seam, not a claim that a robot driver
+or Gymnasium environment is ported.
+
+## Cycle 38 — pace the finite SO-101 control loop
+
+At the pinned LeRobot commit, the hardware rollout records the elapsed time for
+one observation/policy/action cycle and waits for `max(1 / fps - elapsed, 0)`
+with `robot_utils.precise_sleep`. The existing Rust SO-101 path wrote actions as
+fast as the serial/model path allowed, so it did not preserve the configured
+30 Hz default or the user-selected `fps`.
+
+**RED** — the precision helper was specified by a focused test before it was
+implemented:
+
+```
+cargo test -p rerobot-cli --lib rollout::tests::precise_sleep_waits_for_a_positive_duration --locked
+error[E0425]: cannot find function `precise_sleep` in this scope
+RED_EXIT=101
+```
+
+**GREEN** — `RolloutConfig` now accepts a positive finite `--fps` (default
+`30.0`), the hardware loop computes the remaining interval after each complete
+read/select/write cycle, and `precise_sleep` mirrors upstream's macOS/Windows
+sleep-margin plus final-spin behavior while using the scheduler on other
+platforms. Offline dataset-backed rollout remains unchanged. The regression
+coverage includes exact interval arithmetic, no sleep after an overrun, float
+CLI parsing/rejection, and a positive-duration sleep:
+
+```
+cargo test -p rerobot-cli --lib rollout::tests --locked
+3 passed; 0 failed
+cargo test -p rerobot-cli --test rollout_cli --locked
+8 passed; 0 failed
+```

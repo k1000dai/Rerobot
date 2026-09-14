@@ -388,6 +388,55 @@ impl InferenceSession {
         self.select_action_normalized(&normalized, frame_index)
     }
 
+    /// Run a finite stream of caller-owned observations and deliver each action.
+    ///
+    /// This is the deployment seam for a simulator or another runtime that owns
+    /// observation acquisition. The session is reset before the stream starts, so a
+    /// queued action from an earlier trace cannot leak into this one. Each item must
+    /// be a single-observation raw batch and is passed through the same rename,
+    /// camera/scalar normalization, action queue or temporal ensembler, and action
+    /// unnormalization path as [`Self::select_action_on_batch`]. The caller must call
+    /// [`Self::reset`] when its environment starts a new episode: a caller-owned
+    /// batch has no dataset episode table from which this method could infer that
+    /// boundary.
+    ///
+    /// The stream is capped at [`crate::limits::MAX_ROLLOUT_TRACE_STEPS`] items. If
+    /// the iterator reports a larger upper bound, it is rejected before consuming
+    /// it. Iterators without a usable upper bound are rejected after the cap is
+    /// reached, without processing the extra batch, so an accidental unbounded
+    /// source cannot run forever inside this adapter.
+    pub fn rollout_batches_with_sink<I, F>(&mut self, batches: I, mut sink: F) -> Result<usize>
+    where
+        I: IntoIterator<Item = Batch>,
+        F: FnMut(&InferenceStep) -> Result<()>,
+    {
+        let batches = batches.into_iter();
+        if batches
+            .size_hint()
+            .1
+            .is_some_and(|upper| upper > crate::limits::MAX_ROLLOUT_TRACE_STEPS)
+        {
+            return Err(TrainError::unsupported(format!(
+                "caller-owned rollout stream exceeds the limit {}",
+                crate::limits::MAX_ROLLOUT_TRACE_STEPS
+            )));
+        }
+        self.reset();
+        let mut count = 0usize;
+        for batch in batches {
+            if count == crate::limits::MAX_ROLLOUT_TRACE_STEPS {
+                return Err(TrainError::unsupported(format!(
+                    "caller-owned rollout stream exceeds the limit {} items",
+                    crate::limits::MAX_ROLLOUT_TRACE_STEPS
+                )));
+            }
+            let step = self.select_action_on_batch(&batch)?;
+            sink(&step)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     fn select_action_normalized(
         &mut self,
         batch: &Batch,
@@ -429,6 +478,53 @@ impl InferenceSession {
 
     /// Run the policy for `steps` observations in increasing dataset order.
     pub fn rollout(&mut self, start_index: usize, steps: usize) -> Result<Vec<InferenceStep>> {
+        let mut trace = Vec::with_capacity(steps.min(crate::limits::MAX_BATCH_SIZE));
+        self.rollout_with_sink(start_index, steps, |step| {
+            trace.push(step.clone());
+            Ok(())
+        })?;
+        Ok(trace)
+    }
+
+    /// Run a finite rollout and deliver each selected action to `sink` immediately.
+    ///
+    /// This is the deployment boundary for a simulator or actuator adapter. The sink
+    /// receives a step only after the policy preprocessing, queue/temporal state, and
+    /// action unnormalization have succeeded. A sink error stops before the next
+    /// observation is read and is returned unchanged, so an actuator failure cannot be
+    /// mistaken for a completed rollout. The policy is reset before every trace and
+    /// when the dataset episode changes, matching the offline [`Self::rollout`] path.
+    pub fn rollout_with_sink<F>(
+        &mut self,
+        start_index: usize,
+        steps: usize,
+        mut sink: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&InferenceStep) -> Result<()>,
+    {
+        let end = self.validate_rollout_range(start_index, steps)?;
+        // Upstream's rollout() calls policy.reset() before every new trace. Do not
+        // let an earlier call's queued chunk or temporal ensemble bleed into this one.
+        self.reset();
+        let mut previous_episode = None;
+        for index in start_index..end {
+            let episode = self
+                .dataset
+                .as_ref()
+                .expect("the dataset was checked above")
+                .episode_index_at(index)?;
+            if should_reset_for_episode_change(previous_episode, episode) {
+                self.reset();
+            }
+            previous_episode = Some(episode);
+            let step = self.select_action(index)?;
+            sink(&step)?;
+        }
+        Ok(())
+    }
+
+    fn validate_rollout_range(&self, start_index: usize, steps: usize) -> Result<usize> {
         if steps == 0 {
             return Err(TrainError::unsupported(
                 "offline rollout steps must be positive",
@@ -454,24 +550,7 @@ impl InferenceSession {
                 "offline rollout ends at frame {end}, but the dataset has {dataset_len} frames"
             )));
         }
-        let mut trace = Vec::with_capacity(steps.min(crate::limits::MAX_BATCH_SIZE));
-        // Upstream's rollout() calls policy.reset() before every new trace. Do not
-        // let an earlier call's queued chunk or temporal ensemble bleed into this one.
-        self.reset();
-        let mut previous_episode = None;
-        for index in start_index..end {
-            let episode = self
-                .dataset
-                .as_ref()
-                .expect("the dataset was checked above")
-                .episode_index_at(index)?;
-            if should_reset_for_episode_change(previous_episode, episode) {
-                self.reset();
-            }
-            previous_episode = Some(episode);
-            trace.push(self.select_action(index)?);
-        }
-        Ok(trace)
+        Ok(end)
     }
 
     fn refill_from_batch(&mut self, batch: &Batch) -> Result<()> {

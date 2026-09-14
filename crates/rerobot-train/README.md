@@ -135,3 +135,22 @@ let action = session.select_action_on_batch(&raw_batch)?;
 assert!(action.action.iter().all(|value| value.is_finite()));
 # Ok::<(), rerobot_train::error::TrainError>(())
 ```
+
+For a finite simulator or camera-adapter trace, use
+`rollout_batches_with_sink`. It resets the policy queue at the trace boundary,
+then applies the same preprocessing and action delivery to each single-observation
+batch; the caller explicitly calls `reset()` between episodes:
+
+```no_run
+# use rerobot_train::data::batch::Batch;
+# use rerobot_train::deploy::InferenceSession;
+# use std::path::Path;
+# let mut session = InferenceSession::load_checkpoint(Path::new("checkpoint"), Some("cpu"))?;
+# let batches: Vec<Batch> = todo!("assemble raw observations");
+let _emitted = session.rollout_batches_with_sink(batches, |step| {
+    // Send step.action to the simulator or hardware adapter.
+    assert!(step.action.iter().all(|value| value.is_finite()));
+    Ok(())
+})?;
+# Ok::<(), rerobot_train::error::TrainError>(())
+```

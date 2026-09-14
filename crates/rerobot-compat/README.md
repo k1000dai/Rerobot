@@ -43,8 +43,8 @@ let eval = entry_point("lerobot-eval").unwrap();
 assert_eq!(eval.status, Status::Unimplemented);
 assert!(eval.status.is_unsupported());
 
-// Hardware is gated, never simulated.
-assert_eq!(module_family("robots").unwrap().status, Status::HardwareGated);
+// The SO-101 low-level boundary is partial; unported hardware remains gated.
+assert_eq!(module_family("robots").unwrap().status, Status::Partial);
 assert_eq!(MODULE_FAMILIES.len(), 24);
 ```
 

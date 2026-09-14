@@ -42,6 +42,14 @@ lerobot-train --dataset.repo_id=ID --dataset.root=DIR --output_dir=DIR \
 lerobot-rollout --policy.path=outputs/train/demo/checkpoints/000001/pretrained_model \\
                 --dataset.root=path/to/dataset --steps=10
 
+# A finite, state-only SO-101 follower rollout. This is the only physical path
+# in this slice: it requires upstream calibration JSON and explicit torque
+# confirmation, and disables torque on normal or error exit.
+lerobot-rollout --policy.path=outputs/train/demo/checkpoints/000001/pretrained_model \\
+                --robot.type=so101_follower --robot.port=/dev/tty.usbmodemXXX \\
+                --robot.calibration=~/.cache/huggingface/lerobot/calibration.json \\
+                --robot.confirm=true --steps=10 --fps=30
+
 # The fifteen unported commands say so and exit 2:
 lerobot-eval; echo $?        # -> 2
 ```

@@ -214,7 +214,7 @@ pub static ENTRY_POINTS: &[EntryPoint] = &[
         target: "lerobot.scripts.lerobot_rollout:main",
         status: Status::Partial,
         summary: "Run a trained policy on a real robot with pluggable strategies.",
-        note: "Runnable for a hardware-independent local ACT deployment: it loads a checkpoint, consumes the saved normalizer/unnormalizer processor state, reads local dataset observations, and emits action-unit outputs from the action queue or temporal ensembler. The library also loads a checkpoint without a dataset and accepts a caller-owned single-observation `Batch`, matching the policy's simulator/camera adapter boundary. Robot drivers, teleoperators, environments, visualization and video shards remain explicitly refused; the physical rollout boundary is not faked.",
+        note: "Runnable for a hardware-independent local ACT deployment and a finite, state-only SO-101 follower deployment: the local path loads checkpoint processor state and dataset observations; the hardware path loads upstream calibration JSON, pings and validates all six Feetech IDs, uses one sync-read position request, converts calibrated state units, runs a local ACT checkpoint, writes six finite position goals only after explicit confirmation, paces each control tick at the positive finite `--fps` target (default 30 Hz), and disables torque on every exit. A protocol-valid mock transport now exercises the real policy/handshake/control/cleanup boundary in CI; physical serial hardware and the broader robot/environment strategy surface remain unexercised. Cameras, teleoperators, environments, visualization, video shards, and other rollout strategies remain explicitly refused.",
     },
 ];
 
@@ -333,21 +333,21 @@ pub static MODULE_FAMILIES: &[ModuleFamily] = &[
     },
     ModuleFamily {
         name: "robots",
-        status: Status::HardwareGated,
+        status: Status::Partial,
         upstream_modules: 53,
-        note: "Per-robot drivers (SO-100/101, LeKiwi, Reachy2, Unitree, ...).",
+        note: "SO-101 low-level Feetech follower transport, calibration loading, model-checked discovery, sync-read state conversion, and finite action writes are ported; SO-101 cameras, teleoperation, and all other robot families remain hardware-gated or unimplemented.",
     },
     ModuleFamily {
         name: "rollout",
         status: Status::Partial,
         upstream_modules: 18,
-        note: "`ring_buffer.RolloutRingBuffer` is ported and tested, including its byte-accounting quirks, as is the DAgger event state machine (`strategies.dagger.DAggerPhase`, its four transitions and `DAggerEvents`). The DAgger strategy itself, the input devices it listens to, the other rollout strategies and the hardware/environment policy loop are not. The local dataset-backed ACT action queue, temporal ensembler, and checkpoint-only caller-batch inference boundary are ported in `rerobot_train::deploy`; it does not claim a robot or Gymnasium boundary.",
+        note: "`ring_buffer.RolloutRingBuffer` is ported and tested, including its byte-accounting quirks, as is the DAgger event state machine (`strategies.dagger.DAggerPhase`, its four transitions and `DAggerEvents`). The DAgger strategy itself, the input devices it listens to, the other rollout strategies and the environment policy loop are not. The local dataset-backed ACT action queue, temporal ensembler, checkpoint-only caller-batch inference boundary, and finite state-only SO-101 hardware loop are ported in `rerobot_train::deploy` and `rerobot_cli`; cameras, environments, teleoperators, and async inference remain outside the boundary.",
     },
     ModuleFamily {
         name: "scripts",
         status: Status::Partial,
         upstream_modules: 20,
-        note: "`lerobot_info`, `lerobot_train`, and the hardware-independent local ACT path of `lerobot_rollout` are ported and runnable. The other 15 entry points exist only as executables that fail with a stable unsupported error.",
+        note: "`lerobot_info`, `lerobot_train`, and the local ACT paths of `lerobot_rollout` (dataset-backed and finite, state-only calibrated SO-101) are ported and runnable. The other 15 entry points exist only as executables that fail with a stable unsupported error.",
     },
     ModuleFamily {
         name: "teleoperators",

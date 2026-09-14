@@ -1,7 +1,9 @@
 //! SO-101 follower configuration and safe joint-level commands.
 
 use crate::feetech::{encode_sign_magnitude, open_serial, FeetechBus, FeetechError};
+use serde_json::Value;
 use std::io::{Read, Write};
+use std::path::Path;
 
 /// SO-101's six follower servos in the control order used by LeRobot actions.
 pub const SO101_MOTOR_IDS: [u8; 6] = [1, 2, 3, 4, 5, 6];
@@ -17,6 +19,10 @@ pub const SO101_JOINT_NAMES: [&str; 6] = [
 
 /// STS3215 torque-enable register.
 pub const TORQUE_ENABLE: u8 = 40;
+/// STS3215 model-number register.
+pub const MODEL_NUMBER: u8 = 3;
+/// Model number expected by LeRobot's SO-101 `sts3215` configuration.
+pub const STS3215_MODEL_NUMBER: u16 = 777;
 /// STS3215 lock register used by the Feetech SDK around EEPROM/config writes.
 pub const LOCK: u8 = 55;
 /// STS3215 return-delay-time register.
@@ -58,6 +64,133 @@ pub const POSITION_TICK_MAX: f32 = 4095.0;
 /// The default SO-101 bus baudrate.
 pub const SO101_BAUDRATE: u32 = 1_000_000;
 
+/// The maximum calibration document size accepted before JSON parsing.
+const MAX_CALIBRATION_JSON_BYTES: u64 = 64 * 1024;
+
+fn calibration_integer(
+    record: &serde_json::Map<String, Value>,
+    joint: &str,
+    field: &str,
+) -> Result<i64, FeetechError> {
+    let value = record.get(field).ok_or_else(|| {
+        FeetechError::Invalid(format!("calibration for {joint:?} is missing {field:?}"))
+    })?;
+    value.as_i64().ok_or_else(|| {
+        FeetechError::Invalid(format!(
+            "calibration for {joint:?} field {field:?} must be an integer"
+        ))
+    })
+}
+
+/// Load the upstream `dict[str, MotorCalibration]` JSON representation.
+///
+/// The result is ordered by [`SO101_JOINT_NAMES`], not by JSON object order. The
+/// parser is deliberately strict: a missing joint, an unknown field, a wrong
+/// scalar type, an unexpected motor ID, or a range that cannot be represented by
+/// the STS3215 control table is refused before a follower can write to hardware.
+/// `drive_mode` is retained through the existing sign field because the SO-101
+/// path uses it only for the gripper's `RANGE_0_100` convention.
+pub fn load_calibration(path: &Path) -> Result<[JointCalibration; 6], FeetechError> {
+    let file = std::fs::File::open(path).map_err(|error| {
+        FeetechError::Invalid(format!(
+            "cannot read calibration {}: {error}",
+            path.display()
+        ))
+    })?;
+    let mut bytes = Vec::new();
+    file.take(MAX_CALIBRATION_JSON_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            FeetechError::Invalid(format!(
+                "cannot read calibration {}: {error}",
+                path.display()
+            ))
+        })?;
+    if bytes.len() as u64 > MAX_CALIBRATION_JSON_BYTES {
+        return Err(FeetechError::Invalid(format!(
+            "calibration {} exceeds the {MAX_CALIBRATION_JSON_BYTES}-byte limit",
+            path.display()
+        )));
+    }
+    let document: Value = serde_json::from_slice(&bytes).map_err(|error| {
+        FeetechError::Invalid(format!(
+            "calibration {} is not valid JSON: {error}",
+            path.display()
+        ))
+    })?;
+    let root = document.as_object().ok_or_else(|| {
+        FeetechError::Invalid("the calibration root must be a JSON object".to_owned())
+    })?;
+    let expected = SO101_JOINT_NAMES;
+    for key in root.keys() {
+        if !expected.contains(&key.as_str()) {
+            return Err(FeetechError::Invalid(format!(
+                "calibration contains unknown joint {key:?}"
+            )));
+        }
+    }
+
+    let mut calibration = [JointCalibration::default(); 6];
+    for (index, joint) in expected.into_iter().enumerate() {
+        let record = root.get(joint).ok_or_else(|| {
+            FeetechError::Invalid(format!("calibration is missing joint {joint:?}"))
+        })?;
+        let record = record.as_object().ok_or_else(|| {
+            FeetechError::Invalid(format!("calibration for {joint:?} must be an object"))
+        })?;
+        for key in record.keys() {
+            if !matches!(
+                key.as_str(),
+                "id" | "drive_mode" | "homing_offset" | "range_min" | "range_max"
+            ) {
+                return Err(FeetechError::Invalid(format!(
+                    "calibration for {joint:?} contains unknown field {key:?}"
+                )));
+            }
+        }
+        let id = calibration_integer(record, joint, "id")?;
+        let expected_id = i64::from(SO101_MOTOR_IDS[index]);
+        if id != expected_id {
+            return Err(FeetechError::Invalid(format!(
+                "calibration for {joint:?} has id {id}, expected {expected_id}"
+            )));
+        }
+        let drive_mode = calibration_integer(record, joint, "drive_mode")?;
+        let homing_offset = i32::try_from(calibration_integer(record, joint, "homing_offset")?)
+            .map_err(|_| {
+                FeetechError::Invalid(format!(
+                    "calibration for {joint:?} homing_offset does not fit i32"
+                ))
+            })?;
+        let min_ticks =
+            i32::try_from(calibration_integer(record, joint, "range_min")?).map_err(|_| {
+                FeetechError::Invalid(format!(
+                    "calibration for {joint:?} range_min does not fit i32"
+                ))
+            })?;
+        let max_ticks =
+            i32::try_from(calibration_integer(record, joint, "range_max")?).map_err(|_| {
+                FeetechError::Invalid(format!(
+                    "calibration for {joint:?} range_max does not fit i32"
+                ))
+            })?;
+        let joint_calibration = JointCalibration {
+            center_ticks: 2048,
+            sign: if joint == "gripper" && drive_mode != 0 {
+                -1.0
+            } else {
+                1.0
+            },
+            homing_offset,
+            min_ticks,
+            max_ticks,
+        };
+        joint_calibration.validate_range()?;
+        calibration[index] = joint_calibration;
+    }
+    Ok(calibration)
+}
+
 /// Per-joint conversion and safety limits.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct JointCalibration {
@@ -68,9 +201,9 @@ pub struct JointCalibration {
     pub sign: f32,
     /// Signed Feetech homing offset stored in sign-magnitude form.
     pub homing_offset: i32,
-    /// Minimum permitted goal position in raw encoder ticks.
+    /// Calibrated minimum raw encoder position used for normalization.
     pub min_ticks: i32,
-    /// Maximum permitted goal position in raw encoder ticks.
+    /// Calibrated maximum raw encoder position used for normalization.
     pub max_ticks: i32,
 }
 
@@ -144,26 +277,24 @@ impl JointCalibration {
         Ok(midpoint as u16)
     }
 
-    /// Convert a body-joint degree command using the calibration range and
-    /// direction. This is the raw-unit inverse of LeRobot's `DEGREES` mode.
+    /// Convert a body-joint degree command using the calibration range.
+    ///
+    /// This is the raw-unit inverse of LeRobot's `DEGREES` mode. The upstream
+    /// conversion does not apply `drive_mode` in degree mode; direction is only
+    /// applied by the gripper's `RANGE_0_100` conversion.
     pub fn degrees_to_ticks(self, degrees: f32) -> Result<u16, FeetechError> {
-        if !degrees.is_finite() || !self.sign.is_finite() || self.sign == 0.0 {
+        if !degrees.is_finite() {
             return Err(FeetechError::Invalid(
-                "joint angle and calibration sign must be finite; sign must be non-zero".to_owned(),
+                "joint angle must be finite".to_owned(),
             ));
         }
         self.validate_range()?;
         let midpoint = (f64::from(self.min_ticks) + f64::from(self.max_ticks)) / 2.0;
-        let raw = midpoint
-            + f64::from(self.sign) * f64::from(degrees) * f64::from(POSITION_TICK_MAX) / 360.0;
+        let raw = midpoint + f64::from(degrees) * f64::from(POSITION_TICK_MAX) / 360.0;
         let truncated = raw.trunc();
-        if !raw.is_finite()
-            || truncated < f64::from(self.min_ticks)
-            || truncated > f64::from(self.max_ticks)
-        {
+        if !raw.is_finite() || truncated < 0.0 || truncated > f64::from(u16::MAX) {
             return Err(FeetechError::Invalid(format!(
-                "angle {degrees}° maps to {:.1} ticks, outside {}..={}",
-                raw, self.min_ticks, self.max_ticks
+                "angle {degrees}° maps to {raw:.1} ticks, which does not fit a u16"
             )));
         }
         Ok(truncated as u16)
@@ -236,6 +367,41 @@ impl<T> So101Follower<T> {
         self.torque_enabled
     }
 
+    /// Convert present encoder positions to the six-dimensional state vector
+    /// consumed by a LeRobot SO-101 policy.
+    pub fn positions_to_observation(&self, positions: [u16; 6]) -> Result<[f32; 6], FeetechError> {
+        let mut values = [0.0_f32; 6];
+        for (index, (position, calibration)) in
+            positions.into_iter().zip(self.calibration).enumerate()
+        {
+            calibration.validate_range()?;
+            if !calibration.sign.is_finite() || calibration.sign == 0.0 {
+                return Err(FeetechError::Invalid(
+                    "calibration sign must be finite and non-zero".to_owned(),
+                ));
+            }
+            if index == 5 {
+                let bounded = f64::from(position).clamp(
+                    f64::from(calibration.min_ticks),
+                    f64::from(calibration.max_ticks),
+                );
+                let span = f64::from(calibration.max_ticks - calibration.min_ticks);
+                let percent = (bounded - f64::from(calibration.min_ticks)) * 100.0 / span;
+                values[index] = if calibration.sign < 0.0 {
+                    (100.0 - percent) as f32
+                } else {
+                    percent as f32
+                };
+            } else {
+                let midpoint =
+                    (f64::from(calibration.min_ticks) + f64::from(calibration.max_ticks)) / 2.0;
+                values[index] = ((f64::from(position) - midpoint) * 360.0
+                    / f64::from(POSITION_TICK_MAX)) as f32;
+            }
+        }
+        Ok(values)
+    }
+
     /// Convert the five body-joint degree commands and the gripper percentage
     /// command into raw encoder positions without touching the transport.
     pub fn positions_to_ticks(&self, values: [f32; 6]) -> Result<[u16; 6], FeetechError> {
@@ -262,11 +428,19 @@ impl<T> So101Follower<T> {
 }
 
 impl<T: Read + Write> So101Follower<T> {
-    /// Ping all six expected servo IDs. No torque or EEPROM writes occur.
+    /// Ping all six expected servo IDs and validate their model numbers.
+    /// No torque or EEPROM writes occur.
     pub fn ping_all(&mut self) -> Result<[bool; 6], FeetechError> {
         let mut found = [false; 6];
         for (index, id) in SO101_MOTOR_IDS.iter().copied().enumerate() {
-            found[index] = self.bus.ping(id).is_ok();
+            if self.bus.ping(id).is_err() {
+                continue;
+            }
+            let Ok(model) = self.bus.read_register(id, MODEL_NUMBER, 2) else {
+                continue;
+            };
+            let model = u16::from_le_bytes([model[0], model[1]]);
+            found[index] = model == STS3215_MODEL_NUMBER;
         }
         Ok(found)
     }
@@ -318,12 +492,27 @@ impl<T: Read + Write> So101Follower<T> {
 
     /// Read all six present positions in raw encoder ticks.
     pub fn read_positions_ticks(&mut self) -> Result<[u16; 6], FeetechError> {
-        let mut positions = [0_u16; 6];
-        for (index, id) in SO101_MOTOR_IDS.iter().copied().enumerate() {
-            let bytes = self.bus.read_register(id, PRESENT_POSITION, 2)?;
-            positions[index] = u16::from_le_bytes([bytes[0], bytes[1]]);
-        }
-        Ok(positions)
+        let values = self.bus.sync_read(PRESENT_POSITION, 2, &SO101_MOTOR_IDS)?;
+        values
+            .into_iter()
+            .map(|(_, bytes)| {
+                bytes
+                    .as_slice()
+                    .try_into()
+                    .map(u16::from_le_bytes)
+                    .map_err(|_| {
+                        FeetechError::Protocol(
+                            "sync read returned a position with the wrong width".to_owned(),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .try_into()
+            .map_err(|_| {
+                FeetechError::Protocol(
+                    "sync read did not return all six SO-101 positions".to_owned(),
+                )
+            })
     }
 
     /// Move all six joints to raw encoder positions. Torque must be enabled by
@@ -411,6 +600,39 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::io;
+    use std::path::PathBuf;
+
+    fn calibration_fixture_path(label: &str) -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        std::env::temp_dir().join(format!(
+            "rerobot-so101-calibration-{}-{label}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
+    fn status_packet(id: u8, position: u16, valid_checksum: bool) -> Vec<u8> {
+        let mut packet = vec![0xff, 0xff, id, 4, 0, position as u8, (position >> 8) as u8];
+        let checksum = !(packet[2..]
+            .iter()
+            .fold(0_u8, |sum, byte| sum.wrapping_add(*byte)));
+        packet.push(if valid_checksum {
+            checksum
+        } else {
+            checksum ^ 1
+        });
+        packet
+    }
+
+    fn ping_status_packet(id: u8) -> Vec<u8> {
+        let mut packet = vec![0xff, 0xff, id, 2, 0];
+        packet.push(
+            !packet[2..]
+                .iter()
+                .fold(0_u8, |sum, byte| sum.wrapping_add(*byte)),
+        );
+        packet
+    }
 
     #[derive(Default)]
     struct MockPort {
@@ -454,6 +676,77 @@ mod tests {
         // Upstream uses (range_min + range_max) / 2 and truncates the resulting
         // float conversion; it does not use a conventional 4096/360 formula.
         assert_eq!(calibration.degrees_to_ticks(90.0).unwrap(), 2323);
+    }
+
+    #[test]
+    fn position_reads_use_one_sync_read_request_in_joint_order() {
+        let incoming = SO101_MOTOR_IDS
+            .into_iter()
+            .flat_map(|id| status_packet(id, u16::from(id) * 100, true))
+            .collect::<Vec<_>>();
+        let mut follower = So101Follower::new(FeetechBus::new(MockPort {
+            incoming: incoming.into_iter().collect(),
+            outgoing: Vec::new(),
+        }));
+
+        assert_eq!(
+            follower.read_positions_ticks().unwrap(),
+            [100, 200, 300, 400, 500, 600]
+        );
+        let port = follower.into_inner();
+        assert_eq!(
+            port.outgoing,
+            crate::feetech::instruction_packet(
+                0xfe,
+                crate::feetech::Instruction::SyncRead,
+                &[PRESENT_POSITION, 2, 1, 2, 3, 4, 5, 6],
+            )
+        );
+    }
+
+    #[test]
+    fn ping_all_rejects_a_servo_with_the_wrong_model_number() {
+        let incoming = SO101_MOTOR_IDS
+            .into_iter()
+            .flat_map(|id| {
+                let model = if id == 3 {
+                    STS3215_MODEL_NUMBER + 1
+                } else {
+                    STS3215_MODEL_NUMBER
+                };
+                ping_status_packet(id)
+                    .into_iter()
+                    .chain(status_packet(id, model, true))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut follower = So101Follower::new(FeetechBus::new(MockPort {
+            incoming: incoming.into_iter().collect(),
+            outgoing: Vec::new(),
+        }));
+
+        assert_eq!(
+            follower.ping_all().unwrap(),
+            [true, true, false, true, true, true]
+        );
+    }
+
+    #[test]
+    fn position_reads_do_not_retry_a_corrupted_status_packet() {
+        let mut incoming = status_packet(1, 2048, false);
+        for id in SO101_MOTOR_IDS {
+            incoming.extend(status_packet(id, 2048, true));
+        }
+        let mut follower = So101Follower::new(FeetechBus::new(MockPort {
+            incoming: incoming.into_iter().collect(),
+            outgoing: Vec::new(),
+        }));
+
+        let error = follower.read_positions_ticks().expect_err(
+            "the upstream get_observation path does not retry a corrupt sync-read response",
+        );
+
+        assert!(error.to_string().contains("checksum"), "{error}");
     }
 
     #[test]
@@ -692,12 +985,88 @@ mod tests {
     }
 
     #[test]
-    fn calibration_rejects_motion_outside_the_declared_range() {
+    fn degree_commands_are_not_clamped_to_the_calibration_range() {
         let calibration = JointCalibration {
             min_ticks: 1800,
             max_ticks: 2200,
             ..JointCalibration::default()
         };
-        assert!(calibration.degrees_to_ticks(90.0).is_err());
+
+        // Upstream's DEGREES unnormalization uses the calibrated midpoint but
+        // does not clamp the resulting raw position to range_min..=range_max.
+        assert_eq!(calibration.degrees_to_ticks(90.0).unwrap(), 3023);
+    }
+
+    #[test]
+    fn upstream_calibration_json_loads_in_so101_joint_order() {
+        let path = calibration_fixture_path("valid");
+        let document = r#"{
+            "shoulder_pan": {"id": 1, "drive_mode": 0, "homing_offset": -709, "range_min": 43, "range_max": 1335},
+            "shoulder_lift": {"id": 2, "drive_mode": 0, "homing_offset": 0, "range_min": 100, "range_max": 2100},
+            "elbow_flex": {"id": 3, "drive_mode": 0, "homing_offset": 1, "range_min": 101, "range_max": 2101},
+            "wrist_flex": {"id": 4, "drive_mode": 0, "homing_offset": 2, "range_min": 102, "range_max": 2102},
+            "wrist_roll": {"id": 5, "drive_mode": 0, "homing_offset": 3, "range_min": 103, "range_max": 2103},
+            "gripper": {"id": 6, "drive_mode": 1, "homing_offset": 4, "range_min": 500, "range_max": 1500}
+        }"#;
+        std::fs::write(&path, document).unwrap();
+
+        let actual = load_calibration(&path).expect("the upstream calibration file loads");
+
+        let _ = std::fs::remove_file(path);
+        assert_eq!(actual[0].homing_offset, -709);
+        assert_eq!(actual[0].min_ticks, 43);
+        assert_eq!(actual[0].max_ticks, 1335);
+        assert_eq!(actual[5].min_ticks, 500);
+        assert_eq!(actual[5].max_ticks, 1500);
+        assert!(actual[5].sign < 0.0, "drive_mode=1 must invert the gripper");
+    }
+
+    #[test]
+    fn calibration_json_rejects_missing_joint_and_wrong_field_types() {
+        let path = calibration_fixture_path("invalid");
+        let document = r#"{
+            "shoulder_pan": {"id": 1, "drive_mode": 0, "homing_offset": 0, "range_min": "0", "range_max": 4095}
+        }"#;
+        std::fs::write(&path, document).unwrap();
+
+        let error = load_calibration(&path).expect_err("incomplete typed calibration must fail");
+
+        let _ = std::fs::remove_file(path);
+        assert!(
+            error.to_string().contains("shoulder_lift") || error.to_string().contains("range_min")
+        );
+    }
+
+    #[test]
+    fn calibrated_positions_use_upstream_degrees_and_gripper_percent_units() {
+        let mut calibration = [JointCalibration::default(); 6];
+        calibration[0].min_ticks = 100;
+        calibration[0].max_ticks = 2500;
+        calibration[5].min_ticks = 500;
+        calibration[5].max_ticks = 1500;
+        calibration[5].sign = -1.0;
+        let follower =
+            So101Follower::with_calibration(FeetechBus::new(MockPort::default()), calibration);
+
+        let actual = follower
+            .positions_to_observation([1300, 2048, 2048, 2048, 2048, 750])
+            .unwrap();
+
+        assert_eq!(actual[0], 0.0);
+        assert!((actual[5] - 75.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn body_joint_degree_commands_ignore_drive_mode_like_upstream() {
+        let mut calibration = [JointCalibration::default(); 6];
+        calibration[0].sign = -1.0;
+        let follower =
+            So101Follower::with_calibration(FeetechBus::new(MockPort::default()), calibration);
+
+        let actual = follower
+            .positions_to_ticks([90.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .unwrap();
+
+        assert_eq!(actual[0], 3071);
     }
 }

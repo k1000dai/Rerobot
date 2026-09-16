@@ -106,14 +106,20 @@ fn rollout_loads_a_trained_checkpoint_and_emits_actions() {
 }
 
 #[test]
-fn rollout_refuses_robot_flags_instead_of_claiming_hardware_deployment() {
+fn rollout_rejects_unconfirmed_hardware_invocations() {
     let output = Command::new(env!("CARGO_BIN_EXE_lerobot-rollout"))
-        .args(["--robot.type=so101_follower"])
+        .args([
+            "--policy.path=/tmp/policy",
+            "--robot.type=so101_follower",
+            "--robot.port=/dev/ttyACM0",
+            "--robot.calibration=/tmp/calibration.json",
+            "--steps=1",
+        ])
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.status.code(), Some(64));
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("robot drivers"), "{stderr}");
+    assert!(stderr.contains("robot.confirm=true"), "{stderr}");
 }
 
 #[test]
@@ -139,4 +145,60 @@ fn rollout_rejects_trace_counts_that_would_exceed_the_memory_bound() {
     ];
     let error = parse(&args).expect_err("the in-memory rollout trace must be bounded");
     assert!(error.to_string().contains("rollout trace"), "{error}");
+}
+
+#[test]
+fn rollout_accepts_a_calibrated_so101_hardware_source() {
+    let args = vec![
+        "--policy.path=/tmp/policy".to_owned(),
+        "--robot.type=so101_follower".to_owned(),
+        "--robot.port=/dev/ttyACM0".to_owned(),
+        "--robot.calibration=/tmp/calibration.json".to_owned(),
+        "--robot.confirm=true".to_owned(),
+        "--fps=20.5".to_owned(),
+        "--steps=3".to_owned(),
+    ];
+
+    let config = parse(&args).expect("a finite calibrated SO-101 source is parseable");
+
+    assert_eq!(config.steps, 3);
+    assert_eq!(
+        config.robot_port.as_deref(),
+        Some(Path::new("/dev/ttyACM0"))
+    );
+    assert_eq!(
+        config.calibration_path.as_deref(),
+        Some(Path::new("/tmp/calibration.json"))
+    );
+    assert!(config.confirm);
+    assert_eq!(config.fps, 20.5);
+}
+
+#[test]
+fn rollout_rejects_a_non_positive_or_non_finite_control_frequency() {
+    for value in ["0", "-1", "NaN", "inf"] {
+        let args = vec![
+            "--policy.path=/tmp/policy".to_owned(),
+            "--dataset.root=/tmp/dataset".to_owned(),
+            "--steps=1".to_owned(),
+            format!("--fps={value}"),
+        ];
+        let error = parse(&args).expect_err("control frequency must be finite and positive");
+        assert!(error.to_string().contains("positive finite"), "{error}");
+    }
+}
+
+#[test]
+fn rollout_requires_explicit_confirmation_for_a_so101_hardware_source() {
+    let args = vec![
+        "--policy.path=/tmp/policy".to_owned(),
+        "--robot.type=so101_follower".to_owned(),
+        "--robot.port=/dev/ttyACM0".to_owned(),
+        "--robot.calibration=/tmp/calibration.json".to_owned(),
+        "--steps=1".to_owned(),
+    ];
+
+    let error = parse(&args).expect_err("hardware rollout must not default to torque writes");
+
+    assert!(error.to_string().contains("robot.confirm=true"), "{error}");
 }

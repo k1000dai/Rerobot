@@ -120,6 +120,188 @@ fn checkpoint_only_inference_normalizes_raw_cameras_like_dataset_backed_inferenc
 }
 
 #[test]
+fn caller_batch_stream_reuses_the_policy_queue_and_delivers_each_action() {
+    let (_dir, checkpoint) = trained_checkpoint();
+    let mut session = InferenceSession::load_checkpoint(&checkpoint, None)
+        .expect("a checkpoint-only inference session loads");
+
+    let metadata = rerobot_train::data::meta::DatasetMetadata::load(&fixture_dataset())
+        .expect("the fixture metadata loads");
+    let mut delta_timestamps = IndexMap::new();
+    delta_timestamps.insert(
+        ACTION.to_owned(),
+        action_delta_timestamps(2, metadata.fps().expect("the fixture fps is valid")),
+    );
+    let dataset = StateOnlyDataset::load(&fixture_dataset(), &delta_timestamps, 1e-4)
+        .expect("the fixture frames load");
+    let batches = (0..2)
+        .map(|index| {
+            let frame = dataset.get(index).expect("the fixture frame loads");
+            collate(std::slice::from_ref(&frame), session.device()).expect("the batch collates")
+        })
+        .collect::<Vec<_>>();
+
+    let mut streamed = Vec::new();
+    let count = session
+        .rollout_batches_with_sink(batches, |step| {
+            streamed.push(step.clone());
+            Ok(())
+        })
+        .expect("the caller-owned batch stream completes");
+
+    assert_eq!(count, 2);
+    assert_eq!(streamed.len(), 2);
+    assert_eq!(streamed[0].frame_index, 0);
+    assert_eq!(streamed[1].frame_index, 1);
+    assert!(streamed[0].queried_policy);
+    assert!(!streamed[1].queried_policy);
+    assert!(streamed
+        .iter()
+        .flat_map(|step| step.action.iter())
+        .all(|value| value.is_finite()));
+}
+
+#[test]
+fn caller_batch_stream_stops_before_the_next_batch_when_the_sink_fails() {
+    let (_dir, checkpoint) = trained_checkpoint();
+    let mut session = InferenceSession::load_checkpoint(&checkpoint, None)
+        .expect("a checkpoint-only inference session loads");
+    let metadata = rerobot_train::data::meta::DatasetMetadata::load(&fixture_dataset())
+        .expect("the fixture metadata loads");
+    let mut delta_timestamps = IndexMap::new();
+    delta_timestamps.insert(
+        ACTION.to_owned(),
+        action_delta_timestamps(2, metadata.fps().expect("the fixture fps is valid")),
+    );
+    let dataset = StateOnlyDataset::load(&fixture_dataset(), &delta_timestamps, 1e-4)
+        .expect("the fixture frames load");
+    let batches = (0..2)
+        .map(|index| {
+            let frame = dataset.get(index).expect("the fixture frame loads");
+            collate(std::slice::from_ref(&frame), session.device()).expect("the batch collates")
+        })
+        .collect::<Vec<_>>();
+    let mut calls = 0;
+
+    let error = session
+        .rollout_batches_with_sink(batches, |_step| {
+            calls += 1;
+            Err(rerobot_train::error::TrainError::unsupported(
+                "simulator stopped",
+            ))
+        })
+        .expect_err("a failed simulator sink aborts the caller-owned stream");
+
+    assert_eq!(calls, 1);
+    assert!(error.to_string().contains("simulator stopped"));
+}
+
+#[test]
+fn caller_batch_stream_rejects_a_known_overlong_iterator_before_reading_it() {
+    let (_dir, checkpoint) = trained_checkpoint();
+    let mut session = InferenceSession::load_checkpoint(&checkpoint, None)
+        .expect("a checkpoint-only inference session loads");
+    let batches = std::iter::repeat_with(|| -> rerobot_train::data::batch::Batch {
+        panic!("the known-overlong iterator must not be read")
+    })
+    .take(rerobot_train::limits::MAX_ROLLOUT_TRACE_STEPS + 1);
+
+    let error = session
+        .rollout_batches_with_sink(batches, |_step| Ok(()))
+        .expect_err("a known-overlong stream is refused before processing");
+
+    assert!(error
+        .to_string()
+        .contains("caller-owned rollout stream exceeds the limit"));
+}
+
+#[test]
+fn caller_batch_stream_resets_a_queued_chunk_before_a_new_trace() {
+    let (_dir, checkpoint) = trained_checkpoint();
+    let mut session = InferenceSession::load_checkpoint(&checkpoint, None)
+        .expect("a checkpoint-only inference session loads");
+    let metadata = rerobot_train::data::meta::DatasetMetadata::load(&fixture_dataset())
+        .expect("the fixture metadata loads");
+    let mut delta_timestamps = IndexMap::new();
+    delta_timestamps.insert(
+        ACTION.to_owned(),
+        action_delta_timestamps(2, metadata.fps().expect("the fixture fps is valid")),
+    );
+    let dataset = StateOnlyDataset::load(&fixture_dataset(), &delta_timestamps, 1e-4)
+        .expect("the fixture frames load");
+    let first = dataset.get(0).expect("the first frame loads");
+    let second = dataset.get(1).expect("the second frame loads");
+    let first_batch =
+        collate(std::slice::from_ref(&first), session.device()).expect("the first batch collates");
+    let second_batch = collate(std::slice::from_ref(&second), session.device())
+        .expect("the second batch collates");
+    session
+        .select_action_on_batch(&first_batch)
+        .expect("the first caller batch queries the policy");
+
+    let mut streamed = Vec::new();
+    session
+        .rollout_batches_with_sink(vec![second_batch], |step| {
+            streamed.push(step.clone());
+            Ok(())
+        })
+        .expect("the second trace completes");
+
+    assert_eq!(streamed.len(), 1);
+    assert!(streamed[0].queried_policy);
+    assert_eq!(streamed[0].frame_index, 1);
+}
+
+#[test]
+fn caller_batch_stream_resets_policy_state_at_explicit_episode_boundaries() {
+    let (_dir, checkpoint) = trained_checkpoint();
+    let metadata = rerobot_train::data::meta::DatasetMetadata::load(&fixture_dataset())
+        .expect("the fixture metadata loads");
+    let mut delta_timestamps = IndexMap::new();
+    delta_timestamps.insert(
+        ACTION.to_owned(),
+        action_delta_timestamps(2, metadata.fps().expect("the fixture fps is valid")),
+    );
+    let dataset = StateOnlyDataset::load(&fixture_dataset(), &delta_timestamps, 1e-4)
+        .expect("the fixture frames load");
+    let first = dataset.get(0).expect("the first fixture frame loads");
+    let second = dataset.get(1).expect("the second fixture frame loads");
+    let first_batch =
+        collate(std::slice::from_ref(&first), &Device::Cpu).expect("the first batch collates");
+    let second_batch =
+        collate(std::slice::from_ref(&second), &Device::Cpu).expect("the second batch collates");
+
+    let mut expected_session = InferenceSession::load_checkpoint(&checkpoint, None)
+        .expect("the checkpoint-only session loads");
+    let expected = expected_session
+        .select_action_on_batch(&second_batch)
+        .expect("the first observation of a fresh episode runs");
+
+    let mut session = InferenceSession::load_checkpoint(&checkpoint, None)
+        .expect("the checkpoint-only session loads");
+    let mut streamed = Vec::new();
+    let count = session
+        .rollout_batches_with_episode_boundaries(
+            vec![(false, first_batch), (true, second_batch)],
+            |step| {
+                streamed.push(step.clone());
+                Ok(())
+            },
+        )
+        .expect("the episode-aware caller stream completes");
+
+    assert_eq!(count, 2);
+    assert_eq!(streamed.len(), 2);
+    assert!(streamed[0].queried_policy);
+    assert!(
+        streamed[1].queried_policy,
+        "the explicit episode boundary must clear ACT's queued actions"
+    );
+    assert_eq!(streamed[1].frame_index, expected.frame_index);
+    assert_eq!(streamed[1].action, expected.action);
+}
+
+#[test]
 fn a_checkpoint_only_session_applies_a_saved_rename_map_before_inference() {
     let (_dir, checkpoint) = trained_checkpoint();
     let config_path = checkpoint.join("policy_preprocessor.json");
@@ -255,6 +437,52 @@ fn offline_rollout_reports_each_requested_frame_in_order() {
         vec![0, 1, 2]
     );
     assert_eq!(trace.iter().filter(|step| step.queried_policy).count(), 2);
+}
+
+#[test]
+fn rollout_with_sink_streams_each_action_after_policy_selection() {
+    let (_dir, checkpoint) = trained_checkpoint();
+    let mut session = InferenceSession::load(&checkpoint, &fixture_dataset(), None)
+        .expect("the checkpoint loads");
+    let mut actions = Vec::new();
+
+    let mut trace = Vec::new();
+    session
+        .rollout_with_sink(0, 3, |step| {
+            actions.push(step.action.clone());
+            trace.push(step.clone());
+            Ok(())
+        })
+        .expect("the rollout reaches the action sink");
+
+    assert_eq!(actions.len(), trace.len());
+    assert_eq!(
+        actions,
+        trace
+            .iter()
+            .map(|step| step.action.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn rollout_with_sink_stops_before_the_next_frame_when_the_sink_fails() {
+    let (_dir, checkpoint) = trained_checkpoint();
+    let mut session = InferenceSession::load(&checkpoint, &fixture_dataset(), None)
+        .expect("the checkpoint loads");
+    let mut calls = 0;
+
+    let error = session
+        .rollout_with_sink(0, 3, |_action| {
+            calls += 1;
+            Err(rerobot_train::error::TrainError::unsupported(
+                "action sink stopped",
+            ))
+        })
+        .expect_err("a sink failure must abort the rollout");
+
+    assert_eq!(calls, 1);
+    assert!(error.to_string().contains("action sink stopped"));
 }
 
 #[test]

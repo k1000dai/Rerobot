@@ -239,6 +239,7 @@ fn partially_ported_families_are_exactly_the_ones_with_tests() {
             "optim",
             "policies",
             "processor",
+            "robots",
             "rollout",
             "scripts",
             "utils"
@@ -248,7 +249,7 @@ fn partially_ported_families_are_exactly_the_ones_with_tests() {
 
 #[test]
 fn hardware_families_are_marked_hardware_gated() {
-    for name in ["cameras", "motors", "robots", "teleoperators"] {
+    for name in ["cameras", "motors", "teleoperators"] {
         assert_eq!(
             module_family(name).unwrap().status,
             Status::HardwareGated,

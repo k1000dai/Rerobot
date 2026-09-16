@@ -252,6 +252,86 @@ impl<T: Read + Write> FeetechBus<T> {
         Ok(status)
     }
 
+    /// Read one control-table range from multiple servo IDs with one broadcast packet.
+    ///
+    /// Responses are accepted in any order, but the returned vector follows the
+    /// requested ID order. Every requested servo must answer exactly once.
+    pub fn sync_read(
+        &mut self,
+        address: u8,
+        data_length: u8,
+        ids: &[u8],
+    ) -> Result<Vec<(u8, Vec<u8>)>, FeetechError> {
+        if ids.is_empty() {
+            return Err(FeetechError::Invalid(
+                "sync read needs at least one servo".to_owned(),
+            ));
+        }
+        if ids.len() > 251 {
+            return Err(FeetechError::Invalid(
+                "sync read has too many servo IDs for one protocol packet".to_owned(),
+            ));
+        }
+        validate_range(address, usize::from(data_length))?;
+        for (index, id) in ids.iter().copied().enumerate() {
+            validate_id(id)?;
+            if ids[..index].contains(&id) {
+                return Err(FeetechError::Invalid(format!(
+                    "sync read contains duplicate servo id {id}"
+                )));
+            }
+        }
+
+        let mut parameters = Vec::with_capacity(ids.len() + 2);
+        parameters.push(address);
+        parameters.push(data_length);
+        parameters.extend_from_slice(ids);
+        self.send(&instruction_packet(
+            0xfe,
+            Instruction::SyncRead,
+            &parameters,
+        ))?;
+
+        let mut received = Vec::with_capacity(ids.len());
+        for _ in ids {
+            let status = self.read_status()?;
+            if !ids.contains(&status.id) {
+                return Err(FeetechError::Protocol(format!(
+                    "sync read received status from unexpected servo {}",
+                    status.id
+                )));
+            }
+            if received.iter().any(|(id, _)| *id == status.id) {
+                return Err(FeetechError::Protocol(format!(
+                    "sync read received duplicate status from servo {}",
+                    status.id
+                )));
+            }
+            if status.parameters.len() != usize::from(data_length) {
+                return Err(FeetechError::Protocol(format!(
+                    "sync read for servo {} requested {data_length} bytes, received {}",
+                    status.id,
+                    status.parameters.len()
+                )));
+            }
+            received.push((status.id, status.parameters));
+        }
+
+        ids.iter()
+            .map(|id| {
+                received
+                    .iter()
+                    .find(|(received_id, _)| received_id == id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        FeetechError::Protocol(format!(
+                            "sync read did not receive a status from servo {id}"
+                        ))
+                    })
+            })
+            .collect()
+    }
+
     /// Write one register range to multiple servo IDs with one bus packet.
     pub fn sync_write(
         &mut self,

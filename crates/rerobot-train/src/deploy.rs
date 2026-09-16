@@ -388,6 +388,62 @@ impl InferenceSession {
         self.select_action_normalized(&normalized, frame_index)
     }
 
+    /// Run a finite stream of caller-owned observations and reset policy state at
+    /// caller-declared episode boundaries.
+    ///
+    /// Each item is `(starts_new_episode, batch)`. A `true` marker is applied before
+    /// that observation is processed, so an action queued by the preceding episode
+    /// cannot leak across the boundary. The session is reset once before the stream as
+    /// well, matching [`Self::rollout_batches_with_sink`]. This is the explicit
+    /// lifecycle form for simulators and other runtimes that know their episode
+    /// transitions but do not have a dataset episode table.
+    pub fn rollout_batches_with_episode_boundaries<I, F>(
+        &mut self,
+        batches: I,
+        sink: F,
+    ) -> Result<usize>
+    where
+        I: IntoIterator<Item = (bool, Batch)>,
+        F: FnMut(&InferenceStep) -> Result<()>,
+    {
+        self.rollout_batches_with_sink_inner(batches, sink)
+    }
+
+    fn rollout_batches_with_sink_inner<I, F>(&mut self, batches: I, mut sink: F) -> Result<usize>
+    where
+        I: IntoIterator<Item = (bool, Batch)>,
+        F: FnMut(&InferenceStep) -> Result<()>,
+    {
+        let batches = batches.into_iter();
+        if batches
+            .size_hint()
+            .1
+            .is_some_and(|upper| upper > crate::limits::MAX_ROLLOUT_TRACE_STEPS)
+        {
+            return Err(TrainError::unsupported(format!(
+                "caller-owned rollout stream exceeds the limit {}",
+                crate::limits::MAX_ROLLOUT_TRACE_STEPS
+            )));
+        }
+        self.reset();
+        let mut count = 0usize;
+        for (starts_new_episode, batch) in batches {
+            if count == crate::limits::MAX_ROLLOUT_TRACE_STEPS {
+                return Err(TrainError::unsupported(format!(
+                    "caller-owned rollout stream exceeds the limit {} items",
+                    crate::limits::MAX_ROLLOUT_TRACE_STEPS
+                )));
+            }
+            if starts_new_episode {
+                self.reset();
+            }
+            let step = self.select_action_on_batch(&batch)?;
+            sink(&step)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     /// Run a finite stream of caller-owned observations and deliver each action.
     ///
     /// This is the deployment seam for a simulator or another runtime that owns
@@ -405,36 +461,12 @@ impl InferenceSession {
     /// it. Iterators without a usable upper bound are rejected after the cap is
     /// reached, without processing the extra batch, so an accidental unbounded
     /// source cannot run forever inside this adapter.
-    pub fn rollout_batches_with_sink<I, F>(&mut self, batches: I, mut sink: F) -> Result<usize>
+    pub fn rollout_batches_with_sink<I, F>(&mut self, batches: I, sink: F) -> Result<usize>
     where
         I: IntoIterator<Item = Batch>,
         F: FnMut(&InferenceStep) -> Result<()>,
     {
-        let batches = batches.into_iter();
-        if batches
-            .size_hint()
-            .1
-            .is_some_and(|upper| upper > crate::limits::MAX_ROLLOUT_TRACE_STEPS)
-        {
-            return Err(TrainError::unsupported(format!(
-                "caller-owned rollout stream exceeds the limit {}",
-                crate::limits::MAX_ROLLOUT_TRACE_STEPS
-            )));
-        }
-        self.reset();
-        let mut count = 0usize;
-        for batch in batches {
-            if count == crate::limits::MAX_ROLLOUT_TRACE_STEPS {
-                return Err(TrainError::unsupported(format!(
-                    "caller-owned rollout stream exceeds the limit {} items",
-                    crate::limits::MAX_ROLLOUT_TRACE_STEPS
-                )));
-            }
-            let step = self.select_action_on_batch(&batch)?;
-            sink(&step)?;
-            count += 1;
-        }
-        Ok(count)
+        self.rollout_batches_with_sink_inner(batches.into_iter().map(|batch| (false, batch)), sink)
     }
 
     fn select_action_normalized(

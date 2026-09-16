@@ -253,6 +253,55 @@ fn caller_batch_stream_resets_a_queued_chunk_before_a_new_trace() {
 }
 
 #[test]
+fn caller_batch_stream_resets_policy_state_at_explicit_episode_boundaries() {
+    let (_dir, checkpoint) = trained_checkpoint();
+    let metadata = rerobot_train::data::meta::DatasetMetadata::load(&fixture_dataset())
+        .expect("the fixture metadata loads");
+    let mut delta_timestamps = IndexMap::new();
+    delta_timestamps.insert(
+        ACTION.to_owned(),
+        action_delta_timestamps(2, metadata.fps().expect("the fixture fps is valid")),
+    );
+    let dataset = StateOnlyDataset::load(&fixture_dataset(), &delta_timestamps, 1e-4)
+        .expect("the fixture frames load");
+    let first = dataset.get(0).expect("the first fixture frame loads");
+    let second = dataset.get(1).expect("the second fixture frame loads");
+    let first_batch =
+        collate(std::slice::from_ref(&first), &Device::Cpu).expect("the first batch collates");
+    let second_batch =
+        collate(std::slice::from_ref(&second), &Device::Cpu).expect("the second batch collates");
+
+    let mut expected_session = InferenceSession::load_checkpoint(&checkpoint, None)
+        .expect("the checkpoint-only session loads");
+    let expected = expected_session
+        .select_action_on_batch(&second_batch)
+        .expect("the first observation of a fresh episode runs");
+
+    let mut session = InferenceSession::load_checkpoint(&checkpoint, None)
+        .expect("the checkpoint-only session loads");
+    let mut streamed = Vec::new();
+    let count = session
+        .rollout_batches_with_episode_boundaries(
+            vec![(false, first_batch), (true, second_batch)],
+            |step| {
+                streamed.push(step.clone());
+                Ok(())
+            },
+        )
+        .expect("the episode-aware caller stream completes");
+
+    assert_eq!(count, 2);
+    assert_eq!(streamed.len(), 2);
+    assert!(streamed[0].queried_policy);
+    assert!(
+        streamed[1].queried_policy,
+        "the explicit episode boundary must clear ACT's queued actions"
+    );
+    assert_eq!(streamed[1].frame_index, expected.frame_index);
+    assert_eq!(streamed[1].action, expected.action);
+}
+
+#[test]
 fn a_checkpoint_only_session_applies_a_saved_rename_map_before_inference() {
     let (_dir, checkpoint) = trained_checkpoint();
     let config_path = checkpoint.join("policy_preprocessor.json");

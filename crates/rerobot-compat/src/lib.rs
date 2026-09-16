@@ -142,8 +142,7 @@ pub static ENTRY_POINTS: &[EntryPoint] = &[
         target: "lerobot.scripts.lerobot_eval:main",
         status: Status::Unimplemented,
         summary: "Evaluate a policy by running environment rollouts.",
-        note: "Needs policy inference and a Gymnasium environment; neither is ported, and \
-               fabricating metrics would be worse than failing.",
+        note: "Local ACT checkpoint inference is ported, but this executable still needs Gymnasium environment integration and evaluation metric/reporting semantics; fabricating metrics would be worse than failing.",
     },
     EntryPoint {
         name: "lerobot-train",
